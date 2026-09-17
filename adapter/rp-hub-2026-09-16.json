@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "id": "rp-hub-2026-09-16",
+  "author": {
+    "script": {
+      "path": "/assets/js/app.js",
+      "replacements": [
+        {
+          "name": "保留流式选择",
+          "find": "settings.stream = true;",
+          "replace": ""
+        },
+        {
+          "name": "保留温度",
+          "find": "settings.temperature = 1.0;",
+          "replace": ""
+        },
+        {
+          "name": "角色图片记录清理",
+          "find": "const CHARACTER_SCOPED_STORAGE_NAMES = ['chat', 'classic_memories', 'branches'];",
+          "replace": "const CHARACTER_SCOPED_STORAGE_NAMES = ['chat', 'classic_memories', 'branches', 'image_renders'];"
+        },
+        {
+          "name": "记忆设置保存接入",
+          "find": "let _memorySettingsSaveTimer = null;\nwatch(memorySettings, () => {\nclearTimeout(_memorySettingsSaveTimer);\n_memorySettingsSaveTimer = setTimeout(() => {\nsaveMemorySettingsNow().catch(e => console.error('Save memory settings failed:', e));\n}, 500);\n}, { deep: true });",
+          "replace": "watch(memorySettings, window.RPH_SYNC_PERSISTENCE.debounce(saveMemorySettingsNow, 500), { deep: true });"
+        },
+        {
+          "name": "防抖保存与上传入口",
+          "find": "const debounce = (fn, delay) => {\nlet timeoutId;\nreturn (...args) => {\nclearTimeout(timeoutId);\ntimeoutId = setTimeout(() => fn(...args), delay);\n};\n};\nconst debouncedSave = debounce(() => {\nsaveData({ saveMemories: false, saveCharacters: false });\n}, 1000);\nconst debouncedCharacterSave = debounce(() => {\nsaveCharactersNow().catch(error => console.error('Save characters failed:', error));\n}, 1000);",
+          "replace": "const debouncedSave = window.RPH_SYNC_PERSISTENCE.debounce(() => saveData({ saveMemories: false, saveCharacters: false }), 1000);\nconst debouncedCharacterSave = window.RPH_SYNC_PERSISTENCE.debounce(saveCharactersNow, 1000);\nwindow.RPHubAuthorSaveData = async () => {\nawait nextTick();\nawait window.RPH_SYNC_PERSISTENCE.flushDebounced();\nconst saved = chatHistorySaveTimer ? await saveChatHistoryNow() : await chatHistorySaveQueue;\nif (saved === false) throw new Error('聊天记录尚未保存，请重试。');\n};"
+        },
+        {
+          "name": "图片任务接入",
+          "find": "const task = startGeneratedImageTask(requestUrl, options.fresh === true);",
+          "replace": "const rphMagicMessage = chatHistory.value[Number(card.closest('[data-chat-index]')?.dataset.chatIndex ?? -1)];\nconst task = window.RPH_MAGIC_IMAGE_TASK({\ncard, requestUrl, fresh: options.fresh === true,\nmessage: rphMagicMessage,\ncharacterId: currentCharacter.value?.uuid || '',\ncharacterName: currentCharacter.value?.name || '',\nrender: renderGeneratedImageJob\n});"
+        }
+      ]
+    },
+    "sourceChecks": [
+      {
+        "path": "/index.html",
+        "contains": ["<app-navigation", "chat-input-scrollbar", "input-island"]
+      },
+      {
+        "path": "/assets/js/ui-components.js",
+        "contains": ["class=\"app-navigation-panel\"", "class=\"app-navigation-content"]
+      },
+      {
+        "path": "/assets/js/app.js",
+        "contains": ["const startGeneratedImageTask", "const CHARACTER_SCOPED_STORAGE_NAMES"]
+      }
+    ]
+  },
+  "ui": {
+    "navigation": {
+      "mode": "section-grid",
+      "panel": "#app-navigation-panel",
+      "content": ".app-navigation-content",
+      "section": ".app-navigation-section",
+      "sectionHeading": "常用",
+      "grid": ".app-navigation-grid",
+      "item": ".app-navigation-item",
+      "insertBeforeLabel": "设置",
+      "user": ".app-navigation-user",
+      "buttonClass": "app-navigation-item",
+      "iconClass": "app-navigation-icon",
+      "openTrigger": ".app-nav-trigger"
+    },
+    "settings": {
+      "labelSelector": "label",
+      "labelText": "沉浸模式",
+      "occurrence": "last",
+      "anchorParentSelector": ".grid",
+      "insert": "before"
+    },
+    "chat": {
+      "input": "textarea.chat-input-scrollbar",
+      "row": ".relative.w-full.flex.items-end",
+      "area": ".input-island",
+      "container": ".chat-view-root > .flex-1.overflow-y-auto"
+    }
+  }
+}
