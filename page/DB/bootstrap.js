@@ -750,6 +750,22 @@
         });
     }
 
+    // 与 readRecordsByKeys 同样的批量思路：一次只读事务读回多条缓存条目，
+    // 避免批量删除或数组分页比较时逐键一个事务。
+    async function readCacheEntries(db, ids) {
+        const entries = [];
+        for (let start = 0; start < ids.length; start += CONFIG.restoreBatchSize) {
+            const batch = ids.slice(start, start + CONFIG.restoreBatchSize);
+            entries.push(...await new Promise((resolve, reject) => {
+                const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly');
+                const requests = batch.map(id => tx.objectStore(LOCAL_CACHE_ENTRY_STORE).get(id));
+                tx.oncomplete = () => resolve(requests.map(request => request.result));
+                tx.onerror = tx.onabort = () => reject(tx.error || new Error('本地同步对象读取失败。'));
+            }));
+        }
+        return entries;
+    }
+
     function cacheSourceKeys(db, sourceKey) {
         return new Promise((resolve, reject) => {
             const request = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly')
@@ -911,13 +927,27 @@
             && bytes.every((byte, index) => byte === cachedBytes[index]);
     }
 
-    function readObjectStoreRecordByKey(database, storeName, key) {
-        return openDbByName(database).then(db => new Promise((resolve, reject) => {
-            if (!db.objectStoreNames.contains(storeName)) { db.close(); resolve(undefined); return; }
-            const request = db.transaction([storeName], 'readonly').objectStore(storeName).get(key);
-            request.onsuccess = () => { db.close(); resolve(request.result); };
-            request.onerror = () => { db.close(); reject(request.error || new Error('本地同步记录读取失败。')); };
-        }));
+    // 读出缓存 header 里记录的版本号；解析失败或非法时返回 null，调用方回退当前版本。
+    function readCachedHeaderVersion(bytes) {
+        try {
+            const value = JSON.parse(new TextDecoder().decode(bytes));
+            return typeof value?.version === 'number' && Number.isFinite(value.version) ? value.version : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // Keep requests in one transaction; callers bound each batch by record count.
+    // IndexedDB must still clone a whole value for a single business key.
+    function readRecordsByKeys(db, storeName, keys) {
+        if (!keys.length || !db.objectStoreNames.contains(storeName)) return Promise.resolve(keys.map(() => undefined));
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(storeName, 'readonly');
+            const store = tx.objectStore(storeName);
+            const requests = keys.map(key => store.get(key));
+            tx.oncomplete = () => resolve(requests.map(request => request.result));
+            tx.onerror = tx.onabort = () => reject(tx.error || new Error('本地同步记录读取失败。'));
+        });
     }
 
     async function buildCachedPacks(db, bucketKey) {
@@ -1030,19 +1060,30 @@
 
     async function updateCachedSnapshot(cacheDb, state, dirty) {
         const affectedBuckets = new Set(state.pendingBuckets || []);
-        const touchBucket = async bucket => {
+        let bucketsDirty = false;
+        // 触桶只做内存标记，条目落盘前由 flushPendingBuckets 统一持久化：保住
+        // “条目已写入 ⇒ 其所在桶必已在 pendingBuckets”的崩溃安全不变量，
+        // 同时把原来每触一个桶就全量写一次 state 合并成每次条目落盘前至多一次。
+        const touchBucket = bucket => {
             if (affectedBuckets.has(bucket)) return;
             affectedBuckets.add(bucket);
             state.pendingBuckets = [...affectedBuckets];
+            bucketsDirty = true;
+        };
+        const flushPendingBuckets = async () => {
+            if (!bucketsDirty) return;
+            bucketsDirty = false;
             await cacheWriteState(cacheDb, state);
         };
         const yieldIfNeeded = createYieldController();
         const removeEntries = async keys => {
-            for (const key of keys) {
-                const entry = await cacheReadEntry(cacheDb, key);
-                if (entry) await touchBucket(entry.bucketKey);
+            const list = [...keys];
+            if (!list.length) return;
+            for (const entry of await readCacheEntries(cacheDb, list)) {
+                if (entry) touchBucket(entry.bucketKey);
             }
-            await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE, [...keys]);
+            await flushPendingBuckets();
+            await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE, list);
         };
         const replaceSource = async (sourceKey, value) => {
             const remaining = new Set(await cacheSourceKeys(cacheDb, sourceKey));
@@ -1052,8 +1093,9 @@
                 remaining.delete(id);
                 if (!previous || !snapshotBytesEqual(value, previous.bytes)) {
                     const entry = buildCacheEntry(value);
-                    if (previous) await touchBucket(previous.bucketKey);
-                    await touchBucket(entry.bucketKey);
+                    if (previous) touchBucket(previous.bucketKey);
+                    touchBucket(entry.bucketKey);
+                    await flushPendingBuckets();
                     await cacheWriteEntries(cacheDb, [entry]);
                 }
             }
@@ -1079,22 +1121,28 @@
                         remaining.delete(previous.id);
                     }
                 }
+                const previousEntries = new Map();
+                for (const entry of await readCacheEntries(cacheDb, [...values.keys()])) {
+                    if (entry) previousEntries.set(entry.id, entry);
+                }
                 let writes = [];
                 let bytes = 0;
                 for (const [id, item] of values) {
                     remaining.delete(id);
-                    const previous = await cacheReadEntry(cacheDb, id);
-                    if (previous) await touchBucket(previous.bucketKey);
+                    const previous = previousEntries.get(id);
+                    if (previous) touchBucket(previous.bucketKey);
                     const entry = buildCacheEntry(item);
-                    await touchBucket(entry.bucketKey);
+                    touchBucket(entry.bucketKey);
                     writes.push(entry);
                     bytes += entry.bytes.byteLength;
                     if (bytes >= CONFIG.cacheWriteBytes || writes.length >= CONFIG.readBatchSize) {
+                        await flushPendingBuckets();
                         await cacheWriteEntries(cacheDb, writes);
                         writes = [];
                         bytes = 0;
                     }
                 }
+                await flushPendingBuckets();
                 await cacheWriteEntries(cacheDb, writes);
                 await yieldIfNeeded();
             }
@@ -1116,7 +1164,18 @@
             const db = await openDbByName(database);
             try {
                 const stores = readStoreDefinitions(db, knownDb.stores.filter(name => db.objectStoreNames.contains(name)));
-                await replaceSource(`db:${database}`, { type: 'database', name: database, version: db.version, stores });
+                let headerValue = { type: 'database', name: database, version: db.version, stores };
+                const previousHeader = await cacheReadEntry(cacheDb, snapshotEntryId(headerValue));
+                if (previousHeader && !snapshotBytesEqual(headerValue, previousHeader.bytes)) {
+                    // 仅内置版本号变化（store 定义等价）时改用缓存 header 的版本号，
+                    // 让随后的字节比较判等，不再制造无效的 header 分片；
+                    // 真实 schema 变化仍以当前版本号写入。
+                    const stabilized = { ...headerValue, version: readCachedHeaderVersion(previousHeader.bytes) };
+                    if (stabilized.version !== null && snapshotBytesEqual(stabilized, previousHeader.bytes)) {
+                        headerValue = stabilized;
+                    }
+                }
+                await replaceSource(`db:${database}`, headerValue);
                 await replaceSource(`db-end:${database}`, { type: 'databaseEnd', name: database });
                 for (const definition of stores) {
                     await replaceSource(`store-end:${database}/${definition.name}`, { type: 'storeEnd', database, store: definition.name });
@@ -1125,24 +1184,47 @@
                 const otherGroups = state.groups.filter(group => !group.startsWith(`db:${database}:`) && !dbGroups.includes(group));
                 const localGroup = otherGroups.includes('localStorage') ? ['localStorage'] : [];
                 state.groups = [...localGroup, ...otherGroups.filter(group => group !== 'localStorage'), `db:${database}:header`, ...dbGroups, `db:${database}:footer`];
+                if (item.clear) {
+                    // clear 按最终键集合做差分：只删除真正消失的键；clear 后原样
+                    // 回填的数据继续交给键循环字节比较去重，不再整店重写缓存。
+                    const finalSources = new Set();
+                    for (const key of item.keys.values()) {
+                        if (!isSyncExcludedRecord(database, store, key)) {
+                            finalSources.add(`${database}/${store}/${stableKeyToken(key)}`);
+                        }
+                    }
+                    const prefix = `${database}/${store}/`;
+                    const staleKeys = await new Promise((resolve, reject) => {
+                        const request = cacheDb.transaction(LOCAL_CACHE_ENTRY_STORE).objectStore(LOCAL_CACHE_ENTRY_STORE)
+                            .index('sourceKey').openCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+                        const keys = [];
+                        request.onsuccess = () => {
+                            const cursor = request.result;
+                            if (!cursor) return resolve(keys);
+                            if (!finalSources.has(cursor.key)) keys.push(cursor.primaryKey);
+                            cursor.continue();
+                        };
+                        request.onerror = () => reject(request.error);
+                    });
+                    await removeEntries(staleKeys);
+                }
+                const dirtyKeys = [...item.keys.values()].filter(key => !isSyncExcludedRecord(database, store, key));
+                // 单连接 + 批量只读事务读取变化键：原来每键重开一次数据库、
+                // 每键一个事务，收敛为每库一次打开、每 64 键一个只读事务，
+                // 只读连接不会阻塞业务写入。
+                for (let start = 0; start < dirtyKeys.length; start += CONFIG.restoreBatchSize) {
+                    const batch = dirtyKeys.slice(start, start + CONFIG.restoreBatchSize);
+                    const values = await readRecordsByKeys(db, store, batch);
+                    for (let index = 0; index < batch.length; index += 1) {
+                        const key = batch[index];
+                        const value = values[index];
+                        const sourceKey = `${database}/${store}/${stableKeyToken(key)}`;
+                        if (Array.isArray(value)) await replaceArraySource(database, store, key, value, sourceKey);
+                        else await replaceSource(sourceKey, value === undefined ? null : { type: 'record', database, store, key, value });
+                    }
+                    await yieldIfNeeded();
+                }
             } finally { db.close(); }
-            if (item.clear) {
-                const prefix = `${database}/${store}/`;
-                const keys = await new Promise((resolve, reject) => {
-                    const request = cacheDb.transaction(LOCAL_CACHE_ENTRY_STORE).objectStore(LOCAL_CACHE_ENTRY_STORE)
-                        .index('sourceKey').getAllKeys(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
-                    request.onsuccess = () => resolve(request.result);
-                    request.onerror = () => reject(request.error);
-                });
-                await removeEntries(keys);
-            }
-            for (const key of item.keys.values()) {
-                if (isSyncExcludedRecord(database, store, key)) continue;
-                const sourceKey = `${database}/${store}/${stableKeyToken(key)}`;
-                const value = await readObjectStoreRecordByKey(database, store, key);
-                if (Array.isArray(value)) await replaceArraySource(database, store, key, value, sourceKey);
-                else await replaceSource(sourceKey, value === undefined ? null : { type: 'record', database, store, key, value });
-            }
         }
         const groupOrder = ['localStorage'];
         for (const definition of CONFIG.knownDatabases) {
@@ -1975,16 +2057,12 @@
         }
     }
 
-    async function* iterateMissingUploadPacks(snapshot) {
-        const available = new Set();
-        let cursor;
-        do {
-            const page = await postSync({ action: 'list-upload-packs', cursor });
-            for (const pack of page.availablePacks) {
-                available.add(`${pack.checksum}:${pack.length}`);
-            }
-            cursor = page.cursor;
-        } while (cursor);
+    async function* iterateMissingUploadPacks(snapshot, remotePackManifest) {
+        // 直接用基线远端快照的分片清单作种子：已提交到远端的分片必然已在 R2 中，
+        // 不再每次上传都列举全部历史分片（原来是每次 O(历史分片数/1000) 个请求）。
+        // 中断上传等异常由提交时服务器的 409 missingPacks 定向补传兜底。
+        const available = new Set((Array.isArray(remotePackManifest) ? remotePackManifest : [])
+            .map(pack => `${pack.checksum}:${pack.length}`));
         const yielded = new Set();
         for (const pack of snapshot.packManifest) {
             const key = `${pack.checksum}:${pack.length}`;
@@ -2320,7 +2398,7 @@
 
         updateProgress(progress.uploadStart, '正在上传…');
         await uploadCachedSnapshot(
-            iterateMissingUploadPacks(snapshot),
+            iterateMissingUploadPacks(snapshot, baseRemote?.packManifest),
             snapshot.totalBytes,
             progress.uploadStart,
             progress.uploadEnd

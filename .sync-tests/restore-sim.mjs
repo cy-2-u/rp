@@ -2,6 +2,11 @@
 //   browser A uploads, browser B restores over its own data, browser A
 //   uploads an increment. Exercises bootstrap.js end to end, including the
 //   restore state machine, exclusions and the bounded upload engine.
+// Phase 4 additionally pins the incremental upload contract: only changed
+// keys are read (in bounded batches through one connection), invalid changes
+// (same-value puts, change-and-revert, clear+identical refill, version-only
+// schema churn) touch neither the snapshot cache nor the remote, and pushes
+// never enumerate historical packs in R2.
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -327,6 +332,16 @@ const makeFetchShim = label => async (input, init) => {
 
 // ------------------------------------------------- phase 1: browser A ------
 
+// Business database open counter: incremental pushes must reuse one
+// connection per database instead of reopening per changed key. Installed
+// before any dirty-tracker capture so every native open is counted.
+const nativeFactoryOpen = FDBFactory.prototype.open;
+let businessOpens = 0;
+FDBFactory.prototype.open = function (name, ...rest) {
+    if (['RPHubDB', 'AICharGen'].includes(name)) businessOpens += 1;
+    return nativeFactoryOpen.call(this, name, ...rest);
+};
+
 const factoryA = new FDBFactory();
 const StorageA = makeStorageClass();
 const localStorageA = new StorageA();
@@ -356,6 +371,10 @@ const locationA = {
     assign(url) { this.assigned = url; }
 };
 const requestsA = [];
+const recordAction = init => {
+    if (typeof init?.body !== 'string') return null;
+    try { return JSON.parse(init.body).action ?? null; } catch { return null; }
+};
 const fetchShimA = async (input, init) => {
     const url = typeof input === 'string' ? input : input.url;
     assert.ok(url.startsWith('/api/rp-sync'), `unexpected fetch in browser A: ${url}`);
@@ -364,7 +383,7 @@ const fetchShimA = async (input, init) => {
         requestsA.push({ kind: 'batch', packs });
         return makeFetchShim('browser A')(input, init);
     }
-    requestsA.push({ kind: url.includes('upload-pack-batch') ? 'batch' : url });
+    requestsA.push({ kind: url.includes('upload-pack-batch') ? 'batch' : url, action: recordAction(init) });
     return makeFetchShim('browser A')(input, init);
 };
 const savedPrototypes = snapshotPrototypes();
@@ -521,18 +540,73 @@ FDBObjectStore.prototype.get = function (key) {
     if (this.transaction.mode === 'readonly' && ['store', 'characters'].includes(this.name)) reads.keys.push(key);
     return nativeReadGet.call(this, key);
 };
+// Cache mutation counters: invalid changes must not touch the snapshot cache
+// at all, so writes and deletes on RPHubSyncCache/entries are counted per push.
+const cacheWrites = { puts: 0, deletes: 0 };
+const nativeStorePut = FDBObjectStore.prototype.put;
+const nativeStoreDelete = FDBObjectStore.prototype.delete;
+FDBObjectStore.prototype.put = function (...args) {
+    if (this.transaction.db.name === 'RPHubSyncCache' && this.name === 'entries') cacheWrites.puts += 1;
+    return nativeStorePut.apply(this, args);
+};
+FDBObjectStore.prototype.delete = function (...args) {
+    if (this.transaction.db.name === 'RPHubSyncCache' && this.name === 'entries') cacheWrites.deletes += 1;
+    return nativeStoreDelete.apply(this, args);
+};
+// Readonly-transaction counter on the main business store: proves changed
+// keys are read back in bounded batches instead of one transaction per key.
+const nativeDbTransaction = FDBDatabase.prototype.transaction;
+let readonlyStoreTxs = 0;
+FDBDatabase.prototype.transaction = function (names, mode) {
+    const scope = typeof names === 'string' ? [names] : Array.from(names || []);
+    if (this.name === 'RPHubDB' && mode === 'readonly' && scope.includes('store')) readonlyStoreTxs += 1;
+    return nativeDbTransaction.apply(this, arguments);
+};
 async function push(label) {
     modalA.querySelector('[data-action="push"]').click();
     await waitForUploadDone(modalA, label);
     assert.equal(reads.cursors, 0, 'later uploads may not full-scan business stores');
 }
 const batchesCount = () => requestsA.filter(entry => entry.kind === 'batch').length;
+
 await idbPut(factoryA, 'RPHubDB', 'store', 'settings', { nested: { b: [1, 2, 3], a: 1 }, theme: 'dark' });
 const noOpBatches = batchesCount();
 await push('object order only');
 assert.equal(batchesCount(), noOpBatches, 'same content must send zero packs');
 assert.equal((await readManifest(bucket)).version, manifestV2.version, 'no-op must not commit a new version');
 assert.ok(!reads.keys.includes('chat_big'), 'unchanged conversations must not be read');
+{
+    const puts = cacheWrites.puts;
+    const deletes = cacheWrites.deletes;
+    assert.equal(puts, 0, 'object-order no-op must not rewrite cache entries');
+    assert.equal(deletes, 0, 'object-order no-op must not delete cache entries');
+}
+
+// A put with byte-identical content is an invalid change: the journal records
+// it, but neither the snapshot cache nor the upload may be touched.
+await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'hello-2');
+{
+    const puts = cacheWrites.puts;
+    const deletes = cacheWrites.deletes;
+    await push('same-value put');
+    assert.equal(batchesCount(), noOpBatches, 'same-value put must send zero packs');
+    assert.equal(cacheWrites.puts, puts, 'same-value put must not rewrite cache entries');
+    assert.equal(cacheWrites.deletes, deletes, 'same-value put must not delete cache entries');
+    assert.equal((await readManifest(bucket)).version, manifestV2.version, 'same-value put must not commit');
+}
+// Changing a value and reverting it inside one journal window is also an
+// invalid change: the final bytes equal the cached bytes.
+await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'temporary');
+await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'hello-2');
+{
+    const puts = cacheWrites.puts;
+    const deletes = cacheWrites.deletes;
+    await push('change and revert');
+    assert.equal(batchesCount(), noOpBatches, 'change-and-revert must send zero packs');
+    assert.equal(cacheWrites.puts, puts, 'change-and-revert must not rewrite cache entries');
+    assert.equal(cacheWrites.deletes, deletes, 'change-and-revert must not delete cache entries');
+    assert.equal((await readManifest(bucket)).version, manifestV2.version, 'change-and-revert must not commit');
+}
 
 async function writeTransaction(name, store, action, { abort = false } = {}) {
     const db = await idbOpen(factoryA, name, 1, [store]);
@@ -562,10 +636,35 @@ await writeTransaction('AICharGen', 'characters', store => { store.clear(); stor
 await push('clear and new record');
 text = await readManifestPackText(bucket, await readManifest(bucket));
 assert.ok(!text.includes('Alice') && text.includes('after-clear'));
+// clear followed by putting the identical records back is an invalid change:
+// the final key set matches the cache, so nothing may be deleted or rewritten.
+await writeTransaction('AICharGen', 'characters', store => { store.clear(); store.put({ id: 'after-clear' }, 'new'); });
+{
+    const puts = cacheWrites.puts;
+    const deletes = cacheWrites.deletes;
+    const version = (await readManifest(bucket)).version;
+    const refillBatches = batchesCount();
+    await push('clear and identical refill');
+    assert.equal(batchesCount(), refillBatches, 'identical refill must send zero packs');
+    assert.equal(cacheWrites.puts, puts, 'identical refill must not rewrite cache entries');
+    assert.equal(cacheWrites.deletes, deletes, 'identical refill must not delete surviving cache entries');
+    assert.equal((await readManifest(bucket)).version, version, 'identical refill must not commit');
+}
 await writeTransaction('RPHubDB', 'store', store => {
     for (let index = 0; index < 5105; index += 1) store.put({ index }, `many_${index}`);
 });
-await push('more than 5000 keys');
+{
+    // Bounded incremental reading: one connection per database and one
+    // readonly transaction per 64 changed keys, not one of each per key.
+    const opensBefore = businessOpens;
+    const txsBefore = readonlyStoreTxs;
+    await push('more than 5000 keys');
+    const openDelta = businessOpens - opensBefore;
+    const txDelta = readonlyStoreTxs - txsBefore;
+    assert.ok(openDelta <= 8, `5105 changed keys must not reopen the database per key (${openDelta} opens)`);
+    assert.ok(txDelta >= 80 && txDelta <= 160,
+        `5105 changed keys must be read in 64-key batches (${txDelta} readonly transactions)`);
+}
 text = await readManifestPackText(bucket, await readManifest(bucket));
 for (let index = 0; index < 5105; index += 1) assert.ok(text.includes(`"many_${index}"`));
 
@@ -607,6 +706,33 @@ const retryBatches = batchesCount();
 await push('commit retry');
 assert.equal(batchesCount(), retryBatches, 'retry must reuse committed packs');
 
+// Bumping the internal IndexedDB version without store changes is an invalid
+// change source: the cached header must be reused instead of rebuilding the
+// header bucket every push. AICharGen is used because later tests keep opening
+// RPHubDB at version 1.
+{
+    const bumpDb = await idbOpen(factoryA, 'AICharGen', 2, ['characters']);
+    bumpDb.close();
+    const putDb = await idbOpen(factoryA, 'AICharGen', undefined, ['characters']);
+    try {
+        await new Promise((resolve, reject) => {
+            const tx = putDb.transaction('characters', 'readwrite');
+            tx.objectStore('characters').put({ id: 'after-clear' }, 'new');
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+        });
+    } finally { putDb.close(); }
+    const puts = cacheWrites.puts;
+    const deletes = cacheWrites.deletes;
+    const version = (await readManifest(bucket)).version;
+    const bumpBatches = batchesCount();
+    await push('same content under bumped db version');
+    assert.equal(batchesCount(), bumpBatches, 'version-only churn must send zero packs');
+    assert.equal(cacheWrites.puts, puts, 'version-only churn must not rewrite cache entries');
+    assert.equal(cacheWrites.deletes, deletes, 'version-only churn must not delete cache entries');
+    assert.equal((await readManifest(bucket)).version, version, 'version-only churn must not commit');
+}
+
 const remoteBeforeConflict = await readManifest(bucket);
 const altered = { ...remoteBeforeConflict, version: remoteBeforeConflict.version + 1 };
 await bucket.put(MANIFEST_KEY, JSON.stringify(altered));
@@ -616,7 +742,16 @@ modalA.querySelector('[data-action="push"]').click();
 await waitFor(() => modalA.classList.contains('is-error'), 60000, 'stale baseline conflict');
 assert.equal(batchesCount(), conflictBatches, 'stale client must not upload packs');
 assert.equal((await readManifest(bucket)).checksum, remoteBeforeConflict.checksum, 'stale client must not replace remote');
+// Uploads must seed missing packs from the baseline manifest instead of
+// enumerating every historical pack in R2 on each push.
+assert.ok(requestsA.some(entry => entry.action === 'prepare-upload'), 'action recording must observe uploads');
+assert.equal(requestsA.filter(entry => entry.action === 'list-upload-packs').length, 0,
+    'uploads must not enumerate historical packs');
 FDBObjectStore.prototype.openCursor = nativeReadCursor;
 FDBObjectStore.prototype.get = nativeReadGet;
-console.log('phase 4 (strict increments, rollback, clear, 5105 keys, watermark, retry, conflict): ok');
+FDBObjectStore.prototype.put = nativeStorePut;
+FDBObjectStore.prototype.delete = nativeStoreDelete;
+FDBDatabase.prototype.transaction = nativeDbTransaction;
+FDBFactory.prototype.open = nativeFactoryOpen;
+console.log('phase 4 (strict increments, invalid changes, clear diff, batched reads, version churn, watermark, retry, conflict): ok');
 console.log('restore-sim: ok');
