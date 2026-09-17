@@ -1,0 +1,286 @@
+.rp-sync-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: none;
+    color: #111827;
+}
+
+.rp-sync-modal.is-open {
+    display: block;
+}
+
+.rp-sync-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(17, 24, 39, 0.32);
+    backdrop-filter: blur(5px);
+}
+
+.rp-sync-modal__panel {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: min(92vw, 420px);
+    max-height: min(86vh, 640px);
+    overflow-y: auto;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 24px 70px -34px rgba(15, 23, 42, 0.55);
+    padding: 18px;
+}
+
+.rp-sync-modal__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.rp-sync-modal__eyebrow {
+    color: #2563eb;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.rp-sync-modal__title {
+    margin: 0;
+    color: #111827;
+    font-size: 20px;
+    line-height: 1.2;
+    font-weight: 800;
+}
+
+.rp-sync-modal__title-main {
+    display: block;
+    color: #111827;
+    font-size: 18px;
+    line-height: 1.1;
+    font-weight: 800;
+    letter-spacing: 0;
+}
+
+.rp-sync-modal__close {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 999px;
+    background: #fff;
+    color: #6b7280;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.rp-sync-modal__close:hover {
+    color: #111827;
+    border-color: rgba(156, 163, 175, 0.9);
+}
+
+.rp-sync-modal--restore .rp-sync-modal__close {
+    width: auto;
+    padding: 0 12px;
+    border-radius: 8px;
+    font-size: 13px;
+}
+
+.rp-sync-modal.is-error .rp-sync-modal__status,
+.rp-sync-modal.is-error .rp-sync-progress__value {
+    color: #b91c1c;
+}
+
+.rp-sync-modal.is-error .rp-sync-progress__bar {
+    background: #dc2626;
+}
+
+.rp-sync-main-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.rp-sync-action-button {
+    min-width: 0;
+    height: 42px;
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 12px;
+    background: #fff;
+    color: #374151;
+    font-size: 15px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.rp-sync-action-button:hover {
+    border-color: rgba(59, 130, 246, 0.35);
+    background: #f8fafc;
+    color: #1d4ed8;
+}
+
+.rp-sync-action-button.is-primary {
+    border-color: rgba(37, 99, 235, 0.25);
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.rp-sync-action-button:disabled,
+.rp-sync-modal__button:disabled {
+    opacity: 0.62;
+    cursor: wait;
+}
+
+.rp-sync-modal__status {
+    min-height: 22px;
+    margin: 14px 0 10px;
+    color: #4b5563;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.rp-sync-progress {
+    width: 100%;
+    height: 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e5e7eb;
+}
+
+.rp-sync-progress__bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: #2563eb;
+    transition: width 0.28s ease;
+}
+
+.rp-sync-progress__value {
+    margin-top: 6px;
+    text-align: right;
+    color: #2563eb;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.rp-sync-modal__intro {
+    margin: 0 0 10px;
+    color: #64748b;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.rp-sync-password-field {
+    display: grid;
+    gap: 7px;
+    margin-top: 14px;
+    color: #475569;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.rp-sync-modal__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.rp-sync-modal__button {
+    min-width: 78px;
+    border: 1px solid rgba(209, 213, 219, 0.95);
+    border-radius: 999px;
+    background: #fff;
+    color: #374151;
+    font-size: 13px;
+    font-weight: 800;
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+.rp-sync-modal__button:hover {
+    border-color: rgba(59, 130, 246, 0.35);
+    color: #1d4ed8;
+}
+
+.rp-sync-modal__button.is-primary {
+    border-color: rgba(37, 99, 235, 0.25);
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.rp-sync-password-field input {
+    width: 100%;
+    border: 1px solid rgba(209, 213, 219, 0.95);
+    border-radius: 12px;
+    background: #fff;
+    color: #111827;
+    font-size: 15px;
+    line-height: 1.4;
+    padding: 11px 12px;
+    outline: none;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.rp-sync-password-field input:focus {
+    border-color: rgba(37, 99, 235, 0.52);
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.11);
+}
+
+.rp-sync-password-status {
+    min-height: 20px;
+    margin: 10px 0 0;
+    color: #475569;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+    .rp-sync-modal__backdrop {
+        background: rgba(17, 24, 39, 0.36);
+    }
+
+    .rp-sync-modal__panel {
+        left: 0;
+        right: 0;
+        bottom: 0;
+        top: auto;
+        width: 100%;
+        max-height: min(82vh, 620px);
+        transform: none;
+        border-right: 0;
+        border-bottom: 0;
+        border-left: 0;
+        border-radius: 20px 20px 0 0;
+        padding: 16px 16px max(16px, env(safe-area-inset-bottom));
+    }
+
+    .rp-sync-modal__header {
+        margin-bottom: 12px;
+    }
+
+    .rp-sync-modal__title {
+        font-size: 18px;
+    }
+
+    .rp-sync-modal__title-main {
+        font-size: 17px;
+    }
+
+    .rp-sync-main-actions {
+        gap: 8px;
+    }
+
+    .rp-sync-action-button {
+        height: 42px;
+        font-size: 14px;
+        border-radius: 12px;
+    }
+
+}
