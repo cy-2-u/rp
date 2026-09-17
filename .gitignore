@@ -1,0 +1,4 @@
+.sync-tests/node_modules/
+*.log
+*.tmp
+*.tmp.mjs

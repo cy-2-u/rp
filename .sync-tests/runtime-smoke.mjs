@@ -62,13 +62,6 @@ async function loadWorker(fetchImpl = globalThis.fetch) {
     return new Function('fetch', 'HTMLRewriter', transformed)(fetchImpl, FakeHTMLRewriter);
 }
 
-async function loadWorkerInternals(fetchImpl = globalThis.fetch) {
-    const source = await read('_worker.js');
-    const transformed = source.replace('export default {', 'const workerExport = {')
-        + '\nreturn { worker: workerExport, handleUploadPackBatch };';
-    return new Function('fetch', 'HTMLRewriter', transformed)(fetchImpl, FakeHTMLRewriter);
-}
-
 async function testAdapterFromFileUrl() {
     const workerSource = await read('_worker.js');
     const start = workerSource.indexOf('const AUTHOR_BASE');
@@ -351,7 +344,7 @@ async function testUploadBatchEndpoint() {
             return { key };
         }
     };
-    const { worker } = await loadWorkerInternals();
+    const worker = await loadWorker();
     const definitions = [
         { checksum: 'a'.repeat(64), length: 4 },
         { checksum: 'b'.repeat(64), length: 3 }
@@ -383,7 +376,6 @@ async function testBootstrapUsesBoundedEngine() {
 }
 
 async function testAdapterConfigEndpoint() {
-    const workerSource = await read('_worker.js');
     const fetchMock = async input => {
         const url = new URL(String(input));
         if (url.protocol === 'file:') {

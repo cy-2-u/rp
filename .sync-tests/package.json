@@ -6,7 +6,8 @@
   "scripts": {
     "runtime-smoke": "node runtime-smoke.mjs",
     "restore-sim": "node restore-sim.mjs",
-    "test": "npm run runtime-smoke && npm run restore-sim"
+    "audit-regressions": "node audit-regressions.mjs && node worker-regressions.mjs && node image-task-regressions.mjs",
+    "test": "npm run runtime-smoke && npm run restore-sim && npm run audit-regressions"
   },
   "devDependencies": {
     "fake-indexeddb": "6.2.5"
