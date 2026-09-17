@@ -154,7 +154,10 @@
             } finally {
                 db.close();
             }
-        })();
+        })().catch(error => {
+            if (imageStores.get(id) === state) imageStores.delete(id);
+            throw error;
+        });
         imageStores.set(id, state);
         return state.loadPromise;
     };
@@ -290,6 +293,19 @@
     const imageGenerationTasks = new Map();
     const imageSlotTasks = new Map();
     const imageCardBindings = new WeakMap();
+    const SLOT_TASK_CACHE_LIMIT = 128;
+
+    // 已结算的槽位任务只用于复用渲染；超限后按插入顺序淘汰已完成的
+    // 条目，进行中的任务保留。被淘汰的槽位重新渲染时走已保存记录的
+    // 完成态路径，不会重新生成。
+    const pruneSlotTasks = () => {
+        if (imageSlotTasks.size <= SLOT_TASK_CACHE_LIMIT) return;
+        for (const [key, task] of imageSlotTasks) {
+            if (imageSlotTasks.size <= SLOT_TASK_CACHE_LIMIT) break;
+            if (task.job?.status === 'running') continue;
+            imageSlotTasks.delete(key);
+        }
+    };
 
     const publishImageJob = (task, job) => {
         task.job = job;
@@ -297,6 +313,7 @@
             if (!card.isConnected) task.cards.delete(card);
             else renderDirectImageJob(task.render, card, task, job);
         });
+        pruneSlotTasks();
         return job;
     };
 
@@ -330,6 +347,9 @@
                 error: error?.message || '生成失败',
                 generationProgress: { percent: 0 }
             }));
+        promise.finally(() => {
+            if (imageGenerationTasks.get(key) === promise) imageGenerationTasks.delete(key);
+        });
         imageGenerationTasks.set(key, promise);
         return promise;
     };
@@ -375,6 +395,7 @@
             promise: null
         };
         imageSlotTasks.set(slotKey, task);
+        pruneSlotTasks();
         task.promise = createImageGenerationTask(readUrl, generateUrl).then(async job => {
             if (imageSlotTasks.get(slotKey) !== task) return job;
             if (job.status === 'done') {
@@ -403,7 +424,7 @@
         const state = await loadImageStore(characterId, characterName);
         const slotKey = JSON.stringify([String(characterId || ''), descriptor.messageId || `index:${descriptor.messageIndex}`, descriptor.occurrenceIndex]);
         const activeTask = imageSlotTasks.get(slotKey);
-        if (fresh !== true && activeTask
+        if (fresh !== true && activeTask && activeTask.job?.status !== 'failed'
             && (activeTask.record.promptHash === descriptor.promptHash || activeTask.sourcePromptHash === descriptor.promptHash)) {
             activeTask.requestUrl = buildRecordUrl(activeTask.record, token, true);
             activeTask.render = render;
@@ -438,6 +459,7 @@
             const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
             Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
             imageSlotTasks.set(slotKey, task);
+            pruneSlotTasks();
             return task;
         }
 
@@ -676,19 +698,31 @@
         const settingsButton = [...nav.querySelectorAll(':scope > button')].find(item => item.textContent.includes('设置'));
         nav.insertBefore(button, settingsButton || null);
     };
-    const findFixedImageGrid = () => [...document.querySelectorAll('label')]
-        .filter(label => [...label.querySelectorAll('span')].some(span => span.textContent.trim() === '沉浸模式'))
-        .map(label => label.parentElement)
-        .find(grid => grid?.classList.contains('grid')) || null;
-    const installFixedImageSetting = () => {
-        if (typeof window.RPHubAuthorSaveData !== 'function') return;
+    const findFixedImageAnchor = () => {
         const cfg = settingsConfig();
-        const grid = cfg.labelSelector
+        const labels = cfg.labelSelector
             ? [...document.querySelectorAll(cfg.labelSelector)]
                 .filter(label => textOf(label).includes(String(cfg.labelText || '沉浸模式')))
                 .filter(label => cfg.anchorParentSelector ? label.closest(cfg.anchorParentSelector) : true)
-                .slice(cfg.occurrence === 'last' ? -1 : 0)[0]?.closest(cfg.anchorParentSelector || 'div')
-            : findFixedImageGrid();
+            : [...document.querySelectorAll('label')]
+                .filter(label => [...label.querySelectorAll('span')].some(span => span.textContent.trim() === '沉浸模式'));
+        const label = labels[cfg.occurrence === 'last' ? labels.length - 1 : 0] || null;
+        if (!label) return { grid: null, anchor: null };
+        const grid = cfg.labelSelector
+            ? label.closest(cfg.anchorParentSelector || 'div')
+            : (label.parentElement?.classList.contains('grid') ? label.parentElement : null);
+        if (!grid) return { grid: null, anchor: null };
+        // 锚点可能是网格的嵌套后代；插入位相对锚点计算，作者调整设置项
+        // 顺序不再改变“固定生图”的落点。
+        let anchor = label;
+        while (anchor && anchor.parentElement !== grid) anchor = anchor.parentElement;
+        if (anchor?.parentElement !== grid) anchor = null;
+        return { grid, anchor };
+    };
+    const installFixedImageSetting = () => {
+        if (typeof window.RPHubAuthorSaveData !== 'function') return;
+        const cfg = settingsConfig();
+        const { grid, anchor } = findFixedImageAnchor();
         if (!grid || grid.querySelector('.magic-fixed-image-toggle')) return;
         const label = document.createElement('label');
         label.className = 'magic-fixed-image-toggle flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group';
@@ -696,7 +730,10 @@
         const input = label.querySelector('input');
         input.checked = isFixedImageEnabled();
         input.addEventListener('change', () => localStorage.setItem(FIXED_IMAGE_KEY, input.checked ? '1' : '0'));
-        grid.insertBefore(label, cfg.insert === 'after' ? grid.children[0]?.nextSibling || null : grid.children[4] || null);
+        const insertAfter = cfg.insert === 'after';
+        grid.insertBefore(label, anchor
+            ? (insertAfter ? anchor.nextSibling : anchor)
+            : (insertAfter ? grid.children[0]?.nextSibling || null : null));
     };
 
     let scrollContainer = null;
@@ -772,7 +809,7 @@
             document.querySelector('.app-sidebar'),
             document.querySelector(navigationConfig().content || '.app-navigation-content'),
             document.querySelector('.app-main'),
-            findFixedImageGrid(),
+            findFixedImageAnchor().grid,
             document.querySelector(chatConfig().input || 'textarea.chat-input-scrollbar')?.closest(chatConfig().row || '.relative.w-full.flex.items-end'),
             scrollContainer
         ].filter(Boolean));

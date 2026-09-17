@@ -1,6 +1,175 @@
+(function (global) {
+    'use strict';
+
+    function toAsyncIterator(source) {
+        if (source && typeof source[Symbol.asyncIterator] === 'function') return source[Symbol.asyncIterator]();
+        if (source && typeof source[Symbol.iterator] === 'function') {
+            const iterator = source[Symbol.iterator]();
+            return {
+                next: async () => iterator.next(),
+                return: async () => typeof iterator.return === 'function' ? iterator.return() : { done: true }
+            };
+        }
+        throw new TypeError('上传数据源必须是可迭代对象。');
+    }
+
+    function createBatchReader(source, maxItems, maxBytes) {
+        const iterator = toAsyncIterator(source);
+        let pending = null;
+        let ended = false;
+
+        const readBatch = async function readBatch() {
+            if (ended) return null;
+            const items = [];
+            let totalBytes = 0;
+            while (items.length < maxItems) {
+                const result = pending || await iterator.next();
+                pending = null;
+                if (result.done) {
+                    ended = true;
+                    break;
+                }
+                const item = result.value;
+                const length = Number(item?.length);
+                if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
+                    throw new Error('上传分片大小无效。');
+                }
+                if (items.length > 0 && totalBytes + length > maxBytes) {
+                    pending = result;
+                    break;
+                }
+                items.push(item);
+                totalBytes += length;
+                if (totalBytes === maxBytes) break;
+            }
+            return items.length ? { items, totalBytes } : null;
+        };
+        readBatch.close = async () => {
+            if (ended) return;
+            ended = true;
+            pending = null;
+            if (typeof iterator.return === 'function') await iterator.return();
+        };
+        return readBatch;
+    }
+
+    async function runBoundedUpload(options = {}) {
+        const normalizeLimit = (value, fallback) => {
+            const number = Number(value);
+            return Number.isFinite(number) && number >= 1 ? Math.floor(number) : fallback;
+        };
+        const concurrency = normalizeLimit(options.concurrency, 1);
+        const maxItems = normalizeLimit(options.maxItems, 1);
+        const maxBytes = normalizeLimit(options.maxBytes, 1);
+        if (typeof options.read !== 'function' || typeof options.send !== 'function') {
+            throw new TypeError('上传引擎缺少 read/send 回调。');
+        }
+
+        const readBatch = createBatchReader(options.items, maxItems, maxBytes);
+        const active = new Set();
+        let stopped = false;
+        let failure = null;
+        let uploadedBytes = 0;
+        let uploadedItems = 0;
+
+        const launch = batch => {
+            const task = (async () => {
+                const records = [];
+                try {
+                    for (const item of batch.items) {
+                        if (failure) throw failure;
+                        const value = await options.read(item);
+                        if (!value || !value.bytes || !Number.isSafeInteger(value.bytes.byteLength)
+                            || value.bytes.byteLength !== item.length) {
+                            throw new Error('本地同步缓存不完整，请重新上传。');
+                        }
+                        records.push({ ...item, ...value });
+                    }
+                    await options.send(records);
+                    uploadedBytes += batch.totalBytes;
+                    uploadedItems += batch.items.length;
+                    await options.onBatchSuccess?.({
+                        bytes: uploadedBytes,
+                        items: uploadedItems,
+                        batchBytes: batch.totalBytes,
+                        batchItems: batch.items.length
+                    });
+                } finally {
+                    records.forEach(record => { record.bytes = null; });
+                }
+            })();
+            active.add(task);
+            task.then(() => active.delete(task), error => {
+                active.delete(task);
+                failure ||= error;
+            });
+        };
+
+        try {
+            while ((!stopped || active.size) && !failure) {
+                while (!stopped && !failure && active.size < concurrency) {
+                    const batch = await readBatch();
+                    if (!batch) {
+                        stopped = true;
+                        break;
+                    }
+                    launch(batch);
+                }
+                if (active.size) await Promise.race(active);
+            }
+            if (failure) throw failure;
+            return { bytes: uploadedBytes, items: uploadedItems };
+        } finally {
+            await Promise.allSettled([...active]);
+            await readBatch.close?.();
+        }
+    }
+
+    global.RPH_SYNC_UPLOAD_ENGINE = Object.freeze({
+        createBatchReader,
+        runBoundedUpload
+    });
+})(globalThis);
+(function () {
+    const saves = new Set();
+    const debounce = (fn, delay) => {
+        const state = { timer: null, args: null, running: Promise.resolve() };
+        saves.add(state);
+        const run = () => {
+            clearTimeout(state.timer);
+            state.timer = null;
+            const args = state.args;
+            if (!args) return state.running;
+            state.args = null;
+            state.running = state.running.catch(() => undefined).then(() => fn(...args))
+                .catch(error => { state.args ||= args; throw error; });
+            state.running.catch(() => undefined);
+            return state.running;
+        };
+        state.flush = run;
+        return (...args) => {
+            state.args = args;
+            clearTimeout(state.timer);
+            state.timer = setTimeout(run, delay);
+        };
+    };
+    window.RPH_SYNC_PERSISTENCE = {
+        debounce,
+        async flushDebounced() {
+            for (const state of saves) await state.flush();
+        },
+        async manualSave() {
+            if (typeof window.RPHubAuthorSaveData !== 'function') throw new Error('作者保存接口未就绪，请刷新后重试。');
+            await window.RPHubAuthorSaveData();
+            if (window.RPH_MAGIC_FLUSH_IMAGES) await window.RPH_MAGIC_FLUSH_IMAGES();
+            await this.flushDebounced();
+            await window.RPH_SYNC_TRACKER.flush();
+        }
+    };
+})();
 (function () {
     const SNAPSHOT_FORMAT = 'rp-sync-bounded-jsonl-v3';
-    const SNAPSHOT_SCHEMA_VERSION = 11;
+    const SNAPSHOT_SCHEMA_VERSION = 12;
     const DOWNLOAD_STAGING_DB = 'RPHubSyncStaging';
     const DOWNLOAD_STAGING_DB_VERSION = 3;
     const DOWNLOAD_STAGING_STORE = 'packs';
@@ -50,9 +219,12 @@
     const LOCAL_CACHE_ENTRY_STORE = 'entries';
     const LOCAL_CACHE_STATE_STORE = 'state';
     const LOCAL_CACHE_PACK_STORE = 'packs';
-    const DIRTY_STATE_KEY = 'rp_sync_dirty_v1';
+    const JOURNAL_STORE = '__rp_sync_journal_v2';
+    const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
+    const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
+    const BASELINE_KEY = 'rp_sync_baseline_v2';
     const CACHE_STATE_KEY = 'snapshot';
-    const CACHE_FORMAT_VERSION = 5;
+    const CACHE_FORMAT_VERSION = 6;
     const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
     const STABLE_BUCKET_COUNT = 32;
@@ -82,27 +254,57 @@
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
-    function readDirtyState() {
-        try {
-            const value = JSON.parse(localStorage.getItem(DIRTY_STATE_KEY) || '{}');
-            return {
-                revision: Number.isSafeInteger(value?.revision) && value.revision >= 0 ? value.revision : 0,
-                all: value?.all === true,
-                localStorage: new Set(Array.isArray(value?.localStorage) ? value.localStorage : []),
-                stores: new Map(Object.entries(value?.stores || {}).map(([name, item]) => [name, {
-                    all: item?.all === true,
-                    keys: new Set(Array.isArray(item?.keys) ? item.keys : [])
-                }]))
-            };
-        } catch (_) {
-            return { revision: 0, all: true, localStorage: new Set(), stores: new Map() };
+    async function readDirtyState() {
+        const watermark = { databases: {}, intents: [] };
+        const dirty = { localStorage: new Set(), stores: new Map(), watermark, epochs: {} };
+        for (let index = 0; index < localStorage.length; index += 1) {
+            const intent = localStorage.key(index);
+            if (!intent?.startsWith(STORAGE_INTENT_PREFIX)) continue;
+            const key = localStorage.getItem(intent);
+            if (key !== null) { watermark.intents.push(intent); dirty.localStorage.add(key); }
         }
+        for (const name of await listIndexedDbNames()) {
+            const db = await openDbByName(name);
+            try {
+                if (!db.objectStoreNames.contains(JOURNAL_STORE)) throw new Error('本地变更追踪未就绪，请刷新后重试。');
+                await new Promise((resolve, reject) => {
+                    const tx = db.transaction(JOURNAL_STORE, 'readonly');
+                    const request = tx.objectStore(JOURNAL_STORE).openCursor();
+                    request.onsuccess = () => {
+                        const cursor = request.result;
+                        if (!cursor) return;
+                        if (cursor.key === '__epoch__') { dirty.epochs[name] = cursor.value; cursor.continue(); return; }
+                        const event = cursor.value;
+                        watermark.databases[name] = cursor.key;
+                        const identity = `${name}/${event.store}`;
+                        const item = dirty.stores.get(identity) || { clear: false, keys: new Map() };
+                        if (event.clear) { item.clear = true; item.keys.clear(); }
+                        else item.keys.set(stableKeyToken(event.key), event.key);
+                        dirty.stores.set(identity, item);
+                        cursor.continue();
+                    };
+                    tx.oncomplete = resolve;
+                    tx.onabort = () => reject(tx.error || new Error('变更日志读取失败。'));
+                });
+            } finally { db.close(); }
+        }
+        return dirty;
     }
 
-    function clearDirtyRevision(revision) {
-        if (readDirtyState().revision === revision) {
-            localStorage.setItem(DIRTY_STATE_KEY, JSON.stringify({ revision, all: false, localStorage: [], stores: {} }));
-        }
+    function requestExplicitRebuild() {
+        localStorage.setItem('rp_sync_rebuild_requested', '1');
+        return true;
+    }
+    window.RPH_SYNC_REBUILD_CACHE = requestExplicitRebuild;
+
+    function readBaseline() {
+        const value = localStorage.getItem(BASELINE_KEY);
+        if (value === null) return null;
+        try {
+            const parsed = JSON.parse(value);
+            if (!Number.isSafeInteger(parsed.version) || typeof parsed.checksum !== 'string') throw new Error();
+            return parsed;
+        } catch (_) { throw new Error('同步基线损坏，请先导出本地数据，再重新建立基线。'); }
     }
 
     function createYieldController() {
@@ -292,9 +494,12 @@
                     return;
                 }
                 // Stop before deserializing the next record into the batch, so a
-                // single oversized author record never inflates it.
+                // single oversized author record never inflates it. lastKey must be
+                // the last key already read: the next batch resumes with an
+                // exclusive lower bound, so returning the unread cursor.key here
+                // would silently skip that record.
                 if (records.length >= CONFIG.scanBatchRecords || batchBytes >= CONFIG.scanBatchBytes) {
-                    resolve({ records, done: false, lastKey: cursor.key });
+                    resolve({ records, done: false, lastKey: records[records.length - 1].key });
                     return;
                 }
                 records.push({ key: cursor.key, value: cursor.value });
@@ -461,7 +666,25 @@
     }
 
     function serializeSnapshotObject(value) {
-        const json = JSON.stringify(value);
+        const seen = new Set();
+        const canonical = item => {
+            if (item === null || typeof item !== 'object') {
+                if (item === undefined || (typeof item === 'number' && !Number.isFinite(item))
+                    || typeof item === 'bigint' || typeof item === 'function' || typeof item === 'symbol') {
+                    throw new Error('数据包含不支持的非 JSON 值，已停止同步以避免丢失。');
+                }
+                return item;
+            }
+            if (seen.has(item) || (!Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null)) {
+                throw new Error('数据包含循环引用或非 JSON 对象，已停止同步以避免丢失。');
+            }
+            seen.add(item);
+            const value = Array.isArray(item) ? item.map(canonical) : Object.create(null);
+            if (!Array.isArray(item)) for (const key of Object.keys(item).sort()) value[key] = canonical(item[key]);
+            seen.delete(item);
+            return value;
+        };
+        const json = JSON.stringify(canonical(value));
         if (typeof json !== 'string') throw new Error('本地数据包含无法序列化的内容。');
         return new TextEncoder().encode(json);
     }
@@ -493,15 +716,26 @@
         return new Promise((resolve, reject) => {
             const request = db.transaction([LOCAL_CACHE_STATE_STORE], 'readonly')
                 .objectStore(LOCAL_CACHE_STATE_STORE).get(CACHE_STATE_KEY);
-            request.onsuccess = () => resolve(request.result || null);
+            request.onsuccess = () => {
+                const value = request.result || null;
+                // 写入时清单只保存一份（state.packs），读回时回填到
+                // state.snapshot.packManifest，避免大库存两份清单。
+                if (value && Array.isArray(value.packs) && value.snapshot && !value.snapshot.packManifest) {
+                    value.snapshot.packManifest = value.packs;
+                }
+                resolve(value);
+            };
             request.onerror = () => reject(request.error || new Error('本地同步索引读取失败。'));
         });
     }
 
     function cacheWriteState(db, value) {
+        const persisted = value && Array.isArray(value.packs) && value.snapshot
+            ? { ...value, snapshot: { ...value.snapshot, packManifest: undefined } }
+            : value;
         return new Promise((resolve, reject) => {
             const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readwrite');
-            tx.objectStore(LOCAL_CACHE_STATE_STORE).put(value, CACHE_STATE_KEY);
+            tx.objectStore(LOCAL_CACHE_STATE_STORE).put(persisted, CACHE_STATE_KEY);
             tx.oncomplete = resolve;
             tx.onerror = () => reject(tx.error || new Error('本地同步索引写入失败。'));
         });
@@ -669,21 +903,12 @@
         return { id, group, sourceKey, sortKey: `${sourceKey}|${sequence}`, bucketKey: snapshotEntryBucket(value, id, sourceKey), bytes };
     }
 
-    function snapshotValuesEqual(left, right) {
-        if (left === right) return true;
-        if (typeof left === 'number' && !Number.isFinite(left)) return right === null;
-        if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
-        if (Array.isArray(left)) {
-            if (!Array.isArray(right) || left.length !== right.length) return false;
-            for (let index = 0; index < left.length; index += 1) {
-                if (!snapshotValuesEqual(left[index] === undefined ? null : left[index], right[index])) return false;
-            }
-            return true;
-        }
-        if (Array.isArray(right) || typeof left.toJSON === 'function') return false;
-        const keys = Object.keys(left).filter(key => !['undefined', 'function', 'symbol'].includes(typeof left[key]));
-        return keys.length === Object.keys(right).length
-            && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && snapshotValuesEqual(left[key], right[key]));
+    // 缓存条目的 bytes 本来就是这台序列化器产出的规范字节，判断“未变化”
+    // 直接与缓存字节逐位比较即可，省掉先 JSON.parse 再重新序列化一遍。
+    function snapshotBytesEqual(value, cachedBytes) {
+        const bytes = serializeSnapshotObject(value);
+        return bytes.byteLength === cachedBytes.byteLength
+            && bytes.every((byte, index) => byte === cachedBytes[index]);
     }
 
     function readObjectStoreRecordByKey(database, storeName, key) {
@@ -804,14 +1029,18 @@
     }
 
     async function updateCachedSnapshot(cacheDb, state, dirty) {
-        if (dirty.all) return null;
-        const affectedBuckets = new Set();
-        const decoder = new TextDecoder();
+        const affectedBuckets = new Set(state.pendingBuckets || []);
+        const touchBucket = async bucket => {
+            if (affectedBuckets.has(bucket)) return;
+            affectedBuckets.add(bucket);
+            state.pendingBuckets = [...affectedBuckets];
+            await cacheWriteState(cacheDb, state);
+        };
         const yieldIfNeeded = createYieldController();
         const removeEntries = async keys => {
             for (const key of keys) {
                 const entry = await cacheReadEntry(cacheDb, key);
-                if (entry) affectedBuckets.add(entry.bucketKey);
+                if (entry) await touchBucket(entry.bucketKey);
             }
             await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE, [...keys]);
         };
@@ -821,10 +1050,10 @@
                 const id = snapshotEntryId(value);
                 const previous = await cacheReadEntry(cacheDb, id);
                 remaining.delete(id);
-                if (!previous || !snapshotValuesEqual(value, JSON.parse(decoder.decode(previous.bytes)))) {
+                if (!previous || !snapshotBytesEqual(value, previous.bytes)) {
                     const entry = buildCacheEntry(value);
-                    if (previous) affectedBuckets.add(previous.bucketKey);
-                    affectedBuckets.add(entry.bucketKey);
+                    if (previous) await touchBucket(previous.bucketKey);
+                    await touchBucket(entry.bucketKey);
                     await cacheWriteEntries(cacheDb, [entry]);
                 }
             }
@@ -845,7 +1074,7 @@
                 const bucketKey = snapshotEntryBucket(first, snapshotEntryId(first), sourceKey);
                 for await (const previous of iterateCachedBucket(cacheDb, bucketKey)) {
                     const item = values.get(previous.id);
-                    if (item && snapshotValuesEqual(item, JSON.parse(decoder.decode(previous.bytes)))) {
+                    if (item && snapshotBytesEqual(item, previous.bytes)) {
                         values.delete(previous.id);
                         remaining.delete(previous.id);
                     }
@@ -855,9 +1084,9 @@
                 for (const [id, item] of values) {
                     remaining.delete(id);
                     const previous = await cacheReadEntry(cacheDb, id);
-                    if (previous) affectedBuckets.add(previous.bucketKey);
+                    if (previous) await touchBucket(previous.bucketKey);
                     const entry = buildCacheEntry(item);
-                    affectedBuckets.add(entry.bucketKey);
+                    await touchBucket(entry.bucketKey);
                     writes.push(entry);
                     bytes += entry.bytes.byteLength;
                     if (bytes >= CONFIG.cacheWriteBytes || writes.length >= CONFIG.readBatchSize) {
@@ -874,22 +1103,40 @@
         for (const key of dirty.localStorage) {
             if (!isAppLocalStorageKey(key)) continue;
             const value = localStorage.getItem(key);
-            if (value !== null && !state.groups.includes('localStorage')) return null;
+            if (value !== null && !state.groups.includes('localStorage')) state.groups.unshift('localStorage');
             await replaceSource(`ls:${key}`, value === null ? null : { type: 'localStorage', key, value });
         }
         for (const [storeName, item] of dirty.stores) {
-            if (item.all) return null;
             const slash = storeName.indexOf('/');
-            if (slash <= 0) return null;
+            if (slash <= 0) throw new Error('变更日志对象存储无效。');
             const database = storeName.slice(0, slash);
             const store = storeName.slice(slash + 1);
             const knownDb = CONFIG.knownDatabases.find(dbDef => dbDef.name === database);
             if (!knownDb || !knownDb.stores.includes(store)) continue;
-            if (!state.groups.includes(`db:${database}:header`)
-                || !state.groups.includes(`store:${database}/${store}:data`)) return null;
-            for (const keyText of item.keys) {
-                let key;
-                try { key = JSON.parse(keyText); } catch (_) { return null; }
+            const db = await openDbByName(database);
+            try {
+                const stores = readStoreDefinitions(db, knownDb.stores.filter(name => db.objectStoreNames.contains(name)));
+                await replaceSource(`db:${database}`, { type: 'database', name: database, version: db.version, stores });
+                await replaceSource(`db-end:${database}`, { type: 'databaseEnd', name: database });
+                for (const definition of stores) {
+                    await replaceSource(`store-end:${database}/${definition.name}`, { type: 'storeEnd', database, store: definition.name });
+                }
+                const dbGroups = stores.flatMap(def => [`store:${database}/${def.name}:data`, `store:${database}/${def.name}:footer`]);
+                const otherGroups = state.groups.filter(group => !group.startsWith(`db:${database}:`) && !dbGroups.includes(group));
+                const localGroup = otherGroups.includes('localStorage') ? ['localStorage'] : [];
+                state.groups = [...localGroup, ...otherGroups.filter(group => group !== 'localStorage'), `db:${database}:header`, ...dbGroups, `db:${database}:footer`];
+            } finally { db.close(); }
+            if (item.clear) {
+                const prefix = `${database}/${store}/`;
+                const keys = await new Promise((resolve, reject) => {
+                    const request = cacheDb.transaction(LOCAL_CACHE_ENTRY_STORE).objectStore(LOCAL_CACHE_ENTRY_STORE)
+                        .index('sourceKey').getAllKeys(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error);
+                });
+                await removeEntries(keys);
+            }
+            for (const key of item.keys.values()) {
                 if (isSyncExcludedRecord(database, store, key)) continue;
                 const sourceKey = `${database}/${store}/${stableKeyToken(key)}`;
                 const value = await readObjectStoreRecordByKey(database, store, key);
@@ -897,8 +1144,17 @@
                 else await replaceSource(sourceKey, value === undefined ? null : { type: 'record', database, store, key, value });
             }
         }
+        const groupOrder = ['localStorage'];
+        for (const definition of CONFIG.knownDatabases) {
+            groupOrder.push(`db:${definition.name}:header`);
+            for (const name of definition.stores) groupOrder.push(`store:${definition.name}/${name}:data`, `store:${definition.name}/${name}:footer`);
+            groupOrder.push(`db:${definition.name}:footer`);
+        }
+        state.groups.sort((left, right) => groupOrder.indexOf(left) - groupOrder.indexOf(right));
         if (affectedBuckets.size === 0) return { state, snapshot: state.snapshot };
-        return finalizeCachedSnapshot(cacheDb, state, affectedBuckets);
+        const result = await finalizeCachedSnapshot(cacheDb, state, affectedBuckets);
+        result.state.pendingBuckets = [];
+        return result;
     }
 
     function readStoreDefinitions(db, storeNames) {
@@ -1514,10 +1770,12 @@
                 version: CACHE_FORMAT_VERSION,
                 groups: [...new Set(packManifest.map(pack => pack.group))],
                 packs: packManifest.map(pack => ({ ...pack })),
-                preparedRevision: remote.restoreDirtyRevision,
+                epoch: localStorage.getItem(TRACKING_EPOCH_KEY),
+                epochs: (await readDirtyState()).epochs,
                 snapshot
             });
-            clearDirtyRevision(remote.restoreDirtyRevision);
+            localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: remote.version, checksum: remote.checksum }));
+            await window.RPH_SYNC_TRACKER.acknowledge(remote.restoreWatermark);
         } catch (error) {
             await cacheClear(cacheDb);
             throw error;
@@ -1546,20 +1804,19 @@
                 localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
                 await withRestoreWriteLock(async () => {
                     await waitForIndexedDbWriteBarrier();
-                    const restoreDirtyRevision = readDirtyState().revision;
+                    const restoreWatermark = (await readDirtyState()).watermark;
                     await parseStagedPackSnapshot(stagingDb, packManifest, restorer, {
                         onProgress: (completed, total) => {
                             const percent = Math.round((completed / total) * 100);
                             updateProgress(82 + Math.round(percent * 0.16), '正在应用…');
                         }
                     });
-                    await rebuildLocalSyncCacheFromStaging(stagingDb, packManifest, { ...remote, restoreDirtyRevision });
+                    await rebuildLocalSyncCacheFromStaging(stagingDb, packManifest, { ...remote, restoreWatermark });
+                    if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) localStorage.removeItem(RESTORE_ACTIVE_KEY);
                 });
             } catch (error) {
                 restorer.abort();
                 throw error;
-            } finally {
-                if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) localStorage.removeItem(RESTORE_ACTIVE_KEY);
             }
         } finally {
             try { await clearDownloadStagingStore(stagingDb); } catch (_) { }
@@ -1567,19 +1824,8 @@
         }
     }
 
-    function buildSyncHeaders(options = {}) {
-        const headers = {
-            'content-type': 'application/json'
-        };
-        const password = typeof options.password === 'string' ? options.password : getStoredSyncPassword();
-        if (password) {
-            headers['x-rp-sync-password'] = password;
-        }
-        return headers;
-    }
-
-    function buildUploadHeaders(options = {}) {
-        const headers = {};
+    function buildSyncHeaders(options = {}, withContentType = true) {
+        const headers = withContentType ? { 'content-type': 'application/json' } : {};
         const password = typeof options.password === 'string' ? options.password : getStoredSyncPassword();
         if (password) {
             headers['x-rp-sync-password'] = password;
@@ -1592,36 +1838,22 @@
         return !status || status === 408 || status === 429 || status >= 500;
     }
 
-    async function postSync(payload, options = {}) {
+    async function withSyncRetry(options, send) {
         const retryCount = Number.isInteger(options.retryCount) ? options.retryCount : CONFIG.retryCount;
         const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : CONFIG.requestTimeoutMs;
+        const abortMessage = options.abortMessage || '同步请求超时，请检查网络后重试。';
         let lastError = null;
 
         for (let attempt = 0; attempt <= retryCount; attempt += 1) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             try {
-                const response = await fetch(CONFIG.apiEndpoint, {
-                    method: 'POST',
-                    headers: buildSyncHeaders(options),
-                    body: JSON.stringify(payload),
-                    credentials: 'same-origin',
-                    signal: controller.signal
-                });
-
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok || !data.ok) {
-                    if (response.status === 401 && !options.keepPasswordOnAuthError) {
-                        clearStoredSyncPassword();
-                    }
-                    throw Object.assign(new Error(data.error || `HTTP ${response.status}`), { response: data, status: response.status });
-                }
-                return data;
+                return await send(controller.signal);
             } catch (error) {
                 const isAbort = error?.name === 'AbortError';
                 const status = isAbort ? 0 : error?.status;
                 const normalizedError = isAbort
-                    ? new Error('同步请求超时，请检查网络后重试。')
+                    ? new Error(abortMessage)
                     : (error instanceof Error ? error : new Error(String(error)));
                 lastError = Object.assign(normalizedError, { status });
                 if (attempt >= retryCount || !shouldRetrySyncError(lastError)) {
@@ -1636,49 +1868,47 @@
         throw lastError || new Error('同步请求失败。');
     }
 
-    async function postSyncBinary(payload, options = {}) {
-        const retryCount = Number.isInteger(options.retryCount) ? options.retryCount : CONFIG.retryCount;
-        const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : CONFIG.requestTimeoutMs;
-        let lastError = null;
-
-        for (let attempt = 0; attempt <= retryCount; attempt += 1) {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-            try {
-                const response = await fetch(CONFIG.apiEndpoint, {
-                    method: 'POST',
-                    headers: buildSyncHeaders(options),
-                    body: JSON.stringify(payload),
-                    credentials: 'same-origin',
-                    signal: controller.signal
-                });
-
-                if (!response.ok) {
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401 && !options.keepPasswordOnAuthError) {
-                        clearStoredSyncPassword();
-                    }
-                    throw Object.assign(new Error(data.error || `HTTP ${response.status}`), { response: data, status: response.status });
-                }
-
-                return new Uint8Array(await response.arrayBuffer());
-            } catch (error) {
-                const isAbort = error?.name === 'AbortError';
-                const status = isAbort ? 0 : error?.status;
-                const normalizedError = isAbort
-                    ? new Error('同步请求超时，请检查网络后重试。')
-                    : (error instanceof Error ? error : new Error(String(error)));
-                lastError = Object.assign(normalizedError, { status });
-                if (attempt >= retryCount || !shouldRetrySyncError(lastError)) {
-                    throw lastError;
-                }
-                await wait(CONFIG.retryDelayMs * (attempt + 1));
-            } finally {
-                clearTimeout(timeoutId);
-            }
+    function throwSyncHttpError(response, data, keepPasswordOnAuthError) {
+        if (response.status === 401 && !keepPasswordOnAuthError) {
+            clearStoredSyncPassword();
         }
+        throw Object.assign(
+            new Error(data?.error || `HTTP ${response.status}`),
+            { response: data, status: response.status }
+        );
+    }
 
-        throw lastError || new Error('同步请求失败。');
+    async function postSync(payload, options = {}) {
+        return withSyncRetry(options, async signal => {
+            const response = await fetch(CONFIG.apiEndpoint, {
+                method: 'POST',
+                headers: buildSyncHeaders(options),
+                body: JSON.stringify(payload),
+                credentials: 'same-origin',
+                signal
+            });
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.ok) throwSyncHttpError(response, data, options.keepPasswordOnAuthError);
+            return data;
+        });
+    }
+
+    async function postSyncBinary(payload, options = {}) {
+        return withSyncRetry(options, async signal => {
+            const response = await fetch(CONFIG.apiEndpoint, {
+                method: 'POST',
+                headers: buildSyncHeaders(options),
+                body: JSON.stringify(payload),
+                credentials: 'same-origin',
+                signal
+            });
+
+            if (!response.ok) {
+                throwSyncHttpError(response, await response.json().catch(() => ({})), options.keepPasswordOnAuthError);
+            }
+            return new Uint8Array(await response.arrayBuffer());
+        });
     }
 
     function buildUploadBatchBody(records) {
@@ -1695,66 +1925,51 @@
         const body = buildUploadBatchBody(records);
         // Blob owns this bounded batch; retries reuse it without cloning the source packs again.
         records.forEach(record => { record.bytes = null; });
-        const retryCount = CONFIG.retryCount;
-        let lastError = null;
         const params = new URLSearchParams({ action: 'upload-pack-batch' });
 
-        for (let attempt = 0; attempt <= retryCount; attempt += 1) {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), CONFIG.packTransferTimeoutMs);
-            try {
-                const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
-                    method: 'POST',
-                    headers: buildUploadHeaders(),
-                    body,
-                    credentials: 'same-origin',
-                    signal: controller.signal
-                });
-                if (!response.ok) {
-                    const data = await response.json().catch(() => ({}));
-                    if (response.status === 401) clearStoredSyncPassword();
-                    throw Object.assign(new Error(data.error || `HTTP ${response.status}`), { response: data, status: response.status });
-                }
-                return;
-            } catch (error) {
-                const isAbort = error?.name === 'AbortError';
-                const status = isAbort ? 0 : error?.status;
-                const normalizedError = isAbort
-                    ? new Error('上传超时，请检查网络后重试。')
-                    : (error instanceof Error ? error : new Error(String(error)));
-                lastError = Object.assign(normalizedError, { status });
-                if (attempt >= retryCount || !shouldRetrySyncError(lastError)) {
-                    throw lastError;
-                }
-                await wait(CONFIG.retryDelayMs * (attempt + 1));
-            } finally {
-                clearTimeout(timeoutId);
+        return withSyncRetry({
+            timeoutMs: CONFIG.packTransferTimeoutMs,
+            abortMessage: '上传超时，请检查网络后重试。'
+        }, async signal => {
+            const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
+                method: 'POST',
+                headers: buildSyncHeaders({}, false),
+                body,
+                credentials: 'same-origin',
+                signal
+            });
+            if (!response.ok) {
+                throwSyncHttpError(response, await response.json().catch(() => ({})));
             }
-        }
-
-        throw lastError || new Error('上传失败。');
+        });
     }
 
 
     async function prepareLocalSnapshot(progressStart, progressEnd) {
         const cacheDb = await openLocalSyncCache();
-        const dirty = readDirtyState();
+        const dirty = await readDirtyState();
+        const baseline = readBaseline();
         let state = await cacheReadState(cacheDb);
         try {
-            if (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.preparedRevision !== dirty.revision) {
-                // A partially updated entry cache must not masquerade as a completed upload plan.
-                await cacheWriteState(cacheDb, null);
-                let result;
-                if (state?.version === CACHE_FORMAT_VERSION && state.snapshot && !dirty.all) {
-                    result = await updateCachedSnapshot(cacheDb, state, dirty);
-                }
-                if (!result) result = await buildFullCachedSnapshot(cacheDb, progressStart, progressEnd);
-                state = result.state;
-                state.preparedRevision = dirty.revision;
-                await cacheWriteState(cacheDb, state);
+            const rebuild = localStorage.getItem('rp_sync_rebuild_requested') === '1';
+            const epoch = localStorage.getItem(TRACKING_EPOCH_KEY);
+            const journalReset = state?.epochs && Object.entries(state.epochs).some(([name, value]) => dirty.epochs[name] !== value);
+            if (!rebuild && (baseline || state) && (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.epoch !== epoch || journalReset)) {
+                throw new Error('同步索引缺失、过期或追踪已重置。请先导出本地数据，再点击“重建本地索引”；不会自动全扫或覆盖云端。');
             }
+            let result;
+            if (rebuild || !state) {
+                result = await buildFullCachedSnapshot(cacheDb, progressStart, progressEnd);
+            } else {
+                result = await updateCachedSnapshot(cacheDb, state, dirty);
+            }
+            state = result.state;
+            state.epoch = epoch;
+            state.epochs = dirty.epochs;
+            await cacheWriteState(cacheDb, state);
+            localStorage.removeItem('rp_sync_rebuild_requested');
             await pruneCachedPacks(cacheDb, state.snapshot.packManifest);
-            return { snapshot: state.snapshot, dirtyRevision: dirty.revision };
+            return { snapshot: state.snapshot, watermark: dirty.watermark };
         } finally {
             cacheDb.close();
         }
@@ -1945,7 +2160,8 @@
                 clearStoredSyncPassword();
             }
             passwordModalRoot.classList.remove('is-open');
-            openSyncPanel();
+            if (RESTORE_PAGE) pullFromServer().catch(showSyncError);
+            else openSyncPanel();
         } catch (error) {
             passwordStatus.textContent = error.message || '密码验证失败，请稍后再试。';
         } finally {
@@ -2002,6 +2218,7 @@
                 <div class="rp-sync-main-actions">
                     <button type="button" class="rp-sync-action-button is-primary" data-action="push">上传到云端</button>
                     <button type="button" class="rp-sync-action-button" data-action="pull">从云端恢复</button>
+                    <button type="button" class="rp-sync-action-button" data-action="rebuild">重建本地索引</button>
                 </div>
                 <p class="rp-sync-modal__status">选择同步</p>
                 <div class="rp-sync-progress">
@@ -2021,7 +2238,9 @@
         const closeButton = modalRoot.querySelector('.rp-sync-modal__close');
         if (RESTORE_PAGE) {
             modalRoot.classList.add('rp-sync-modal--restore');
-            modalRoot.querySelector('.rp-sync-main-actions')?.remove();
+            pullButton.textContent = '重新恢复';
+            pushButton.style.display = 'none';
+            modalRoot.querySelector('[data-action="rebuild"]').style.display = 'none';
             closeButton.textContent = '返回';
             closeButton.setAttribute('aria-label', '返回');
         }
@@ -2036,7 +2255,22 @@
             if (!state.syncing) closeModal();
         });
         if (pullButton) pullButton.addEventListener('click', () => {
+            if (RESTORE_PAGE) { pullFromServer().catch(showSyncError); return; }
             if (confirm('从云端恢复将替换此浏览器的本地数据，其他已打开的页面会刷新。继续吗？')) location.assign('/sync-restore');
+        });
+        modalRoot.querySelector('[data-action="rebuild"]').addEventListener('click', async () => {
+            if (state.syncing || !confirm('这会完整读取本地数据重建索引，但不会上传或覆盖云端。请先导出本地数据备份。继续吗？')) return;
+            await withCrossTabSyncLock(async () => {
+                state.syncing = true;
+                try {
+                    setActionButtonsDisabled(true);
+                    await flushAppState();
+                    requestExplicitRebuild();
+                    await prepareLocalSnapshot(5, 95);
+                    updateProgress(100, '本地索引已重建，云端未修改。');
+                } catch (error) { showSyncError(error); }
+                finally { state.syncing = false; setActionButtonsDisabled(false); }
+            });
         });
         pushButton.addEventListener('click', () => pushToServer().catch(() => { }));
     }
@@ -2055,20 +2289,34 @@
 
     async function commitObjectSnapshot(progress) {
         updateProgress(progress.check, '准备中…');
-        const incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
-        const snapshot = incremental.snapshot;
         const statusResponse = await postSync({ action: 'prepare-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION }, {
             timeoutMs: CONFIG.commitTimeoutMs
         });
         if (statusResponse.resetRequired) {
+            updateProgress(progress.check, '正在一次性清理旧云端同步数据…');
             let cursor;
             do {
-                const page = await postSync({ action: 'reset-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION, cursor });
-                cursor = page.cursor;
+                const migration = await postSync({ action: 'reset-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION, cursor });
+                cursor = migration.cursor || null;
             } while (cursor);
+            // One-time schema 12 cleanup wiped the remote dataset; the old
+            // acknowledged baseline no longer refers to any cloud version.
+            localStorage.removeItem(BASELINE_KEY);
+            statusResponse.remote = null;
         }
+        const baseline = readBaseline();
         const baseRemote = statusResponse.remote || null;
-        const baseVersion = Number(baseRemote?.version || 0);
+        const baseVersion = Number(baseline?.version || 0);
+        const incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+        const snapshot = incremental.snapshot;
+        if (baseRemote?.checksum === snapshot.checksum) {
+            localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: baseRemote.version, checksum: snapshot.checksum }));
+            await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
+            return true;
+        }
+        if (Number(baseRemote?.version || 0) !== baseVersion || (baseRemote && baseRemote.checksum !== baseline?.checksum)) {
+            throw new Error('云端与此浏览器的已确认基线不同，已停止上传以防覆盖。请先导出本地数据，再恢复云端并合并本地修改。');
+        }
 
         updateProgress(progress.uploadStart, '正在上传…');
         await uploadCachedSnapshot(
@@ -2082,6 +2330,7 @@
         const payload = {
             action: 'upload-complete',
             baseVersion,
+            baseChecksum: baseline?.checksum || '',
             checksum: snapshot.checksum,
             snapshotFormat: snapshot.snapshotFormat,
             schemaVersion: snapshot.schemaVersion,
@@ -2116,7 +2365,8 @@
         if (commitResponse.checksum !== snapshot.checksum) {
             throw new Error('服务器没有确认新快照。');
         }
-        clearDirtyRevision(incremental.dirtyRevision);
+        localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: commitResponse.version, checksum: snapshot.checksum }));
+        await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
         return baseRemote?.checksum === snapshot.checksum;
     }
 
@@ -2130,7 +2380,10 @@
             setActionButtonsDisabled(true);
             await waitForIndexedDbWriteBarrier();
             updateProgress(4, '正在连接…');
-            const manifestResponse = await postSync({ action: 'pull-manifest' });
+            const manifestResponse = await postSync({ action: 'pull-manifest', schemaVersion: SNAPSHOT_SCHEMA_VERSION });
+            if (manifestResponse.resetRequired) {
+                throw new Error('云端同步存储尚未完成升级清理。请先在主页面执行一次“上传到云端”，再回到此页恢复。');
+            }
             const remote = manifestResponse.remote;
 
             if (!remote) {
@@ -2156,6 +2409,7 @@
             }, 700);
         } catch (error) {
             showSyncError(error);
+            if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');
             setActionButtonsDisabled(false);
         } finally {
             state.syncing = false;

@@ -1,3 +1,7 @@
+.rp-sync-modal *, .rp-sync-modal *::before, .rp-sync-modal *::after {
+    box-sizing: border-box;
+}
+
 .rp-sync-modal {
     position: fixed;
     inset: 0;

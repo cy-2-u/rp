@@ -1,5 +1,8 @@
 const AUTHOR_BASE = 'https://sta1n156.github.io/RP-Hub/';
 
+// 生产适配地址固定；file:// 仅供本地测试 fetch mock 使用。
+const DEFAULT_ADAPTER_URL = 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json';
+
 function authorSourcePattern(snippet) {
     const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const gap = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?=[\r\n]|$))*`;
@@ -19,7 +22,6 @@ function authorSourcePattern(snippet) {
 }
 
 const ADAPTER_URL_ENV = 'RPHUB_ADAPTER_URL';
-const ADAPTER_SHA256_ENV = 'RPHUB_ADAPTER_SHA256';
 const ADAPTER_PATH = '/__rphub/adapter.json';
 const ADAPTER_MAX_BYTES = 512 * 1024;
 const ADAPTER_CACHE_TTL_MS = 30 * 1000;
@@ -63,8 +65,8 @@ function validateAdapter(adapter) {
 }
 
 function resolveAdapterUrl(env) {
-    const raw = String(env?.[ADAPTER_URL_ENV] || '').trim();
-    if (!raw) throw new Error('未配置外部适配清单地址。');
+    const override = String(env?.[ADAPTER_URL_ENV] || '').trim();
+    const raw = override.startsWith('file:') ? override : DEFAULT_ADAPTER_URL;
     let url;
     try {
         url = new URL(raw, AUTHOR_BASE);
@@ -85,28 +87,19 @@ function adapterPublicView(adapter) {
     };
 }
 
-async function loadAdapter(env, { fresh = false } = {}) {
+async function loadAdapter(env) {
     const url = resolveAdapterUrl(env);
-    const expectedHash = String(env?.[ADAPTER_SHA256_ENV] || '').trim().toLowerCase();
-    const cacheKey = `${url.href}|${expectedHash}`;
+    const cacheKey = url.href;
     const cached = adapterCache.get(cacheKey);
-    if (!fresh && cached && cached.expiresAt > Date.now()) return cached.value;
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-    const requestUrl = new URL(url.href);
-    if (fresh && requestUrl.protocol !== 'file:') requestUrl.searchParams.set('_rph_adapter', String(Date.now()));
-    const response = await fetch(requestUrl, { headers: { accept: 'application/json,text/plain' } });
+    const response = await fetch(url, { headers: { accept: 'application/json,text/plain' } });
     if (!response.ok) throw new Error(`适配清单读取失败：HTTP ${response.status}`);
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (contentLength > ADAPTER_MAX_BYTES) throw new Error('适配清单超过大小上限。');
     const source = String(await response.text()).replace(/^\uFEFF/, '');
     if (new TextEncoder().encode(source).byteLength > ADAPTER_MAX_BYTES) {
         throw new Error('适配清单超过大小上限。');
-    }
-    if (expectedHash && !/^[a-f0-9]{64}$/.test(expectedHash)) {
-        throw new Error('适配清单校验码配置无效。');
-    }
-    if (expectedHash && await sha256Text(source) !== expectedHash) {
-        throw new Error('适配清单校验失败。');
     }
     let adapter;
     try {
@@ -144,7 +137,7 @@ const IMAGE_ADMIN_AUTH_COOKIE = 'rp_image_admin_auth';
 const API_PATH = '/api/rp-sync';
 const R2_PREFIX = `rp-sync/${DATASET_ID}`;
 const MANIFEST_KEY = `${R2_PREFIX}/manifest.json`;
-const MIGRATION_MARKER_KEY = `${R2_PREFIX}/migration-v11.done`;
+const MIGRATION_MARKER_KEY = `${R2_PREFIX}/migration-v12.done`;
 const PACK_PREFIX = `${R2_PREFIX}/packs`;
 const MAX_PACK_BYTES = 512 * 1024;
 const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
@@ -158,15 +151,20 @@ const SYNC_UPLOAD_BATCH_MAX_BODY_BYTES = 4 + SYNC_UPLOAD_BATCH_MAX_HEADER_BYTES 
 const SYNC_UPLOAD_BATCH_PUT_CONCURRENCY = 3;
 const SYNC_DELETE_BATCH_SIZE = 1000;
 const SYNC_COMMIT_MAX_LIST_PAGES = 32;
-const SYNC_PACK_CLEANUP_GRACE_MS = 24 * 60 * 60 * 1000;
 const STREAM_SNAPSHOT_FORMAT = 'rp-sync-bounded-jsonl-v3';
-const STREAM_SNAPSHOT_SCHEMA_VERSION = 11;
+const STREAM_SNAPSHOT_SCHEMA_VERSION = 12;
 const IMAGE_API_PATH = '/api/rp-image';
 const IMAGE_ADMIN_PATH = '/image';
 const IMAGE_PREFIX = 'rp-images';
 const IMAGE_OBJECT_PREFIX = `${IMAGE_PREFIX}/characters`;
 const IMAGE_THUMB_PREFIX = `${IMAGE_PREFIX}/thumbs`;
 const IMAGE_DELETED_PREFIX = `${IMAGE_PREFIX}/_deleted`;
+// R2 subrequest budget: one tombstone put per image plus per-directory
+// listings and batched deletes must stay under the free plan's 50
+// subrequests per request, so deletes process at most this many targets.
+const IMAGE_DELETE_MAX_TARGETS_PER_REQUEST = 20;
+const IMAGE_DELETE_MAX_KEYS_PER_REQUEST = 20;
+const IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST = 4;
 const IMAGE_MAX_BYTES = 64 * 1024 * 1024;
 const IMAGE_THUMB_MAX_BYTES = 2 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 120000;
@@ -178,7 +176,6 @@ const IMAGE_DEFAULT_CFG = '0';
 const IMAGE_DEFAULT_SAMPLER = 'k_dpmpp_2m_sde';
 const IMAGE_DEFAULT_NOISE_SCHEDULE = 'karras';
 const IMAGE_UPSTREAM_BASE = 'https://nai.sta1n.cn';
-const MAGIC_EXTENSION_PATH = '/magic-extension.js';
 const IMAGE_PARAM_KEYS = [
     'provider',
     'tag',
@@ -359,9 +356,8 @@ function createImageThumbKeyFromImageKey(key) {
     return checksum && characterName ? createImageThumbKey(characterName, checksum) : '';
 }
 
+// 前置校验（tag/token）已在 handleImageRender 完成，这里只负责拼上游地址。
 function buildImageUpstreamUrl(params, token) {
-    if (!params.tag) throw new Error('\u7f3a\u5c11\u751f\u56fe\u63d0\u793a\u8bcd\u3002');
-    if (!token) throw new Error('\u7f3a\u5c11\u751f\u56fe\u5bc6\u94a5\u3002');
     const upstream = new URL('/generate', IMAGE_UPSTREAM_BASE);
     upstream.searchParams.set('tag', params.tag);
     upstream.searchParams.set('token', token);
@@ -431,18 +427,18 @@ async function handleImageRender(request, env) {
         || (request.method === 'GET' && url.searchParams.get('generate') === '1');
     const params = buildImageParams(url, token);
     const primary = await buildImageLookupCandidate(params);
-    const [deleted, cached] = await Promise.all([
-        bucket.get(primary.deletedKey),
-        bucket.get(primary.key)
-    ]);
-    if (deleted) {
-        return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
-            'cache-control': 'public, max-age=3600'
-        });
-    }
+    // 先取原图：命中（最常见的浏览路径）只花 1 个 R2 get；只有未命中
+    // 时才需要读墓碑来区分“已删除”和“从未生成”。
+    const cached = await bucket.get(primary.key);
     if (cached) {
         return imageResponse(request.method === 'HEAD' ? null : cached.body, cached.httpMetadata?.contentType, {
             'content-length': String(cached.size || 0)
+        });
+    }
+    const deleted = await bucket.get(primary.deletedKey);
+    if (deleted) {
+        return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
+            'cache-control': 'public, max-age=3600'
         });
     }
 
@@ -454,6 +450,7 @@ async function handleImageRender(request, env) {
     }
 
     if (!token) return error('缺少生图密钥。', 401);
+    if (!primary.params.tag) return error('缺少生图提示词。', 400);
     const upstreamResponse = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token));
     if (!upstreamResponse.ok) {
         return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
@@ -661,8 +658,8 @@ var library=document.getElementById('library');
 var stats=document.getElementById('stats');
 var notice=document.getElementById('notice');
 var filter=document.getElementById('filter');
-  var backButton=document.getElementById('back');
-  var refreshButton=document.getElementById('refresh');
+var backButton=document.getElementById('back');
+var refreshButton=document.getElementById('refresh');
 var deleteModeButton=document.getElementById('deleteMode');
 var cancelDeleteButton=document.getElementById('cancelDelete');
 var deleteSelectedButton=document.getElementById('deleteSelected');
@@ -712,15 +709,16 @@ function removeDeletedImages(payload){var keys=new Set(payload.keys||[]);var nam
 function render(){if(!data)return;var q=filter.value.trim().toLowerCase();var characters=data.characters.filter(function(c){return !q||c.name.toLowerCase().includes(q);});var total=characters.reduce(function(sum,c){return sum+(c.images||[]).length;},0);if(!total){library.innerHTML='<div class="empty">\u6ca1\u6709\u56fe\u7247</div>';syncToolbar();return;}var html=[];characters.forEach(function(c){var images=c.images||[];if(!images.length)return;var limit=getCharacterRenderLimit(c.name);var shown=images.slice(0,limit);var remaining=Math.max(0,images.length-shown.length);var imgs=shown.map(function(img){var selectedClass=selected.has(img.key)?' selected':'';return '<button class="photo'+selectedClass+'" data-key="'+esc(img.key)+'"><img loading="lazy" decoding="async" src="'+esc(thumbUrl(img.key))+'" onerror="thumbFailed(this)" alt=""><span class="photo-check"></span><span class="photo-info">'+esc(img.sizeHuman)+'</span></button>';}).join('');var more=remaining>0?'<button class="album-more" data-character="'+esc(c.name)+'" data-total="'+images.length+'">\u663e\u793a\u66f4\u591a '+Math.min(albumPageSize(),remaining)+'</button>':'';var actionText=c.count>0?'\u6e05\u7a7a\u672c\u7ec4 ('+c.count+')':'\u6e05\u7a7a\u672c\u7ec4';var actions='<div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="'+esc(c.name)+'" data-count="'+esc(c.count)+'">'+actionText+'</button></div>'+more+'</div>';html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">'+esc(c.name)+'</div><div class="album-meta">'+shown.length+' / '+c.count+' \u5f20 \u00b7 '+esc(c.sizeHuman)+'</div></div></div><div class="gallery">'+imgs+'</div>'+actions+'</section>');});library.innerHTML=html.join('');syncToolbar();scheduleThumbBackfill();}
 function setDeleteMode(value){deleteMode=!!value;selected.clear();library.querySelectorAll('.photo.selected').forEach(function(tile){tile.classList.remove('selected');});syncToolbar();}
 async function load(){if(deleteBusy)return;var scrollPosition=window.scrollY;setNotice('');stats.textContent='\u6b63\u5728\u8bfb\u53d6...';syncToolbar();refreshButton.disabled=true;try{data=await api('/image/api/library',{method:'GET'});var keys=new Set(visibleImages().map(function(image){return image.key;}));selected.forEach(function(key){if(!keys.has(key))selected.delete(key);});stats.textContent=data.totalCount+' \u5f20\u56fe\u7247 / '+data.totalHuman;render();requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});}catch(e){stats.textContent='\u8bfb\u53d6\u5931\u8d25';if(!data)library.innerHTML='<div class="empty">'+esc(e.message)+'</div>';setNotice(e.message,true);}finally{refreshButton.disabled=deleteBusy;}}
-async function deletePayload(payload,message){if(deleteBusy||!confirm(message||'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002'))return;deleteBusy=true;var previousCharacters=data&&data.characters;var previousSelected=new Set(selected);var previousLimits=Object.assign({},characterRenderLimits);removeDeletedImages(payload);try{var r=await api('/image/api/delete',{method:'POST',body:JSON.stringify(payload)});if(r.failedCount){data.characters=previousCharacters;characterRenderLimits=previousLimits;selected=previousSelected;removeDeletedImages({keys:r.acceptedKeys||[]});}setNotice('\u5df2\u5220\u9664 '+r.deletedCount+' \u5f20 / '+r.deletedHuman+(r.failedCount?'\uff0c'+r.failedCount+' \u5f20\u672a\u5b8c\u6210':''),r.failedCount>0);}catch(e){data.characters=previousCharacters;characterRenderLimits=previousLimits;selected=previousSelected;refreshLibraryStats();render();setNotice(e.message,true);}finally{deleteBusy=false;syncToolbar();}}
+var deleteChunkSize=20;
+async function deletePayload(payload,message){if(deleteBusy||!confirm(message||'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002'))return;deleteBusy=true;var previousCharacters=data&&data.characters;var previousSelected=new Set(selected);var previousLimits=Object.assign({},characterRenderLimits);removeDeletedImages(payload);var accepted=[],deletedCount=0,deletedBytes=0,failedCount=0,queue=[];function pushKeyChunks(keys){for(var start=0;start<keys.length;start+=deleteChunkSize)queue.push({keys:keys.slice(start,start+deleteChunkSize)});}try{if(payload.characterNames&&payload.characterNames.length){queue.push({characterNames:payload.characterNames.slice(0,4)});}else{pushKeyChunks((payload.keys||[]).filter(function(key,index,list){return list.indexOf(key)===index;}));}for(var index=0;index<queue.length;index+=1){var r=await api('/image/api/delete',{method:'POST',body:JSON.stringify(queue[index])});deletedCount+=r.deletedCount||0;deletedBytes+=r.deletedBytes||0;failedCount+=r.failedCount||0;(r.acceptedKeys||[]).forEach(function(key){accepted.push(key);});pushKeyChunks(r.remainingKeys||[]);}if(failedCount){data.characters=previousCharacters;characterRenderLimits=previousLimits;removeDeletedImages({keys:accepted});}setNotice('\u5df2\u5220\u9664 '+deletedCount+' \u5f20 / '+formatBytes(deletedBytes)+(failedCount?'\uff0c'+failedCount+' \u5f20\u672a\u5b8c\u6210':''),failedCount>0);}catch(e){data.characters=previousCharacters;characterRenderLimits=previousLimits;if(accepted.length){removeDeletedImages({keys:accepted});}else{selected=previousSelected;refreshLibraryStats();render();}setNotice(e.message,true);}finally{deleteBusy=false;syncToolbar();}}
 function deleteCharacterImages(characterName,count){if(!characterName)return;deletePayload({characterNames:[characterName]},'\u786e\u5b9a\u6e05\u7a7a\u300c'+characterName+'\u300d\u4e0b\u7684 '+(Number(count)||0)+' \u5f20\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');}
 function openViewer(key){previewList=visibleImages();previewIndex=previewList.findIndex(function(img){return img.key===key;});if(previewIndex<0)previewIndex=0;renderViewer();viewer.classList.remove('hidden');}
 function closeViewer(){viewer.classList.add('hidden');}
 function moveViewer(delta){if(!previewList.length)return;previewIndex=(previewIndex+delta+previewList.length)%previewList.length;renderViewer();}
 function renderFilmstrip(){var total=previewList.length;if(!total){filmstrip.innerHTML='';return;}var size=Math.min(18,total);var half=Math.floor(size/2);var items=[];for(var i=0;i<size;i++){var real=(previewIndex-half+i+total)%total;items.push({item:previewList[real],real:real});}filmstrip.innerHTML=items.map(function(entry){var active=entry.real===previewIndex;return '<button class="film'+(active?' active':'')+'" data-index="'+entry.real+'">'+filmThumbHtml(entry.item)+'</button>';}).join('');requestAnimationFrame(function(){var active=filmstrip.querySelector('.film.active');if(active)active.scrollIntoView({block:'nearest',inline:'center'});});}
 function renderViewer(){var img=previewList[previewIndex];if(!img)return;viewerImage.src=imgUrl(img.key);viewerTitle.textContent=img.characterName;viewerCount.textContent=(previewIndex+1)+' / '+previewList.length+' \u00b7 '+img.sizeHuman;renderFilmstrip();}
-  document.getElementById('login').onclick=enter;
-  backButton.onclick=function(){location.href='/';};
+document.getElementById('login').onclick=enter;
+backButton.onclick=function(){location.href='/';};
 passwordInput.onkeydown=function(e){if(e.key==='Enter')enter();};
 refreshButton.onclick=load;
 deleteModeButton.onclick=function(){setDeleteMode(true);};
@@ -813,17 +811,38 @@ async function listImageTombstoneKeys(bucket) {
 }
 
 async function getImageDeleteTargets(bucket, keys, characterNames) {
-    const targets = new Map();
-    const keyObjects = await runConcurrent(keys, 8, async (key) => {
-        if (!key.startsWith(`${IMAGE_OBJECT_PREFIX}/`) || key.includes('..')) return;
-        const object = typeof bucket.head === 'function' ? await bucket.head(key) : await bucket.get(key);
-        return object ? normalizeImageObject({ ...object, key }) : null;
-    });
-    keyObjects.filter(Boolean).forEach(object => targets.set(object.key, object));
-    const groups = await runConcurrent(characterNames, 4, name => (
-        listImageObjects(bucket, `${IMAGE_OBJECT_PREFIX}/${sanitizeImageKeySegment(name)}/`)
+    // Existence is resolved with one listing per character directory instead
+    // of a per-key head, so the subrequest count scales with distinct
+    // characters rather than with the number of selected images.
+    const directories = new Map();
+    for (const key of keys) {
+        if (!key.startsWith(`${IMAGE_OBJECT_PREFIX}/`) || key.includes('..')) continue;
+        const characterName = getImageCharacterFromKey(key);
+        if (!characterName) continue;
+        const directory = directories.get(characterName) || { includeAll: false, requestedKeys: new Set() };
+        directory.requestedKeys.add(key);
+        directories.set(characterName, directory);
+    }
+    for (const name of characterNames) {
+        const characterName = sanitizeImageKeySegment(name);
+        if (!characterName) continue;
+        const directory = directories.get(characterName) || { includeAll: false, requestedKeys: new Set() };
+        directory.includeAll = true;
+        directories.set(characterName, directory);
+    }
+    const names = [...directories.keys()];
+    const groups = await runConcurrent(names, 4, name => (
+        listImageObjects(bucket, `${IMAGE_OBJECT_PREFIX}/${name}/`)
     ));
-    groups.flat().forEach(object => targets.set(object.key, object));
+    const targets = new Map();
+    groups.forEach((objects, index) => {
+        const directory = directories.get(names[index]);
+        for (const object of objects) {
+            if (directory.includeAll || directory.requestedKeys.has(object.key)) {
+                targets.set(object.key, object);
+            }
+        }
+    });
     return [...targets.values()];
 }
 
@@ -867,10 +886,20 @@ async function writeImageTombstone(bucket, key) {
     });
 }
 
-async function deleteImageObjectFiles(bucket, object) {
+function chunkR2DeleteKeys(keys, size = 1000) {
+    const chunks = [];
+    for (let start = 0; start < keys.length; start += size) chunks.push(keys.slice(start, start + size));
+    return chunks;
+}
+
+async function deleteImageObjectFiles(bucket, objects) {
+    // R2 delete accepts up to 1000 keys per call, so cleanup costs two
+    // subrequests per 1000 images instead of two per image.
+    const objectKeys = objects.map(object => object.key);
+    const thumbKeys = objects.map(object => object.thumbKey).filter(Boolean);
     await Promise.allSettled([
-        object.thumbKey ? bucket.delete(object.thumbKey) : Promise.resolve(),
-        bucket.delete(object.key)
+        ...chunkR2DeleteKeys(objectKeys).map(chunk => bucket.delete(chunk)),
+        ...chunkR2DeleteKeys(thumbKeys).map(chunk => bucket.delete(chunk))
     ]);
 }
 
@@ -903,7 +932,7 @@ async function handleImageAdmin(request, env, url, ctx) {
             return !deleted;
         });
         if (staleObjects.length) {
-            const cleanup = runConcurrent(staleObjects, 8, object => deleteImageObjectFiles(bucket, object));
+            const cleanup = deleteImageObjectFiles(bucket, staleObjects);
             if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(cleanup);
         }
         const totalBytes = objects.reduce((sum, object) => sum + object.size, 0);
@@ -951,8 +980,17 @@ async function handleImageAdmin(request, env, url, ctx) {
         if (!body || typeof body !== 'object') return error('Invalid JSON body.');
         const keys = [...new Set(Array.isArray(body.keys) ? body.keys : [])];
         const characterNames = [...new Set(Array.isArray(body.characterNames) ? body.characterNames : [])];
+        if (keys.length > IMAGE_DELETE_MAX_KEYS_PER_REQUEST) {
+            return error(`单次最多删除 ${IMAGE_DELETE_MAX_KEYS_PER_REQUEST} 张图片，请分批删除。`, 400);
+        }
+        if (characterNames.length > IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST) {
+            return error(`单次最多清空 ${IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST} 个角色分组，请分批删除。`, 400);
+        }
         const targets = await getImageDeleteTargets(bucket, keys, characterNames);
-        const tombstoneResults = await runConcurrent(targets, 8, async (object) => {
+        // 超出单次预算的目标以 remainingKeys 返回，由客户端继续分批提交。
+        const processTargets = targets.slice(0, IMAGE_DELETE_MAX_TARGETS_PER_REQUEST);
+        const remainingTargets = targets.slice(IMAGE_DELETE_MAX_TARGETS_PER_REQUEST);
+        const tombstoneResults = await runConcurrent(processTargets, 8, async (object) => {
             try {
                 await writeImageTombstone(bucket, object.key);
                 return { object, accepted: true };
@@ -961,12 +999,12 @@ async function handleImageAdmin(request, env, url, ctx) {
             }
         });
         const acceptedTargets = tombstoneResults.filter(result => result.accepted).map(result => result.object);
-        const failedCount = targets.length - acceptedTargets.length;
-        if (targets.length && acceptedTargets.length === 0) {
+        const failedCount = processTargets.length - acceptedTargets.length;
+        if (processTargets.length && acceptedTargets.length === 0) {
             return error('\u5220\u9664\u6807\u8bb0\u5199\u5165\u5931\u8d25\u3002', 502, { failedCount });
         }
         const deletedBytes = acceptedTargets.reduce((total, object) => total + object.size, 0);
-        const cleanup = runConcurrent(acceptedTargets, 8, object => deleteImageObjectFiles(bucket, object));
+        const cleanup = deleteImageObjectFiles(bucket, acceptedTargets);
         if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(cleanup);
         else await cleanup;
         return json({
@@ -975,7 +1013,8 @@ async function handleImageAdmin(request, env, url, ctx) {
             deletedCount: acceptedTargets.length,
             deletedBytes,
             deletedHuman: formatBytes(deletedBytes),
-            failedCount
+            failedCount,
+            remainingKeys: remainingTargets.map(object => object.key)
         });
     }
     return error('Not found.', 404);
@@ -1106,7 +1145,7 @@ async function getManifestState(bucket) {
     const head = await bucket.head(MANIFEST_KEY);
     if (!head) return { manifest: null, etag: null };
     const headEtag = head.etag || null;
-    if (Number(head.size || 0) > SYNC_CONTROL_MAX_BYTES) return { manifest: null, etag: headEtag };
+    if (Number(head.size || 0) > SYNC_CONTROL_MAX_BYTES) throw new SyncRequestError('现有云端清单超过上限，已停止读写以保护数据。', 409);
     if (headEtag) {
         const cached = manifestCache.get(headEtag);
         if (cached && cached.expiresAt > Date.now()) return { manifest: cached.manifest, etag: headEtag };
@@ -1115,15 +1154,15 @@ async function getManifestState(bucket) {
     if (!object) return { manifest: null, etag: headEtag };
     const etag = object.etag || headEtag;
     if (Number(object.size) > SYNC_CONTROL_MAX_BYTES) {
-        if (object.body) await object.body.cancel();
-        return { manifest: null, etag };
+        if (object.body?.cancel) await object.body.cancel();
+        throw new SyncRequestError('现有云端清单超过上限，已停止读写以保护数据。', 409);
     }
     const text = await object.text();
     let value;
     try {
         value = JSON.parse(text);
     } catch (err) {
-        return { manifest: null, etag };
+        throw new SyncRequestError('现有云端清单 JSON 损坏，已停止读写以保护数据。', 409);
     }
     const manifest = normalizeManifest(value);
     if (manifest
@@ -1137,7 +1176,7 @@ async function getManifestState(bucket) {
         if (object.etag) cacheManifestByEtag(object.etag, manifest);
         return { manifest, etag };
     }
-    return { manifest: null, etag };
+    throw new SyncRequestError('现有云端清单格式或校验无效，已停止读写以保护数据。', 409);
 }
 
 async function getManifest(bucket) {
@@ -1165,24 +1204,13 @@ function buildRemoteInfo(manifest) {
     };
 }
 
-async function handleStatus(bucket) {
-    const manifest = await getManifest(bucket);
-    return json({ ok: true, remote: manifest ? buildRemoteInfo(manifest) : null });
-}
-
-async function handlePrepareUpload(bucket, body) {
-    if (Number(body.schemaVersion) !== STREAM_SNAPSHOT_SCHEMA_VERSION) {
+async function handleStatus(bucket, body) {
+    if (Number(body?.schemaVersion) !== STREAM_SNAPSHOT_SCHEMA_VERSION) {
         return error('同步存储版本已升级，请刷新页面后重试。', 409);
     }
-    const [manifest, marker] = await Promise.all([
-        getManifest(bucket),
-        bucket.head(MIGRATION_MARKER_KEY)
-    ]);
-    return json({
-        ok: true,
-        remote: manifest ? buildRemoteInfo(manifest) : null,
-        resetRequired: !marker
-    });
+    if (!await bucket.head(MIGRATION_MARKER_KEY)) return json({ ok: true, remote: null, resetRequired: true });
+    const manifest = await getManifest(bucket);
+    return json({ ok: true, remote: manifest ? buildRemoteInfo(manifest) : null, resetRequired: false });
 }
 
 function getSyncCursor(body) {
@@ -1209,52 +1237,35 @@ async function handleResetUpload(bucket, body) {
     if (await bucket.head(MIGRATION_MARKER_KEY)) {
         return json({ ok: true, done: true, resetRequired: false, cursor: null });
     }
-    const page = await bucket.list({ prefix: 'rp-sync/', cursor, limit: SYNC_DELETE_BATCH_SIZE });
+    const migrationSource = `${R2_PREFIX}/`;
+    const page = await bucket.list({ prefix: migrationSource, cursor, limit: SYNC_DELETE_BATCH_SIZE });
     const nextCursor = getNextSyncCursor(page, cursor);
-    const keys = (page.objects || [])
-        .map(object => object.key)
-        .filter(key => typeof key === 'string' && key.startsWith('rp-sync/'));
+    const keys = (page.objects || []).map(object => object.key).filter(key => key !== MIGRATION_MARKER_KEY);
     if (keys.length) await bucket.delete(keys);
-    if (!nextCursor) {
-        await bucket.put(MIGRATION_MARKER_KEY, '1', {
-            httpMetadata: { contentType: 'text/plain; charset=utf-8' }
-        });
-    }
-    return json({
-        ok: true,
-        done: !nextCursor,
-        resetRequired: Boolean(nextCursor),
-        cursor: nextCursor
+    if (nextCursor) return json({ ok: true, done: false, cursor: nextCursor, resetRequired: true });
+    await bucket.put(MIGRATION_MARKER_KEY, '1', {
+        httpMetadata: { contentType: 'text/plain; charset=utf-8' }
     });
+    return json({ ok: true, done: true, resetRequired: false, cursor: null });
 }
 
 async function handleListUploadPacks(bucket, body) {
     const cursor = getSyncCursor(body);
     if (!await bucket.head(MIGRATION_MARKER_KEY)) {
-        return error('同步存储版本需要重置，请先完成分页清理。', 409, { resetRequired: true });
+        return error('同步存储尚未初始化，请先完成无损初始化。', 409, { resetRequired: true });
     }
     const prefix = `${PACK_PREFIX}/`;
     const page = await bucket.list({ prefix, cursor, limit: SYNC_DELETE_BATCH_SIZE });
     const nextCursor = getNextSyncCursor(page, cursor);
-    const manifest = await getManifest(bucket);
-    const activeKeys = new Set((manifest?.packManifest || []).map(pack => createPackKey(pack.checksum)));
-    const cleanupCutoff = Date.now() - SYNC_PACK_CLEANUP_GRACE_MS;
-    const staleKeys = [];
     const availablePacks = [];
     for (const object of page.objects || []) {
         if (!object?.key?.startsWith(prefix)) continue;
-        const uploadedAt = new Date(object.uploaded || 0).getTime();
-        if (!activeKeys.has(object.key) && uploadedAt > 0 && uploadedAt < cleanupCutoff) {
-            staleKeys.push(object.key);
-            continue;
-        }
         const match = object.key.slice(prefix.length).match(/^([a-f0-9]{64})\.bin$/);
         const length = Number(object.size);
         if (match && Number.isInteger(length) && length > 0 && length <= MAX_PACK_BYTES) {
             availablePacks.push({ checksum: match[1], length });
         }
     }
-    if (staleKeys.length) await bucket.delete(staleKeys);
     return json({
         ok: true,
         availablePacks,
@@ -1270,9 +1281,8 @@ async function handlePullPack(bucket, body) {
     const checksum = String(body.checksum || '').toLowerCase();
     if (!Number.isInteger(version) || version !== manifest.version) return error('服务器版本已变化，请重试。', 409);
     if (!/^[a-f0-9]{64}$/.test(checksum)) return error('下载数据校验码无效。');
-    if (!manifest.packManifest.some(pack => pack.checksum === checksum)) return error('下载数据不存在。', 404);
-
     const pack = manifest.packManifest.find(item => item.checksum === checksum);
+    if (!pack) return error('下载数据不存在。', 404);
     const storedPack = await bucket.get(createPackKey(checksum));
     if (!storedPack) return error('R2 同步数据不存在。', 404);
     const byteLength = Number(storedPack.size || 0);
@@ -1393,7 +1403,7 @@ async function readSyncJsonBody(request) {
 
 async function handleUploadPackBatch(request, bucket) {
     if (!await bucket.head(MIGRATION_MARKER_KEY)) {
-        return error('同步存储版本需要重置，请先完成分页清理。', 409, { resetRequired: true });
+        return error('同步存储尚未初始化，请先完成无损初始化。', 409, { resetRequired: true });
     }
     const contentType = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     if (contentType !== 'application/octet-stream') return error('上传批次必须使用二进制格式。', 415);
@@ -1440,11 +1450,10 @@ async function handleUploadPackBatch(request, bucket) {
             if (uploadError) throw uploadError;
             const bytes = await reader.readExact(pack.length);
             let entryCount = 0;
-            for (const byte of bytes) {
-                if (byte === 10) entryCount += 1;
-            }
-            if (entryCount > MAX_PACK_ENTRIES) {
-                throw new SyncRequestError('上传数据包记录数量超过上限。', 409);
+            for (let index = 0; index < bytes.byteLength; index += 1) {
+                if (bytes[index] === 10 && ++entryCount > MAX_PACK_ENTRIES) {
+                    throw new SyncRequestError('上传数据包记录数量超过上限。', 409);
+                }
             }
             const sha256 = Uint8Array.from(pack.checksum.match(/../g), value => parseInt(value, 16));
             let upload;
@@ -1498,7 +1507,7 @@ async function handleUploadComplete(bucket, body) {
         return error('上传快照清单校验失败。', 409);
     }
     if (!await bucket.head(MIGRATION_MARKER_KEY)) {
-        return error('同步存储版本需要重置，请先完成分页清理。', 409, { resetRequired: true });
+        return error('同步存储尚未初始化，请先完成无损初始化。', 409, { resetRequired: true });
     }
 
     const expectedPacks = new Map(packManifest.map(pack => [createPackKey(pack.checksum), pack]));
@@ -1533,7 +1542,7 @@ async function handleUploadComplete(bucket, body) {
             schemaVersion: previous.schemaVersion
         });
     }
-    if (baseVersion !== Number(previous?.version || 0)) {
+    if (baseVersion !== Number(previous?.version || 0) || String(body.baseChecksum || '') !== String(previous?.checksum || '')) {
         return error('服务器同步版本已变化，请重新检查后上传。', 409, {
             currentVersion: Number(previous?.version || 0)
         });
@@ -1603,10 +1612,10 @@ async function handleJsonApi(request, env) {
     if (!await isRequestAuthorized(request, env)) return error('Sync password required.', 401, { authRequired: true });
 
     const bucket = getBucket(env);
-    if (body.action === 'prepare-upload') return handlePrepareUpload(bucket, body);
+    if (body.action === 'prepare-upload') return handleStatus(bucket, body);
     if (body.action === 'reset-upload') return handleResetUpload(bucket, body);
     if (body.action === 'list-upload-packs') return handleListUploadPacks(bucket, body);
-    if (body.action === 'pull-manifest') return handleStatus(bucket);
+    if (body.action === 'pull-manifest') return handleStatus(bucket, body);
     if (body.action === 'pull-pack') return handlePullPack(bucket, body);
     if (body.action === 'upload-complete') return handleUploadComplete(bucket, body);
     return error('Unsupported action.', 404);
@@ -1633,14 +1642,12 @@ async function handleApi(request, env, url) {
 }
 
 async function serveStatic(request, env) {
-    if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') {
-        throw new Error('Missing ASSETS binding. Pages Advanced Mode requires env.ASSETS.fetch(request).');
-    }
+    if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') return null;
     return env.ASSETS.fetch(request);
 }
 
 function serveSyncRestorePage() {
-    return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RP Hub 云同步</title><link rel="stylesheet" href="/DB/styles.css"></head><body><script src="/DB/bootstrap.js"></script></body></html>`, {
+    return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RP Hub 云同步</title><link rel="stylesheet" href="/DB/styles.css"></head><body><script src="/DB/dirty-tracker.js"></script><script src="/DB/bootstrap.js"></script></body></html>`, {
         headers: {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-store'
@@ -1653,6 +1660,57 @@ function encodeAdapterForHtml(adapter) {
         .replace(/</g, '\\u003c')
         .replace(/>/g, '\\u003e')
         .replace(/&/g, '\\u0026');
+}
+
+// sourceChecks markers are verified against the live upstream before the
+// adapter is applied; results are cached for the adapter object's lifetime
+// (at most one 30s window per isolate). A failed check means the adapter no
+// longer matches the author's page, so the whole magic set falls back to the
+// unmodified author content — same all-or-nothing rule as replacement misses.
+const sourceCheckCaches = new WeakMap();
+
+function normalizeSourceCheckPath(value) {
+    const path = String(value || '');
+    return path === '/' ? '/index.html' : path;
+}
+
+async function sourceCheckResults(adapter, knownContent = null, fetchUnknownPaths = true) {
+    const checks = adapter?.author?.sourceChecks;
+    if (!Array.isArray(checks) || checks.length === 0) return true;
+    try {
+        let cache = sourceCheckCaches.get(adapter);
+        if (!cache) {
+            cache = new Map();
+            sourceCheckCaches.set(adapter, cache);
+        }
+        let allPassed = true;
+        for (const check of checks) {
+            const path = normalizeSourceCheckPath(check.path);
+            const markers = Array.isArray(check.contains) ? check.contains : [];
+            if (knownContent && normalizeSourceCheckPath(knownContent.path) === path) {
+                const passed = markers.every(marker => knownContent.text.includes(marker));
+                cache.set(path, passed);
+                if (!passed) allPassed = false;
+                continue;
+            }
+            if (cache.has(path)) {
+                if (!cache.get(path)) allPassed = false;
+                continue;
+            }
+            if (!fetchUnknownPaths) continue;
+            const response = await fetch(new URL(check.path.replace(/^\/+/, ''), AUTHOR_BASE));
+            let passed = false;
+            if (response.ok) {
+                const text = await response.text();
+                passed = markers.every(marker => text.includes(marker));
+            }
+            cache.set(path, passed);
+            if (!passed) allPassed = false;
+        }
+        return allPassed;
+    } catch (_) {
+        return false;
+    }
 }
 
 async function tryLoadAdapter(env) {
@@ -1670,7 +1728,7 @@ function rewriteAuthorHtml(response, pathname, adapter = null) {
         : '';
     const injection = (isMain ? '<link rel="stylesheet" href="/DB/styles.css">' : '')
         + '<script src="/DB/dirty-tracker.js"></script>'
-        + (isMain ? `<script src="/DB/persistence-bridge.js"></script>${adapterConfig}<script src="/DB/upload-engine.js"></script><script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
+        + (isMain ? `${adapterConfig}<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
     headers.set('cache-control', 'no-store');
@@ -1694,6 +1752,11 @@ async function serveAdapterConfig(request, env) {
     }
     try {
         const adapter = await loadAdapter(env);
+        // Only consult already-verified source check results here; the pages
+        // and app.js requests perform the full verification.
+        if (!await sourceCheckResults(adapter, null, false)) {
+            throw new Error('适配清单与作者页面不匹配。');
+        }
         const response = json(adapterPublicView(adapter));
         return request.method === 'HEAD'
             ? new Response(null, { status: response.status, headers: response.headers })
@@ -1767,7 +1830,7 @@ async function serveAuthor(request, env) {
     if (isAppJs) {
         const source = await response.text();
         let body = source;
-        if (adapter) {
+        if (adapter && await sourceCheckResults(adapter, { path: requestUrl.pathname, text: source })) {
             try {
                 body = rewriteAuthorScript(source, adapter);
                 const etag = response.headers.get('etag');
@@ -1781,10 +1844,24 @@ async function serveAuthor(request, env) {
     if (response.status === 304) return response;
     const isHtml = contentType.toLowerCase().includes('text/html');
     if (isHtml) {
-        const adapter = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html'
-            ? await tryLoadAdapter(env)
-            : null;
-        return rewriteAuthorHtml(response, requestUrl.pathname, adapter);
+        const isMain = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html';
+        let pageAdapter = isMain ? await tryLoadAdapter(env) : null;
+        let pageResponse = response;
+        if (pageAdapter) {
+            // Verify the in-hand page markers here; other check paths are only
+            // consulted from cache so serving a page never downloads extra
+            // assets. The app.js request verifies the remaining paths.
+            const pageText = await response.text();
+            if (!await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText }, false)) {
+                pageAdapter = null;
+            }
+            pageResponse = new Response(pageText, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            });
+        }
+        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, pageAdapter);
     }
     return response;
 }
@@ -1794,9 +1871,6 @@ export default {
         const url = new URL(request.url);
         if (url.pathname === ADAPTER_PATH) {
             return serveAdapterConfig(request, env);
-        }
-        if (url.pathname === MAGIC_EXTENSION_PATH) {
-            return serveStatic(request, env);
         }
         if (url.pathname === IMAGE_API_PATH) {
             try {
@@ -1818,12 +1892,11 @@ export default {
         if (url.pathname === '/sync-restore') {
             return serveSyncRestorePage();
         }
-        if (url.pathname === '/' || url.pathname === '/index.html'
-            || url.pathname === '/character' || url.pathname.startsWith('/character/')
-            || url.pathname === '/novel' || url.pathname.startsWith('/novel/')
-            || url.pathname === '/logo.jpg' || url.pathname.startsWith('/assets/')) {
-            return serveAuthor(request, env);
-        }
-        return serveStatic(request, env);
+        // 部署目录里只有我们自己的静态文件；本地资源命中就直接返回，
+        // 其余路径（包括作者以后新增的页面和资源）一律回源作者站点，
+        // 不再维护硬编码的代理路径清单。
+        const assetResponse = await serveStatic(request, env);
+        if (assetResponse && assetResponse.status !== 404) return assetResponse;
+        return serveAuthor(request, env);
     }
 };

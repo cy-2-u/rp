@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "id": "rp-hub-2026-09-16",
+  "id": "rp-hub",
   "author": {
     "script": {
       "path": "/assets/js/app.js",
@@ -55,7 +55,6 @@
   "ui": {
     "navigation": {
       "mode": "section-grid",
-      "panel": "#app-navigation-panel",
       "content": ".app-navigation-content",
       "section": ".app-navigation-section",
       "sectionHeading": "常用",
@@ -64,8 +63,7 @@
       "insertBeforeLabel": "设置",
       "user": ".app-navigation-user",
       "buttonClass": "app-navigation-item",
-      "iconClass": "app-navigation-icon",
-      "openTrigger": ".app-nav-trigger"
+      "iconClass": "app-navigation-icon"
     },
     "settings": {
       "labelSelector": "label",
