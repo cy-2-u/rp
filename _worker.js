@@ -155,7 +155,9 @@ const SYNC_DELETE_BATCH_SIZE = 1000;
 const SYNC_COMMIT_MAX_LIST_PAGES = 32;
 const SYNC_PACK_GC_GRACE_MS = 24 * 60 * 60 * 1000;
 const SYNC_PACK_GC_MAX_LIST_PAGES = 8;
-const SYNC_PACK_GC_MAX_DELETES = 100;
+// R2 batch delete takes up to 1000 keys per call, so one delete subrequest
+// clears up to 1000 orphans — the cap bounds work, not subrequests.
+const SYNC_PACK_GC_MAX_DELETES = 1000;
 const STREAM_SNAPSHOT_FORMAT = 'rp-sync-bounded-jsonl-v3';
 const STREAM_SNAPSHOT_SCHEMA_VERSION = 12;
 const IMAGE_API_PATH = '/api/rp-image';
@@ -1706,6 +1708,15 @@ async function handleUploadComplete(bucket, body, ctx) {
         }
     }
     if (expectedPacks.size) {
+        // The scan budget ran out — almost always a pre-GC orphan backlog
+        // crowding the lexicographic listing. GC here breaks the deadlock:
+        // a failed commit used to never reach the post-commit GC, so the
+        // backlog could only grow. Budget check: this response path has used
+        // ~35 subrequests (head, manifest, 32 list pages); the GC adds at
+        // most 10 more (head, 8 list pages, 1 batch delete) — under the 50
+        // limit. Best effort; the client retries and the backlog shrinks
+        // by up to 1000 per attempt until verification fits again.
+        scheduleOrphanPackGc(bucket, ctx);
         return error('服务器数据包索引尚未检查完整，请完成分页整理后重试。', 503);
     }
 

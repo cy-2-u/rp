@@ -319,6 +319,53 @@ async function testOrphanPackGc() {
         assert.ok(!objects.has(packKey('1'.repeat(64))), 'first-commit GC must remove orphans when nothing is referenced');
         assert.ok(objects.has('rp-sync/main/manifest.json'), 'the fresh manifest must survive its own GC run');
     }
+
+    // Scenario 6: a pre-GC orphan backlog larger than the commit scan budget
+    // (32 pages x 1000 keys) used to deadlock — the 503 meant no commit and
+    // therefore no GC. The verification-503 path must schedule the GC so each
+    // attempt shaves the backlog (up to 1000 packs) until verification fits.
+    {
+        const objects = new Map();
+        const oldChecksum = await snapshotChecksum([referencedOld]);
+        const newChecksum = await snapshotChecksum([referencedNew]);
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
+        // Pack 'a' is both the currently referenced pack and the new
+        // manifest's only pack; 32100 expired orphans sort BEFORE it
+        // (hex digits < 'a'), pushing it beyond the 32-page scan budget.
+        objects.set(packKey('a'.repeat(64)), { key: packKey('a'.repeat(64)), bytes: Buffer.from([1, 2, 3, 4]), size: 4, etag: '"a"', uploaded: new Date(now - 48 * HOUR) });
+        for (let index = 0; index < 32100; index += 1) {
+            const checksum = index.toString(16).padStart(4, '0').padEnd(64, '0');
+            objects.set(packKey(checksum), { key: packKey(checksum), bytes: Buffer.from([1]), size: 1, etag: `"o${index}"`, uploaded: new Date(now - 48 * HOUR) });
+        }
+        const first = await commit(objects, {}, {
+            baseVersion: 7,
+            baseChecksum: oldChecksum,
+            checksum: newChecksum,
+            packCount: 1,
+            entryCount: 1,
+            totalBytes: 4,
+            packManifest: [referencedNew]
+        });
+        assert.equal(first.status, 503, 'the oversized backlog must exhaust the commit scan budget');
+        assert.equal(objects.has('rp-sync/main/manifest.json'), true, 'the failed commit must not touch data');
+        // The 503-path GC deletes exactly 1000 expired orphans per attempt and
+        // must keep the referenced pack.
+        const packsLeft = [...objects.keys()].filter(key => key.startsWith('rp-sync/main/packs/')).length;
+        assert.equal(packsLeft, 32101 - 1000, 'the 503-path GC must delete ~1000 orphans per attempt');
+        // Retry: the shrunken listing now fits the 32-page budget end-to-end.
+        const second = await commit(objects, {}, {
+            baseVersion: 7,
+            baseChecksum: oldChecksum,
+            checksum: newChecksum,
+            packCount: 1,
+            entryCount: 1,
+            totalBytes: 4,
+            packManifest: [referencedNew]
+        });
+        assert.equal(second.status, 200, 'the retry must commit once the backlog fits the scan budget');
+        assert.equal(objects.has(packKey('a'.repeat(64))), true, 'the committed pack must survive');
+    }
 }
 
 async function testManifestEtagCache() {
