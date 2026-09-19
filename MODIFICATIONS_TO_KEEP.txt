@@ -94,7 +94,9 @@ Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag
    固定图片写入与已开始的 IndexedDB 写入也必须完成。
 
 3. 本地变更日志与稳定分桶：
-   小对象分桶合并，大数组按 128 项分页；每包最多 256 项，目标约 512KB。
+   小对象分桶合并，大数组按 128 项分页；每包最多 512 项，目标约 1MiB（2026-09-19 从 256 项/512KB 上调，
+   原因：清单条目数随包数线性膨胀，大库的 upload-complete 在免费版 10ms CPU 上触发 1102；
+   副作用是等长修改的单切片浪费翻倍，知情取舍）。
    业务写入与变更日志在同一 IndexedDB 事务内提交或回滚：dirty-tracker 在已知库上加内部 `__rp_sync_journal_v2` 存储，
    put/add/delete（含 IDBKeyRange 范围删除，先 getAllKeys 记录实际键）、clear、cursor.update/delete 全部记日志；
    自增键在写成功后用 request.result 记录实际键；日志写入失败会中止业务事务，不再吞异常。

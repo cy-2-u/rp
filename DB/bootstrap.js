@@ -210,11 +210,11 @@
         scanBatchRecords: 64,
         scanBatchBytes: 8 * 1024 * 1024,
         restoreBatchSize: 64,
-        targetPackBytes: 512 * 1024,
+        targetPackBytes: 1024 * 1024,
         maxPackCount: 8192,
         maxManifestBytes: 2 * 1024 * 1024,
         cacheWriteBytes: 1024 * 1024,
-        maxPackEntries: 256,
+        maxPackEntries: 512,
         yieldIntervalMs: 12
     };
 

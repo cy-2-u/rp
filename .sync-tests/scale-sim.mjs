@@ -412,7 +412,7 @@ const localStorage = new Storage();
 
 // ------------------------------------------------- phase 0: seed data ----
 
-const SCALE_MB = 300;
+const SCALE_MB = Number(process.env.SCALE_MB) || 300;
 const TARGET_BYTES = SCALE_MB * 1024 * 1024;
 const PAYLOAD_BYTES = 8000;
 // Per-line estimate: payload + canonical JSON envelope overhead
@@ -554,7 +554,7 @@ assert.ok(phase1MaxSubrequests <= LIMITS.subrequestsPerRequest,
     `subrequest budget exceeded: ${phase1MaxSubrequests}`);
 assert.ok(maxClientInflight <= LIMITS.outboundConnections, 'client concurrency must stay within 6 outbound connections');
 assert.equal(maxClientInflight, 1, 'the bounded engine must keep exactly one batch in flight');
-assert.ok(bucket.stats.maxInflightPutBytes <= 3 * 512 * 1024 + 1024, 'R2 writes must stay within the 3-put concurrency bound');
+assert.ok(bucket.stats.maxInflightPutBytes <= 3 * 1024 * 1024 + 1024, 'R2 writes must stay within the 3-put concurrency bound');
 console.log(`  requests: ${phase1Requests} (~${(phase1Requests / LIMITS.requestsPerDay * 100).toFixed(3)}% of daily 100k), max wall ${Math.max(...phase1Slices.map(e=>e.wallMs)).toFixed(2)} ms, max subrequests ${phase1MaxSubrequests}`);
 console.log(`  R2 ops this phase: A=${phase1Slices.reduce((t, e) => t + e.classA, 0)}, B=${phase1Slices.reduce((t, e) => t + e.classB, 0)}`);
 console.log(`phase 1 (first ${SCALE_MB}MB upload): ok`);

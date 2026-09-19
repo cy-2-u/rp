@@ -139,10 +139,14 @@ const R2_PREFIX = `rp-sync/${DATASET_ID}`;
 const MANIFEST_KEY = `${R2_PREFIX}/manifest.json`;
 const MIGRATION_MARKER_KEY = `${R2_PREFIX}/migration-v12.done`;
 const PACK_PREFIX = `${R2_PREFIX}/packs`;
-const MAX_PACK_BYTES = 512 * 1024;
+// Pack ceilings. 1MiB target keeps the sync manifest (one entry per pack)
+// small enough that upload-complete/prepare-upload stay inside the free
+// plan's 10ms CPU budget even for ~1GiB datasets; the client packs to the
+// same target so entries halve versus the old 512KB target.
+const MAX_PACK_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const MAX_OBJECT_COUNT = 8192;
-const MAX_PACK_ENTRIES = 256;
+const MAX_PACK_ENTRIES = 512;
 // TextEncoder.encode 无内部状态，全 isolate 共享一个实例，避免热路径反复分配。
 const textEncoder = new TextEncoder();
 const SYNC_CONTROL_MAX_BYTES = 2 * 1024 * 1024;

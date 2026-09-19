@@ -221,7 +221,7 @@ npm test
 ## 8. 同步协议速查（开发参考）
 
 - 协议 `rp-sync-bounded-jsonl-v3`，schema 12；云端为 `rp-sync/main/manifest.json` + `rp-sync/main/packs/<sha256>.bin` + 一次性迁移标记 `rp-sync/main/migration-v12.done`。
-- 客户端把数据序列化为 JSONL 行（确定性 canonical JSON，键排序；非 JSON 值直接报错停止），小对象按内容哈希进 32 个稳定桶、大数组按 128 项分页；每包目标 512KB、最多 256 行。
+- 客户端把数据序列化为 JSONL 行（确定性 canonical JSON，键排序；非 JSON 值直接报错停止），小对象按内容哈希进 32 个稳定桶、大数组按 128 项分页；每包目标 1MiB、最多 512 行（2026-09-19 从 512KB/256 行上调：清单条目数减半，让 upload-complete 在 ~1GiB 数据下也不超出免费版 10ms CPU——大库 1102 的根因就是大清单超限；代价是等长修改的单切片浪费翻倍，知情取舍）。
 - 上传：`prepare-upload`（校验 schema 与迁移标记；未迁移返回 `resetRequired`，客户端先走 `reset-upload` 分页删除 `rp-sync/main/` 旧对象、删完才写标记，图片前缀不受影响）→ `upload-pack-batch`（二进制批：4 字节头长 + JSON 头 + 包体；单批 ≤8 包/4MiB）→ `upload-complete`（R2 分页 list 核对 + etag 乐观并发提交 + baseVersion/baseChecksum 与本地已确认基线双比对，云端与基线不同即拒绝）。缺分片时 `upload-complete` 返回 409 `missingPacks`，客户端定向补传后重新提交。客户端用基线快照的分片清单直接判断哪些分片要传，**不再调用 `list-upload-packs` 列举历史分片**（每次推送省掉 O(历史分片数/1000) 个请求；服务器端点保留兼容旧客户端；"改后改回"可能对同一 checksum 幂等重传一次，安全）。提交成功后触发孤儿分片后台 GC（24 小时宽限 + 8 页 list + 单次 1000 删除上限——R2 批量 delete 单请求即可清 1000 个 key，见第 10 节边界）。提交验证因扫描预算耗尽返回 503 时**同样**触发 GC，打破"失败提交无法触发清理"的死锁：GC 上线前积累的孤儿分片会在几次重试内被逐步清掉。
 - 下载：`pull-manifest`（与 `prepare-upload` 共用同一个 handleStatus：请求必须带当前 `schemaVersion`，旧页面收到 409 提示刷新）→ 并发 10 个 `pull-pack`，逐包校验 sha256 和行数 → 先全量校验一遍 → 拿排他锁应用 → 重建本地缓存与基线，并确认恢复水位。
 - 渲染热点路径：`/api/rp-image` 先读原图，命中恰好 1 次 R2 get；未命中才读墓碑，区分"已删除"（SVG 占位，重新生成也会被墓碑拦下）与"从未生成"（404）。生图缺 token 401、缺 tag 400；上游异常透传状态码、非图片 502、超 64MiB 413。
