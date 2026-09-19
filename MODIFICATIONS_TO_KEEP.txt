@@ -172,6 +172,10 @@ Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag
 Worker 不提供 /healthy 检查端点（免费版 CPU 限额下无法承载完整校验）。只有 Worker 逻辑变化时才需要重新部署。
 
 本轮代码检查：
+- 清理测试期遗留钩子（2026-09-19）：删除 window.RPH_SYNC_REBUILD_CACHE 全局导出——重建按钮
+  直接走闭包内 requestExplicitRebuild()，该全局全项目零消费方；其余全局桥
+  （RPH_SYNC_UPLOAD_ENGINE/RPH_SYNC_PERSISTENCE/RPH_SYNC_TRACKER/RPH_MAGIC_IMAGE_TASK/
+  RPH_MAGIC_FLUSH_IMAGES/__RPH_SYNC_DIRTY_TRACKING__）逐一核对均为功能代码。
 - 清单冷路径优化（2026-09-19，行为不变）：normalizePackManifest 单遍同时产出规范化条目与校验源
   （消除第二轮全量 map 与 String/Number 重包装）；buildRemoteInfo 直接复用规范化条目（同键序，序列化字节不变）；
   新增按 checksum 的二级校验缓存（key = checksum:totalBytes:packCount:entryCount，含 version/updatedAt

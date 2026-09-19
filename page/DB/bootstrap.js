@@ -296,7 +296,6 @@
         localStorage.setItem('rp_sync_rebuild_requested', '1');
         return true;
     }
-    window.RPH_SYNC_REBUILD_CACHE = requestExplicitRebuild;
 
     function readBaseline() {
         const value = localStorage.getItem(BASELINE_KEY);
