@@ -248,6 +248,7 @@
     let modalProgressValue = null;
     let pullButton = null;
     let pushButton = null;
+    let rebuildButton = null;
     let passwordModalRoot = null;
     let passwordInput = null;
     let passwordStatus = null;
@@ -1993,7 +1994,9 @@
             const epoch = localStorage.getItem(TRACKING_EPOCH_KEY);
             const journalReset = state?.epochs && Object.entries(state.epochs).some(([name, value]) => dirty.epochs[name] !== value);
             if (!rebuild && (baseline || state) && (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.epoch !== epoch || journalReset)) {
-                throw new Error('同步索引缺失、过期或追踪已重置。请先导出本地数据，再点击“重建本地索引”；不会自动全扫或覆盖云端。');
+                const error = new Error('本地同步索引缺失、过期或追踪已重置，需要完整重建索引后才能继续上传（只读本地数据，不会覆盖云端）。');
+                error.indexInvalid = true;
+                throw error;
             }
             let result;
             if (rebuild || !state) {
@@ -2268,13 +2271,16 @@
         modalProgressValue = modalRoot.querySelector('.rp-sync-progress__value');
         pullButton = modalRoot.querySelector('[data-action="pull"]');
         pushButton = modalRoot.querySelector('[data-action="push"]');
+        rebuildButton = modalRoot.querySelector('[data-action="rebuild"]');
+        // 重建是恢复手段不是常规操作：默认隐藏。推送遇索引错误时经确认
+        // 自动重建并继续；拒绝时才显示按钮走手动路径。
+        rebuildButton.style.display = 'none';
 
         const closeButton = modalRoot.querySelector('.rp-sync-modal__close');
         if (RESTORE_PAGE) {
             modalRoot.classList.add('rp-sync-modal--restore');
             pullButton.textContent = '重新恢复';
             pushButton.style.display = 'none';
-            modalRoot.querySelector('[data-action="rebuild"]').style.display = 'none';
             closeButton.textContent = '返回';
             closeButton.setAttribute('aria-label', '返回');
         }
@@ -2330,7 +2336,22 @@
         let baseRemote = statusResponse.remote || null;
         let baseVersion = Number(baseline?.version || 0);
         let baseChecksum = baseline?.checksum || '';
-        const incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+        let incremental;
+        try {
+            incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+        } catch (err) {
+            if (!err?.indexInvalid) throw err;
+            // 索引过期不再要求用户离开当前流程：一次确认后自动重建并继续
+            // 上传。重建只读本地数据；云端若被别端更新过，后续提交仍会被
+            // 基线比对拦下，这里不会造成静默覆盖。
+            if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据，不会覆盖云端；云端若被别端更新过，上传仍会被基线比对拦下。大库可能需要几分钟。继续吗？')) {
+                if (rebuildButton) rebuildButton.style.display = '';
+                throw err;
+            }
+            updateProgress(progress.check, '正在完整重建本地索引…');
+            requestExplicitRebuild();
+            incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+        }
         const snapshot = incremental.snapshot;
         if (statusResponse.resetRequired) {
             updateProgress(progress.check, '正在一次性清理旧云端同步数据…');
