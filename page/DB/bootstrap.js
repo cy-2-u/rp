@@ -179,6 +179,10 @@
         return;
     }
 
+    // TextEncoder.encode 无内部状态，整个同步模块共享一个实例；
+    // 序列化/校验和是每条记录级别的热路径，不再逐次分配编码器。
+    const textEncoder = new TextEncoder();
+
     const CONFIG = {
         apiEndpoint: '/api/rp-sync',
         passwordStorageKey: 'rp_hub_sync_password_v1',
@@ -267,25 +271,22 @@
             const db = await openDbByName(name);
             try {
                 if (!db.objectStoreNames.contains(JOURNAL_STORE)) throw new Error('本地变更追踪未就绪，请刷新后重试。');
-                await new Promise((resolve, reject) => {
-                    const tx = db.transaction(JOURNAL_STORE, 'readonly');
-                    const request = tx.objectStore(JOURNAL_STORE).openCursor();
-                    request.onsuccess = () => {
-                        const cursor = request.result;
-                        if (!cursor) return;
-                        if (cursor.key === '__epoch__') { dirty.epochs[name] = cursor.value; cursor.continue(); return; }
-                        const event = cursor.value;
-                        watermark.databases[name] = cursor.key;
-                        const identity = `${name}/${event.store}`;
-                        const item = dirty.stores.get(identity) || { clear: false, keys: new Map() };
-                        if (event.clear) { item.clear = true; item.keys.clear(); }
-                        else item.keys.set(stableKeyToken(event.key), event.key);
-                        dirty.stores.set(identity, item);
-                        cursor.continue();
-                    };
-                    tx.oncomplete = resolve;
-                    tx.onabort = () => reject(tx.error || new Error('变更日志读取失败。'));
-                });
+                const tx = db.transaction(JOURNAL_STORE, 'readonly');
+                const request = tx.objectStore(JOURNAL_STORE).openCursor();
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    if (cursor.key === '__epoch__') { dirty.epochs[name] = cursor.value; cursor.continue(); return; }
+                    const event = cursor.value;
+                    watermark.databases[name] = cursor.key;
+                    const identity = `${name}/${event.store}`;
+                    const item = dirty.stores.get(identity) || { clear: false, keys: new Map() };
+                    if (event.clear) { item.clear = true; item.keys.clear(); }
+                    else item.keys.set(stableKeyToken(event.key), event.key);
+                    dirty.stores.set(identity, item);
+                    cursor.continue();
+                };
+                await waitForTransaction(tx, '变更日志读取失败。');
             } finally { db.close(); }
         }
         return dirty;
@@ -350,6 +351,30 @@
 
     function clearStoredSyncPassword() {
         localStorage.removeItem(CONFIG.passwordStorageKey);
+    }
+
+    function waitForTransaction(tx, message, getValue = () => undefined) {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                callback(value);
+            };
+            tx.addEventListener('complete', () => {
+                try {
+                    finish(resolve, getValue());
+                } catch (error) {
+                    finish(reject, error);
+                }
+            }, { once: true });
+            tx.addEventListener('error', () => {
+                finish(reject, tx.error || new Error(message));
+            }, { once: true });
+            tx.addEventListener('abort', () => {
+                finish(reject, tx.error || new Error(`${message} aborted`));
+            }, { once: true });
+        });
     }
 
     function openDbByName(dbName, version) {
@@ -478,35 +503,33 @@
     }
 
     function readObjectStoreRecordBatch(db, storeName, afterKey, hasAfterKey) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([storeName], 'readonly');
-            const store = tx.objectStore(storeName);
-            const range = hasAfterKey ? IDBKeyRange.lowerBound(afterKey, true) : null;
-            const records = [];
-            let batchBytes = 0;
-            const request = store.openCursor(range);
-
-            request.onerror = () => reject(request.error || new Error('IndexedDB cursor read failed.'));
-            request.onsuccess = () => {
-                const cursor = request.result;
-                if (!cursor) {
-                    resolve({ records, done: true, lastKey: afterKey });
-                    return;
-                }
-                // Stop before deserializing the next record into the batch, so a
-                // single oversized author record never inflates it. lastKey must be
-                // the last key already read: the next batch resumes with an
-                // exclusive lower bound, so returning the unread cursor.key here
-                // would silently skip that record.
-                if (records.length >= CONFIG.scanBatchRecords || batchBytes >= CONFIG.scanBatchBytes) {
-                    resolve({ records, done: false, lastKey: records[records.length - 1].key });
-                    return;
-                }
-                records.push({ key: cursor.key, value: cursor.value });
-                batchBytes += estimateRecordBytes(cursor.value);
-                cursor.continue();
-            };
-        });
+        const tx = db.transaction([storeName], 'readonly');
+        const store = tx.objectStore(storeName);
+        const range = hasAfterKey ? IDBKeyRange.lowerBound(afterKey, true) : null;
+        const records = [];
+        let batchBytes = 0;
+        const request = store.openCursor(range);
+        let result;
+        request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+                result = { records, done: true, lastKey: afterKey };
+                return;
+            }
+            // Stop before deserializing the next record into the batch, so a
+            // single oversized author record never inflates it. lastKey must be
+            // the last key already read: the next batch resumes with an
+            // exclusive lower bound, so returning the unread cursor.key here
+            // would silently skip that record.
+            if (records.length >= CONFIG.scanBatchRecords || batchBytes >= CONFIG.scanBatchBytes) {
+                result = { records, done: false, lastKey: records[records.length - 1].key };
+                return;
+            }
+            records.push({ key: cursor.key, value: cursor.value });
+            batchBytes += estimateRecordBytes(cursor.value);
+            cursor.continue();
+        };
+        return waitForTransaction(tx, 'IndexedDB cursor read failed.', () => result);
     }
 
     async function* iterateObjectStoreRecords(db, storeName) {
@@ -531,52 +554,34 @@
     }
 
     function readObjectStoreKeys(db, storeName) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([storeName], 'readonly');
-            const store = tx.objectStore(storeName);
-            const keys = [];
-            const request = store.openKeyCursor();
-
-            request.onerror = () => reject(request.error || new Error('IndexedDB key read failed.'));
-            request.onsuccess = () => {
-                const cursor = request.result;
-                if (!cursor) {
-                    resolve(keys);
-                    return;
-                }
-
-                keys.push(cursor.key);
-                cursor.continue();
-            };
-        });
+        const tx = db.transaction([storeName], 'readonly');
+        const store = tx.objectStore(storeName);
+        const keys = [];
+        const request = store.openKeyCursor();
+        request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) return;
+            keys.push(cursor.key);
+            cursor.continue();
+        };
+        return waitForTransaction(tx, 'IndexedDB key read failed.', () => keys);
     }
 
     function clearObjectStore(db, storeName) {
-        return new Promise((resolve, reject) => {
-            if (!db.objectStoreNames.contains(storeName)) {
-                resolve();
-                return;
-            }
-
-            const tx = db.transaction([storeName], 'readwrite');
-            const store = tx.objectStore(storeName);
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('IndexedDB clear failed.'));
-            store.clear();
-        });
+        if (!db.objectStoreNames.contains(storeName)) return Promise.resolve();
+        const tx = db.transaction([storeName], 'readwrite');
+        tx.objectStore(storeName).clear();
+        return waitForTransaction(tx, 'IndexedDB clear failed.');
     }
 
     async function deleteObjectStoreKeys(db, storeName, keys) {
         const yieldIfNeeded = createYieldController();
         for (let start = 0; start < keys.length; start += CONFIG.restoreBatchSize) {
             const batch = keys.slice(start, start + CONFIG.restoreBatchSize);
-            await new Promise((resolve, reject) => {
-                const tx = db.transaction([storeName], 'readwrite');
-                const store = tx.objectStore(storeName);
-                tx.oncomplete = () => resolve();
-                tx.onerror = () => reject(tx.error || new Error('IndexedDB cleanup failed.'));
-                batch.forEach((key) => store.delete(key));
-            });
+            const tx = db.transaction([storeName], 'readwrite');
+            const store = tx.objectStore(storeName);
+            batch.forEach((key) => store.delete(key));
+            await waitForTransaction(tx, 'IndexedDB cleanup failed.');
             await yieldIfNeeded();
         }
     }
@@ -607,20 +612,17 @@
 
     function writeObjectStoreRecordBatch(db, storeDef, records) {
         if (!Array.isArray(records) || records.length === 0) return Promise.resolve();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([storeDef.name], 'readwrite');
-            const store = tx.objectStore(storeDef.name);
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('IndexedDB restore failed.'));
+        const tx = db.transaction([storeDef.name], 'readwrite');
+        const store = tx.objectStore(storeDef.name);
 
-            for (const record of records) {
-                if (storeDef.keyPath !== null && typeof storeDef.keyPath !== 'undefined') {
-                    store.put(record.value);
-                } else {
-                    store.put(record.value, record.key);
-                }
+        for (const record of records) {
+            if (storeDef.keyPath !== null && typeof storeDef.keyPath !== 'undefined') {
+                store.put(record.value);
+            } else {
+                store.put(record.value, record.key);
             }
-        });
+        }
+        return waitForTransaction(tx, 'IndexedDB restore failed.');
     }
 
     async function deleteMissingObjectStoreRecords(db, database, storeName, incomingKeyTokens) {
@@ -641,14 +643,10 @@
             try {
                 const storeNames = dbDef.stores.filter(storeName => db.objectStoreNames.contains(storeName));
                 for (const storeName of storeNames) {
-                    await new Promise((resolve, reject) => {
-                        const tx = db.transaction([storeName], 'readwrite');
-                        const request = tx.objectStore(storeName).get('__rp_sync_write_barrier__');
-                        request.onerror = () => reject(request.error || new Error('IndexedDB write barrier failed.'));
-                        tx.oncomplete = () => resolve();
-                        tx.onerror = () => reject(tx.error || new Error('IndexedDB write barrier failed.'));
-                        tx.onabort = () => reject(tx.error || new Error('IndexedDB write barrier aborted.'));
-                    });
+                    const tx = db.transaction([storeName], 'readwrite');
+                    const request = tx.objectStore(storeName).get('__rp_sync_write_barrier__');
+                    request.onerror = () => { /* transaction handler below supplies the final error */ };
+                    await waitForTransaction(tx, 'IndexedDB write barrier failed.');
                 }
             } finally {
                 db.close();
@@ -657,7 +655,7 @@
     }
 
     async function sha256(text) {
-        return sha256Bytes(new TextEncoder().encode(text));
+        return sha256Bytes(textEncoder.encode(text));
     }
 
     async function sha256Bytes(bytes) {
@@ -686,7 +684,7 @@
         };
         const json = JSON.stringify(canonical(value));
         if (typeof json !== 'string') throw new Error('本地数据包含无法序列化的内容。');
-        return new TextEncoder().encode(json);
+        return textEncoder.encode(json);
     }
 
     function openLocalSyncCache() {
@@ -713,19 +711,16 @@
     }
 
     function cacheReadState(db) {
-        return new Promise((resolve, reject) => {
-            const request = db.transaction([LOCAL_CACHE_STATE_STORE], 'readonly')
-                .objectStore(LOCAL_CACHE_STATE_STORE).get(CACHE_STATE_KEY);
-            request.onsuccess = () => {
-                const value = request.result || null;
-                // 写入时清单只保存一份（state.packs），读回时回填到
-                // state.snapshot.packManifest，避免大库存两份清单。
-                if (value && Array.isArray(value.packs) && value.snapshot && !value.snapshot.packManifest) {
-                    value.snapshot.packManifest = value.packs;
-                }
-                resolve(value);
-            };
-            request.onerror = () => reject(request.error || new Error('本地同步索引读取失败。'));
+        const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readonly');
+        const request = tx.objectStore(LOCAL_CACHE_STATE_STORE).get(CACHE_STATE_KEY);
+        return waitForTransaction(tx, '本地同步索引读取失败。', () => {
+            const value = request.result || null;
+            // 写入时清单只保存一份（state.packs），读回时回填到
+            // state.snapshot.packManifest，避免大库存两份清单。
+            if (value && Array.isArray(value.packs) && value.snapshot && !value.snapshot.packManifest) {
+                value.snapshot.packManifest = value.packs;
+            }
+            return value;
         });
     }
 
@@ -733,21 +728,15 @@
         const persisted = value && Array.isArray(value.packs) && value.snapshot
             ? { ...value, snapshot: { ...value.snapshot, packManifest: undefined } }
             : value;
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readwrite');
-            tx.objectStore(LOCAL_CACHE_STATE_STORE).put(persisted, CACHE_STATE_KEY);
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error || new Error('本地同步索引写入失败。'));
-        });
+        const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readwrite');
+        tx.objectStore(LOCAL_CACHE_STATE_STORE).put(persisted, CACHE_STATE_KEY);
+        return waitForTransaction(tx, '本地同步索引写入失败。');
     }
 
     function cacheReadEntry(db, id) {
-        return new Promise((resolve, reject) => {
-            const request = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly')
-                .objectStore(LOCAL_CACHE_ENTRY_STORE).get(id);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error || new Error('本地同步对象读取失败。'));
-        });
+        const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly');
+        const request = tx.objectStore(LOCAL_CACHE_ENTRY_STORE).get(id);
+        return waitForTransaction(tx, '本地同步对象读取失败.', () => request.result);
     }
 
     // 与 readRecordsByKeys 同样的批量思路：一次只读事务读回多条缓存条目，
@@ -756,61 +745,49 @@
         const entries = [];
         for (let start = 0; start < ids.length; start += CONFIG.restoreBatchSize) {
             const batch = ids.slice(start, start + CONFIG.restoreBatchSize);
-            entries.push(...await new Promise((resolve, reject) => {
-                const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly');
-                const requests = batch.map(id => tx.objectStore(LOCAL_CACHE_ENTRY_STORE).get(id));
-                tx.oncomplete = () => resolve(requests.map(request => request.result));
-                tx.onerror = tx.onabort = () => reject(tx.error || new Error('本地同步对象读取失败。'));
-            }));
+            const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly');
+            const requests = batch.map(id => tx.objectStore(LOCAL_CACHE_ENTRY_STORE).get(id));
+            const values = await waitForTransaction(tx, '本地同步对象读取失败。', () => requests.map(request => request.result));
+            entries.push(...values);
         }
         return entries;
     }
 
     function cacheSourceKeys(db, sourceKey) {
-        return new Promise((resolve, reject) => {
-            const request = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly')
-                .objectStore(LOCAL_CACHE_ENTRY_STORE).index('sourceKey').getAllKeys(sourceKey);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error || new Error('本地同步对象索引读取失败。'));
-        });
+        const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readonly');
+        const request = tx.objectStore(LOCAL_CACHE_ENTRY_STORE).index('sourceKey').getAllKeys(sourceKey);
+        return waitForTransaction(tx, '本地同步对象索引读取失败。', () => request.result || []);
     }
 
     async function* iterateCachedBucket(db, bucketKey) {
         let after;
         while (true) {
-            const batch = await new Promise((resolve, reject) => {
-                const index = db.transaction(LOCAL_CACHE_ENTRY_STORE, 'readonly')
-                    .objectStore(LOCAL_CACHE_ENTRY_STORE).index('order');
-                const range = IDBKeyRange.bound(after || [bucketKey], [bucketKey, []], Boolean(after), true);
-                const request = index.openCursor(range);
-                const entries = [];
-                let byteLength = 0;
-                request.onerror = () => reject(request.error || new Error('本地分片读取失败。'));
-                request.onsuccess = () => {
-                    const cursor = request.result;
-                    if (!cursor) return resolve({ entries, done: true });
-                    entries.push(cursor.value);
-                    byteLength += cursor.value.bytes.byteLength;
-                    after = cursor.key;
-                    if (entries.length >= CONFIG.readBatchSize || byteLength >= CONFIG.cacheWriteBytes) {
-                        resolve({ entries, done: false });
-                    } else cursor.continue();
-                };
-            });
+            const tx = db.transaction(LOCAL_CACHE_ENTRY_STORE, 'readonly');
+            const index = tx.objectStore(LOCAL_CACHE_ENTRY_STORE).index('order');
+            const range = IDBKeyRange.bound(after || [bucketKey], [bucketKey, []], Boolean(after), true);
+            const request = index.openCursor(range);
+            const entries = [];
+            let byteLength = 0;
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                entries.push(cursor.value);
+                byteLength += cursor.value.bytes.byteLength;
+                after = cursor.key;
+                if (entries.length >= CONFIG.readBatchSize || byteLength >= CONFIG.cacheWriteBytes) return;
+                cursor.continue();
+            };
+            const batch = await waitForTransaction(tx, '本地分片读取失败。', () => ({ entries, done: entries.length === 0 || entries.length < CONFIG.readBatchSize && byteLength < CONFIG.cacheWriteBytes }));
             for (const entry of batch.entries) yield entry;
             if (batch.done) return;
         }
     }
 
     function cachePack(db, checksum, bytes) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(LOCAL_CACHE_PACK_STORE, bytes ? 'readwrite' : 'readonly');
-            const store = tx.objectStore(LOCAL_CACHE_PACK_STORE);
-            const request = bytes ? store.put(bytes, checksum) : store.get(checksum);
-            tx.oncomplete = () => resolve(request.result);
-            tx.onerror = () => reject(tx.error || new Error('本地分片缓存失败。'));
-            tx.onabort = () => reject(tx.error || new Error('本地分片缓存中止。'));
-        });
+        const tx = db.transaction(LOCAL_CACHE_PACK_STORE, bytes ? 'readwrite' : 'readonly');
+        const store = tx.objectStore(LOCAL_CACHE_PACK_STORE);
+        const request = bytes ? store.put(bytes, checksum) : store.get(checksum);
+        return waitForTransaction(tx, '本地分片缓存失败。', () => request.result);
     }
 
     async function pruneCachedPacks(db, manifest) {
@@ -821,24 +798,18 @@
 
     function cacheWriteEntries(db, entries) {
         if (!Array.isArray(entries) || entries.length === 0) return Promise.resolve();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readwrite');
-            const store = tx.objectStore(LOCAL_CACHE_ENTRY_STORE);
-            entries.forEach(entry => store.put(entry));
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error || new Error('本地同步对象写入失败。'));
-        });
+        const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE], 'readwrite');
+        const store = tx.objectStore(LOCAL_CACHE_ENTRY_STORE);
+        entries.forEach(entry => store.put(entry));
+        return waitForTransaction(tx, '本地同步对象写入失败。');
     }
 
     function cacheClear(db) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE, LOCAL_CACHE_STATE_STORE, LOCAL_CACHE_PACK_STORE], 'readwrite');
-            tx.objectStore(LOCAL_CACHE_ENTRY_STORE).clear();
-            tx.objectStore(LOCAL_CACHE_STATE_STORE).clear();
-            tx.objectStore(LOCAL_CACHE_PACK_STORE).clear();
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error || new Error('本地同步索引清理失败。'));
-        });
+        const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE, LOCAL_CACHE_STATE_STORE, LOCAL_CACHE_PACK_STORE], 'readwrite');
+        tx.objectStore(LOCAL_CACHE_ENTRY_STORE).clear();
+        tx.objectStore(LOCAL_CACHE_STATE_STORE).clear();
+        tx.objectStore(LOCAL_CACHE_PACK_STORE).clear();
+        return waitForTransaction(tx, '本地同步索引清理失败。');
     }
 
     function stableHash(value) {
@@ -941,13 +912,10 @@
     // IndexedDB must still clone a whole value for a single business key.
     function readRecordsByKeys(db, storeName, keys) {
         if (!keys.length || !db.objectStoreNames.contains(storeName)) return Promise.resolve(keys.map(() => undefined));
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(storeName, 'readonly');
-            const store = tx.objectStore(storeName);
-            const requests = keys.map(key => store.get(key));
-            tx.oncomplete = () => resolve(requests.map(request => request.result));
-            tx.onerror = tx.onabort = () => reject(tx.error || new Error('本地同步记录读取失败。'));
-        });
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const requests = keys.map(key => store.get(key));
+        return waitForTransaction(tx, '本地同步记录读取失败。', () => requests.map(request => request.result));
     }
 
     async function buildCachedPacks(db, bucketKey) {
@@ -1194,18 +1162,17 @@
                         }
                     }
                     const prefix = `${database}/${store}/`;
-                    const staleKeys = await new Promise((resolve, reject) => {
-                        const request = cacheDb.transaction(LOCAL_CACHE_ENTRY_STORE).objectStore(LOCAL_CACHE_ENTRY_STORE)
-                            .index('sourceKey').openCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
-                        const keys = [];
-                        request.onsuccess = () => {
-                            const cursor = request.result;
-                            if (!cursor) return resolve(keys);
-                            if (!finalSources.has(cursor.key)) keys.push(cursor.primaryKey);
-                            cursor.continue();
-                        };
-                        request.onerror = () => reject(request.error);
-                    });
+                    const tx = cacheDb.transaction(LOCAL_CACHE_ENTRY_STORE, 'readonly');
+                    const request = tx.objectStore(LOCAL_CACHE_ENTRY_STORE)
+                        .index('sourceKey').openCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+                    const keys = [];
+                    request.onsuccess = () => {
+                        const cursor = request.result;
+                        if (!cursor) return;
+                        if (!finalSources.has(cursor.key)) keys.push(cursor.primaryKey);
+                        cursor.continue();
+                    };
+                    const staleKeys = await waitForTransaction(tx, '本地同步索引读取失败。', () => keys);
                     await removeEntries(staleKeys);
                 }
                 const dirtyKeys = [...item.keys.values()].filter(key => !isSyncExcludedRecord(database, store, key));
@@ -1338,41 +1305,27 @@
     }
 
     function clearDownloadStagingStore(stagingDb) {
-        return new Promise((resolve, reject) => {
-            const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
-            tx.objectStore(DOWNLOAD_STAGING_STORE).clear();
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('同步临时数据清理失败。'));
-            tx.onabort = () => reject(tx.error || new Error('同步临时数据清理中止。'));
-        });
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
+        tx.objectStore(DOWNLOAD_STAGING_STORE).clear();
+        return waitForTransaction(tx, '同步临时数据清理失败。');
     }
 
     function writeDownloadStagingObjects(stagingDb, objects) {
-        return new Promise((resolve, reject) => {
-            const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
-            const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
-            objects.forEach(object => store.put(object.bytes, object.index));
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('同步临时数据写入失败。'));
-            tx.onabort = () => reject(tx.error || new Error('同步临时数据写入中止。'));
-        });
+        if (!Array.isArray(objects) || objects.length === 0) return Promise.resolve();
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
+        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
+        objects.forEach(object => store.put(object.bytes, object.index));
+        return waitForTransaction(tx, '同步临时数据写入失败。');
     }
 
     function readDownloadStagingObject(stagingDb, index) {
-        return new Promise((resolve, reject) => {
-            const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readonly');
-            const request = tx.objectStore(DOWNLOAD_STAGING_STORE).get(index);
-            request.onsuccess = () => {
-                const value = request.result;
-                if (value instanceof Uint8Array) {
-                    resolve(value);
-                } else if (value instanceof ArrayBuffer) {
-                    resolve(new Uint8Array(value));
-                } else {
-                    reject(new Error(`同步临时对象 ${index + 1} 不存在。`));
-                }
-            };
-            request.onerror = () => reject(request.error || new Error('同步临时数据读取失败。'));
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readonly');
+        const request = tx.objectStore(DOWNLOAD_STAGING_STORE).get(index);
+        return waitForTransaction(tx, '同步临时数据读取失败。', () => {
+            const value = request.result;
+            if (value instanceof Uint8Array) return value;
+            if (value instanceof ArrayBuffer) return new Uint8Array(value);
+            throw new Error(`同步临时对象 ${index + 1} 不存在。`);
         });
     }
 
@@ -1744,14 +1697,18 @@
         const entryCount = Number(remote.entryCount);
         const totalBytes = Number(remote.totalBytes);
         const sourceManifest = Array.isArray(remote.packManifest) ? remote.packManifest : [];
-        if (!Number.isInteger(packCount) || packCount <= 0 || packCount > CONFIG.maxPackCount) {
+        const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0 && sourceManifest.length === 0;
+        if (!Number.isInteger(packCount) || packCount < 0 || packCount > CONFIG.maxPackCount) {
             throw new Error('服务器同步数据包数量异常。');
         }
-        if (!Number.isInteger(entryCount) || entryCount <= 0 || entryCount > 10_000_000) {
+        if (!Number.isInteger(entryCount) || entryCount < 0 || entryCount > 10_000_000) {
             throw new Error('服务器同步记录数量异常。');
         }
         if (!Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > CONFIG.maxSnapshotBytes) {
             throw new Error(`服务器数据太大：${totalBytes}/${CONFIG.maxSnapshotBytes}。`);
+        }
+        if (!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0)) {
+            throw new Error('服务器空快照字段必须同时为零。');
         }
         if (sourceManifest.length !== packCount) {
             throw new Error('服务器同步数据包清单数量不一致。');
@@ -1994,7 +1951,7 @@
     }
 
     function buildUploadBatchBody(records) {
-        const manifest = new TextEncoder().encode(JSON.stringify(records.map(record => ({
+        const manifest = textEncoder.encode(JSON.stringify(records.map(record => ({
             checksum: record.checksum,
             length: record.length
         }))));
@@ -2370,6 +2327,12 @@
         const statusResponse = await postSync({ action: 'prepare-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION }, {
             timeoutMs: CONFIG.commitTimeoutMs
         });
+        const baseline = readBaseline();
+        let baseRemote = statusResponse.remote || null;
+        let baseVersion = Number(baseline?.version || 0);
+        let baseChecksum = baseline?.checksum || '';
+        const incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+        const snapshot = incremental.snapshot;
         if (statusResponse.resetRequired) {
             updateProgress(progress.check, '正在一次性清理旧云端同步数据…');
             let cursor;
@@ -2380,13 +2343,10 @@
             // One-time schema 12 cleanup wiped the remote dataset; the old
             // acknowledged baseline no longer refers to any cloud version.
             localStorage.removeItem(BASELINE_KEY);
-            statusResponse.remote = null;
+            baseRemote = null;
+            baseVersion = 0;
+            baseChecksum = '';
         }
-        const baseline = readBaseline();
-        const baseRemote = statusResponse.remote || null;
-        const baseVersion = Number(baseline?.version || 0);
-        const incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
-        const snapshot = incremental.snapshot;
         if (baseRemote?.checksum === snapshot.checksum) {
             localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: baseRemote.version, checksum: snapshot.checksum }));
             await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
@@ -2408,7 +2368,7 @@
         const payload = {
             action: 'upload-complete',
             baseVersion,
-            baseChecksum: baseline?.checksum || '',
+            baseChecksum,
             checksum: snapshot.checksum,
             snapshotFormat: snapshot.snapshotFormat,
             schemaVersion: snapshot.schemaVersion,

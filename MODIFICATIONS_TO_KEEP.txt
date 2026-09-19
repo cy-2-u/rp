@@ -1,5 +1,5 @@
 RP Hub 魔改版：当前实现与维护约定
-更新时间：2026-09-17
+更新时间：2026-09-19
 
 一、运行结构
 
@@ -48,7 +48,8 @@ Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag
 
 4. 固定记录保存在：
    RPHubDB / store / rp_hub_image_renders_<角色UUID>
-   继续使用 messageId、messageIndex、contentHash、occurrenceIndex、prompt、promptHash、paramsSnapshot。
+   继续使用 storyScopeId（默认 main）、messageId、messageIndex、contentHash、occurrenceIndex、prompt、promptHash、paramsSnapshot；
+   槽位键与记录键都以 storyScopeId 开头，不同故事作用域不复用同一槽位记录。
    不新增另一套记录格式或图片迁移系统。
    写入失败保留待保存状态并提示；同步前补存，仍失败就停止上传。
    关闭固定只影响后续记录持久化，已固定图片继续读取原记录。
@@ -123,7 +124,7 @@ Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag
    “改后改回”可能对同一 checksum 幂等重传一次（内容寻址，安全）；服务器 list-upload-packs 端点保留兼容旧客户端。
    提交时通过 R2 分页 list 统一对照 key 和 size，不再对每个分片单独 head。
    提交带 baseVersion+baseChecksum，与浏览器已确认基线双重比对；云端与基线不同即拒绝上传，不自动合并、不用旧本地快照覆盖别端。
-   除 schema 12 一次性迁移外不再有孤儿分片自动清理；删除旧分片必须由维护者显式操作。
+   历史孤儿分片由提交后的后台 GC 回收（2026-09-18 起）：提交成功后 waitUntil 里重读清单保护并发写入方，分页扫描分片目录最多 8 页，只删除未被当前清单引用且超过 24 小时宽限期的分片，单次最多 100 个；GC 失败不影响提交，下批继续。
 
 5. 拉取在 /sync-restore 独立页面进行：
    先下载并完整校验，再暂停其他同源页面写入；
@@ -171,6 +172,37 @@ Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag
 Worker 不提供 /healthy 检查端点（免费版 CPU 限额下无法承载完整校验）。只有 Worker 逻辑变化时才需要重新部署。
 
 本轮代码检查：
+- 清单冷路径优化（2026-09-19，行为不变）：normalizePackManifest 单遍同时产出规范化条目与校验源
+  （消除第二轮全量 map 与 String/Number 重包装）；buildRemoteInfo 直接复用规范化条目（同键序，序列化字节不变）；
+  新增按 checksum 的二级校验缓存（key = checksum:totalBytes:packCount:entryCount，含 version/updatedAt
+  结构守卫，损坏对象照旧走完整校验并拒绝；提交成功后预热；上限 8 版本防内存膨胀）。
+  实测：冷首调 prepare-upload 13.2ms→4.0ms，各阶段 upload-complete 普遍下降 1-4ms。
+- 注入面缩减（2026-09-19）：作者主页注入从 5 节点缩到 4 节点——删除内联适配配置脚本
+  （window.RPHUB_MAGIC_ADAPTER / _READY），magic-extension 启动时自行拉取 /__rphub/adapter.json
+  （该路径本就是扩展回归测试的供给方式，isUsableAdapter 校验 + 503 降级语义不变）；
+  encodeAdapterForHtml 因此成为死代码删除；rewriteAuthorHtml 守卫简化为 adapterReady 单条件。
+  styles.css 仍为 <link> 而非懒加载：侵入性最低的节点，懒加载会让面板首开闪无样式。
+  收益：每份主页响应少一个脚本节点与整份适配 JSON；代价：按钮挂载晚一个同源往返。
+- 新增 scale-sim.mjs（npm run scale-sim，不进 npm test）：300MB 规模（SCALE_MB 可调）首次上传 + 无变化空推送 +
+  等长修改增量 + 加长/删除/新增增量的免费版限制强制模拟。实测（2026-09-19）：全量 619 包/manifest 124KB/81 请求，
+  批量上传 wall p50 ≈7ms（门禁 10ms）；空推送 1 请求 0 分片（客户端 checksum 短路）；100 处等长修改 →
+  94 分片/46.6MB/14 请求；40 条漂移/删除/插入 → 219 分片/106MB/30 请求（桶内 512KB 字节切片级联，属设计粒度）；
+  子请求峰值 9/50、客户端在途 1/6、R2 Class A 963 次 = 月度额度 0.096%。暖态基准：prepare-upload p50 ≈1ms、
+  upload-complete p50 ≈4.3ms。测量口径：hrtime wall 为代理（模拟内 mock 全内存，handler 纯计算），
+  n≥5 样本做门禁，n=1 冷首调含 JIT 预热只报告；每 push 前 full GC 清客户端搅动的 GC 债。
+  该文件保持纯 ASCII，中文状态词用 \uXXXX 转义，避免工具链编码往返损坏正则。
+- 性能外科手术（2026-09-19，行为逐位不变）：
+  Worker 批量上传的换行计数从逐字节循环改为原生 TypedArray.indexOf 扫描（每 512KB 包 1.88ms→0.30ms，
+  每 4MiB 批次最多省约 13ms CPU，直接缓解免费版单请求 10ms CPU 峰值）；
+  normalizeImageObject 对同一 key 的 4-5 次 split/正则收敛为单次拆分，并顺带产出 deletedKey 供图库端点复用
+  （原 createImageDeletedKeyFromImageKey 因此成为死代码删除）；
+  buildImageLibrary 排序比较器从 String().localeCompare 改为定长 ISO 串普通比较（5000 张图 11.6ms→2.1ms），
+  sizeHuman 从每张图重算改为每角色一次；角色名排序保留 zh-Hans-CN locale 排序不变；
+  Worker 与 bootstrap 共享无状态 TextEncoder（encode 无内部状态，可并发复用；TextDecoder 有流式状态，保持每请求新建）；
+  图库管理页分批删除的键去重从 list.indexOf 平方级改 Set 线性（批量删除上千张时客户端明显省时）。
+- testImageAdminPageRuntime 偶发 flake 根治：桩桶钉死上传时间戳。根因是图库按 uploaded 降序排序，
+  真实挂钟在 1085 次桩写入中途跳秒会重排图库顺序，而测试按位置选图（slice(0,40)）与按 checksum 断言；
+  固定时间戳让排序退化为稳定的键序。修复后整套测试连跑 4 轮全绿。
 - 缩略图补全使用逐项独立的循环变量，避免三路异步回调都引用最后一项。
 - 清理重复的键序列化函数、无用的密钥包装函数、未读取的图片任务字段、同步下载冗余字段/响应头和未使用的同步副标题样式。
 - 图库列表不再请求未使用的 R2 httpMetadata；原图响应仍正常读取 contentType。
@@ -249,7 +281,7 @@ Worker 不提供 /healthy 检查端点（免费版 CPU 限额下无法承载完�
 - 清理 runtime-smoke 未使用的源码读取和重复 Worker 加载器，不删除有效测试。
 - 生图失败按记录对象身份清理自身临时记录，避免普通重试误判完成；保留新任务和成功记录。完整扩展脚本的 5 项离线回归验证重试、缓存淘汰和并发交错。
 - 不把墓碑、未确认意图键、历史分片当作项目垃圾删除；它们涉及删除语义和同步完整性。
-- 已知限制：原图优先读取可能在后台删除失败时继续返回旧图片；历史分片目录超过提交扫描预算可能阻止新提交；长期不同步的 localStorage 意图可能耗尽配额。详见 HANDOVER.md 第 10 节。
+- 已知限制：原图优先读取可能在后台删除失败时继续返回旧图片；历史分片目录超过提交扫描预算可能阻止新提交；长期不同步的 localStorage 意图可能耗尽配额。详见 README.md（原 HANDOVER.md）第 10 节。
 - node_modules 是 fake-indexeddb 的可重建依赖，源码、锁文件、有效回归测试与 LICENSE 均保留；.gitignore 排除依赖、日志及临时脚本。
 
 本清单只记录现有实现，不维护作者历次更新的功能汇总。

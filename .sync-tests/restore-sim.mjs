@@ -747,6 +747,76 @@ assert.equal((await readManifest(bucket)).checksum, remoteBeforeConflict.checksu
 assert.ok(requestsA.some(entry => entry.action === 'prepare-upload'), 'action recording must observe uploads');
 assert.equal(requestsA.filter(entry => entry.action === 'list-upload-packs').length, 0,
     'uploads must not enumerate historical packs');
+
+// A zero-record schema 12 snapshot is a valid replacement for a non-empty
+// remote snapshot. The restore path must clear synchronized application data
+// while preserving excluded records and credentials.
+const emptyChecksumSource = JSON.stringify([
+    'rp-sync-bounded-jsonl-v3',
+    12,
+    0,
+    0,
+    0,
+    []
+]);
+const emptyDigest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(emptyChecksumSource));
+const emptyChecksum = Array.from(new Uint8Array(emptyDigest))
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+const emptyManifest = {
+    version: remoteBeforeConflict.version + 1,
+    checksum: emptyChecksum,
+    updatedAt: Date.now(),
+    totalBytes: 0,
+    packCount: 0,
+    entryCount: 0,
+    packManifest: [],
+    snapshotFormat: 'rp-sync-bounded-jsonl-v3',
+    schemaVersion: 12
+};
+await bucket.put(MANIFEST_KEY, JSON.stringify(emptyManifest));
+const factoryC = new FDBFactory();
+const StorageC = makeStorageClass();
+const localStorageC = new StorageC();
+restorePrototypes(savedPrototypes);
+await idbPut(factoryC, 'RPHubDB', 'store', 'to-clear', 'local-value');
+await idbPut(factoryC, 'RPHubDB', 'store', 'rp_hub_presets', { keep: true });
+await idbPut(factoryC, 'AICharGen', 'characters', 'local-character', { name: 'Local' });
+localStorageC.setItem('rp_hub_local_only', 'remove-me');
+localStorageC.setItem('rp_hub_sync_password_v1', 'keep-password');
+localStorageC.setItem('unrelated', 'keep-unrelated');
+const documentC = createDocumentStub();
+const locationC = {
+    pathname: '/sync-restore', replaced: null, assigned: null,
+    replace(url) { this.replaced = url; },
+    assign(url) { this.assigned = url; }
+};
+installBrowserGlobals({
+    storageClass: StorageC,
+    localStorage: localStorageC,
+    factory: factoryC,
+    document: documentC,
+    location: locationC,
+    fetchShim: makeFetchShim('browser C'),
+    locks: locksB
+});
+restorePrototypes(savedPrototypes);
+await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+const modalC = documentC.body.children[0];
+await waitFor(() => {
+    const text = modalC.querySelector('.rp-sync-modal__status').textContent;
+    if (modalC.classList.contains('is-error')) throw new Error(`empty restore failed: ${text}`);
+    return locationC.replaced ? 'reloaded' : null;
+}, 60000, 'browser C empty restore');
+const recordsC = await idbGetAll(factoryC, 'RPHubDB', 'store');
+assert.ok(!recordsC.has('to-clear'), 'empty restore must remove synchronized business records');
+assert.deepEqual(recordsC.get('rp_hub_presets'), { keep: true }, 'excluded records must survive empty restore');
+const charactersC = await idbGetAll(factoryC, 'AICharGen', 'characters');
+assert.equal(charactersC.size, 0, 'empty restore must clear known database stores');
+assert.equal(localStorageC.getItem('rp_hub_local_only'), null, 'empty restore must remove synchronized localStorage keys');
+assert.equal(localStorageC.getItem('rp_hub_sync_password_v1'), 'keep-password', 'sync password must survive empty restore');
+assert.equal(localStorageC.getItem('unrelated'), 'keep-unrelated', 'unrelated localStorage must survive empty restore');
+console.log('phase 5 (empty snapshot restore): ok');
+
 FDBObjectStore.prototype.openCursor = nativeReadCursor;
 FDBObjectStore.prototype.get = nativeReadGet;
 FDBObjectStore.prototype.put = nativeStorePut;

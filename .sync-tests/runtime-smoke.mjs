@@ -98,6 +98,229 @@ async function readFromUpstream(relative) {
     return fs.readFile(path.join(upstreamRoot, relative), 'utf8');
 }
 
+async function testEmptySnapshotProtocol() {
+    const objects = new Map();
+    const bucket = makeR2BucketMock(objects);
+    const worker = await loadWorker();
+    const env = { RP_SYNC_R2: bucket };
+    const post = payload => worker.fetch(new Request('https://local.test/api/rp-sync', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+    }), env, {});
+    const checksum = await (async () => {
+        const source = JSON.stringify([
+            'rp-sync-bounded-jsonl-v3',
+            12,
+            0,
+            0,
+            0,
+            []
+        ]);
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+    })();
+
+    await bucket.put('rp-sync/main/migration-v12.done', '1');
+    const payload = {
+        action: 'upload-complete',
+        baseVersion: 0,
+        baseChecksum: '',
+        checksum,
+        snapshotFormat: 'rp-sync-bounded-jsonl-v3',
+        schemaVersion: 12,
+        packCount: 0,
+        entryCount: 0,
+        totalBytes: 0,
+        packManifest: []
+    };
+    const committed = await post(payload);
+    assert.equal(committed.status, 200, 'a zero-record snapshot must be accepted');
+    const committedBody = await committed.json();
+    assert.equal(committedBody.checksum, checksum);
+    const manifest = JSON.parse(Buffer.from(objects.get('rp-sync/main/manifest.json').bytes).toString('utf8'));
+    assert.deepEqual({
+        packCount: manifest.packCount,
+        entryCount: manifest.entryCount,
+        totalBytes: manifest.totalBytes,
+        packManifest: manifest.packManifest
+    }, { packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
+
+    const pulled = await post({ action: 'pull-manifest', schemaVersion: 12 });
+    assert.equal(pulled.status, 200);
+    const pulledBody = await pulled.json();
+    assert.deepEqual({
+        packCount: pulledBody.remote.packCount,
+        entryCount: pulledBody.remote.entryCount,
+        totalBytes: pulledBody.remote.totalBytes,
+        packManifest: pulledBody.remote.packManifest
+    }, { packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
+
+    const repeated = await post(payload);
+    assert.equal(repeated.status, 200, 'repeating the same empty commit must be idempotent');
+    for (const partial of [
+        { packCount: 0, entryCount: 1, totalBytes: 0 },
+        { packCount: 1, entryCount: 0, totalBytes: 1 },
+        { packCount: 1, entryCount: 1, totalBytes: 0 }
+    ]) {
+        const response = await post({ ...payload, checksum: 'f'.repeat(64), ...partial });
+        assert.ok(response.status >= 400, 'partially empty snapshots must be rejected');
+    }
+}
+
+async function testOrphanPackGc() {
+    const worker = await loadWorker();
+    const env = { RP_SYNC_R2: null };
+    const now = Date.now();
+    const HOUR = 60 * 60 * 1000;
+    const streamFormat = 'rp-sync-bounded-jsonl-v3';
+    const packKey = hex => `rp-sync/main/packs/${hex}.bin`;
+
+    // Replicates buildStreamSnapshotChecksumSource so seeded manifests and
+    // commits pass the worker-side snapshot checksum validation.
+    const snapshotChecksum = async packManifest => {
+        const totalBytes = packManifest.reduce((sum, pack) => sum + pack.length, 0);
+        const entryCount = packManifest.reduce((sum, pack) => sum + pack.entryCount, 0);
+        const source = JSON.stringify([
+            streamFormat,
+            12,
+            totalBytes,
+            packManifest.length,
+            entryCount,
+            packManifest.map(pack => [pack.bucketKey, pack.group, pack.part, pack.checksum, pack.length, pack.entryCount])
+        ]);
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const referencedOld = { bucketKey: 'b1', group: 'g', part: 0, checksum: 'a'.repeat(64), length: 4, entryCount: 1 };
+    const referencedNew = { ...referencedOld, bucketKey: 'b2' };
+    const seedManifestObject = checksum => ({
+        key: 'rp-sync/main/manifest.json',
+        bytes: Buffer.from(JSON.stringify({
+            version: 7,
+            checksum,
+            updatedAt: now,
+            totalBytes: 4,
+            packCount: 1,
+            entryCount: 1,
+            packManifest: [referencedOld],
+            snapshotFormat: streamFormat,
+            schemaVersion: 12
+        })),
+        size: JSON.stringify({
+            version: 7,
+            checksum,
+            updatedAt: now,
+            totalBytes: 4,
+            packCount: 1,
+            entryCount: 1,
+            packManifest: [referencedOld],
+            snapshotFormat: streamFormat,
+            schemaVersion: 12
+        }).length,
+        etag: '"m1"',
+        uploaded: new Date(now - 2 * HOUR)
+    });
+
+    const commit = async (objects, hooks, base, useCtx = true) => {
+        const waitList = [];
+        const bucket = makeR2BucketMock(objects, hooks);
+        env.RP_SYNC_R2 = bucket;
+        const ctx = useCtx ? { waitUntil: promise => waitList.push(promise) } : {};
+        const response = await worker.fetch(new Request('https://local.test/api/rp-sync', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'upload-complete',
+                schemaVersion: 12,
+                snapshotFormat: streamFormat,
+                baseVersion: base.baseVersion,
+                baseChecksum: base.baseChecksum,
+                checksum: base.checksum,
+                packCount: base.packCount,
+                entryCount: base.entryCount,
+                totalBytes: base.totalBytes,
+                packManifest: base.packManifest
+            })
+        }), env, ctx);
+        for (const promise of waitList) await promise;
+        return response;
+    };
+
+    // Scenario 1: expired orphans vanish while packs referenced by the newly
+    // committed manifest, young orphans and other namespaces survive.
+    {
+        const oldChecksum = await snapshotChecksum([referencedOld]);
+        const newChecksum = await snapshotChecksum([referencedNew]);
+        const objects = new Map();
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
+        objects.set(packKey('a'.repeat(64)), { key: packKey('a'.repeat(64)), bytes: Buffer.from([1, 2, 3, 4]), size: 4, etag: '"a"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set(packKey('b'.repeat(64)), { key: packKey('b'.repeat(64)), bytes: Buffer.from([5, 6, 7, 8]), size: 4, etag: '"b"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set(packKey('e'.repeat(64)), { key: packKey('e'.repeat(64)), bytes: Buffer.from([9]), size: 1, etag: '"e"', uploaded: new Date(now - 12 * HOUR) });
+        objects.set('rp-sync/other/notes.txt', { key: 'rp-sync/other/notes.txt', bytes: Buffer.from('keep'), size: 4, etag: '"o"', uploaded: new Date(now - 48 * HOUR) });
+        const response = await commit(objects, {}, {
+            baseVersion: 7,
+            baseChecksum: oldChecksum,
+            checksum: newChecksum,
+            packCount: 1,
+            entryCount: 1,
+            totalBytes: 4,
+            packManifest: [referencedNew]
+        });
+        assert.equal(response.status, 200, 'the GC scenario expects a committed snapshot');
+        assert.ok(objects.has(packKey('a'.repeat(64))), 'packs referenced by the committed manifest must survive GC');
+        assert.ok(!objects.has(packKey('b'.repeat(64))), 'expired orphan packs must be deleted');
+        assert.ok(objects.has(packKey('e'.repeat(64))), 'orphan packs inside the grace period must be kept');
+        assert.ok(objects.has('rp-sync/other/notes.txt'), 'objects outside the pack namespace must be kept');
+    }
+
+    // Scenario 2: objects without readable uploaded metadata are never
+    // considered expired, so they are preserved.
+    {
+        const objects = new Map();
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set(packKey('f'.repeat(64)), { key: packKey('f'.repeat(64)), bytes: Buffer.from([1]), size: 1, etag: '"f"' });
+        const response = await commit(objects, {}, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
+        assert.equal(response.status, 200);
+        assert.ok(objects.has(packKey('f'.repeat(64))), 'packs without uploaded metadata must be preserved');
+    }
+
+    // Scenario 3: a degraded R2 list after the commit request itself must not
+    // break anything; the GC swallows the error.
+    {
+        const objects = new Map();
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        const response = await commit(objects, { throwOnList: 1 }, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
+        assert.equal(response.status, 200, 'GC list failures must not affect the committed response');
+    }
+
+    // Scenario 4: a failing GC delete must not affect the committed response.
+    {
+        const oldChecksum = await snapshotChecksum([referencedOld]);
+        const objects = new Map();
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
+        objects.set(packKey('b'.repeat(64)), { key: packKey('b'.repeat(64)), bytes: Buffer.from([5]), size: 1, etag: '"b"', uploaded: new Date(now - 48 * HOUR) });
+        const response = await commit(objects, { throwOnDelete: new Error('delete degraded') }, { baseVersion: 7, baseChecksum: oldChecksum, checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
+        assert.equal(response.status, 200, 'GC delete failures must not affect the committed response');
+        assert.ok(objects.has(packKey('b'.repeat(64))), 'the orphan stays when deletion fails');
+    }
+
+    // Scenario 5: without waitUntil the returned GC promise still completes
+    // within the process.
+    {
+        const objects = new Map();
+        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
+        objects.set(packKey('1'.repeat(64)), { key: packKey('1'.repeat(64)), bytes: Buffer.from([1]), size: 1, etag: '"p1"', uploaded: new Date(now - 48 * HOUR) });
+        const response = await commit(objects, {}, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] }, false);
+        assert.equal(response.status, 200, 'first-commit empty snapshot must succeed before GC');
+        for (let tick = 0; tick < 5; tick += 1) await new Promise(resolve => setImmediate(resolve));
+        assert.ok(!objects.has(packKey('1'.repeat(64))), 'first-commit GC must remove orphans when nothing is referenced');
+        assert.ok(objects.has('rp-sync/main/manifest.json'), 'the fresh manifest must survive its own GC run');
+    }
+}
+
 async function testManifestEtagCache() {
     const sha256Hex = async text => {
         const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -461,7 +684,7 @@ async function testSchema12MigrationCleanup() {
     assert.equal(denied.status, 409, 'old schema versions must be rejected');
 }
 
-function makeR2BucketMock(objects) {
+function makeR2BucketMock(objects, hooks = {}) {
     return {
         head: async key => objects.has(key)
             ? { key, size: objects.get(key).size, etag: objects.get(key).etag }
@@ -469,7 +692,7 @@ function makeR2BucketMock(objects) {
         get: async key => {
             if (!objects.has(key)) return null;
             const object = objects.get(key);
-            return { key, size: object.size, body: object.bytes, httpMetadata: object.httpMetadata || {} };
+            return { key, size: object.size, body: object.bytes, text: async () => Buffer.from(object.bytes).toString('utf8'), httpMetadata: object.httpMetadata || {} };
         },
         put: async (key, value, options = {}) => {
             const bytes = value instanceof Uint8Array
@@ -477,19 +700,37 @@ function makeR2BucketMock(objects) {
                 : value instanceof ArrayBuffer
                     ? new Uint8Array(value)
                     : new Uint8Array(await new Response(value).arrayBuffer());
-            objects.set(key, { key, bytes, size: bytes.byteLength, etag: `"${key}-${objects.size}"`, httpMetadata: options.httpMetadata });
+            objects.set(key, {
+                key,
+                bytes,
+                size: bytes.byteLength,
+                etag: `"${key}-${objects.size}"`,
+                httpMetadata: options.httpMetadata,
+                uploaded: hooks.uploadedAt ? new Date(hooks.uploadedAt) : new Date()
+            });
             return { key };
         },
         delete: async keys => {
+            if (hooks.throwOnDelete) throw hooks.throwOnDelete;
             for (const key of keys) objects.delete(key);
         },
         list: async ({ prefix, cursor, limit = 1000 } = {}) => {
+            // throwOnList: number of list calls that succeed before the
+            // simulated degradation kicks in (the commit verification loop
+            // always performs the first list call).
+            if (typeof hooks.throwOnList === 'number') {
+                hooks.listCalls = (hooks.listCalls || 0) + 1;
+                if (hooks.listCalls > hooks.throwOnList) throw new Error('list degraded');
+            }
             const keys = [...objects.keys()].sort().filter(key => key.startsWith(prefix));
             const start = cursor ? keys.indexOf(cursor) + 1 : 0;
             const page = keys.slice(start, start + limit);
             const truncated = start + limit < keys.length;
             return {
-                objects: page.map(key => ({ key, size: objects.get(key).size })),
+                objects: page.map(key => {
+                    const object = objects.get(key);
+                    return { key, size: object.size, uploaded: object.uploaded };
+                }),
                 truncated,
                 cursor: truncated ? page[page.length - 1] : undefined
             };
@@ -756,7 +997,7 @@ async function testImageRenderApi() {
     counters.r2Get = 0;
     const cached = await worker.fetch(new Request(targetUrl), env, {});
     assert.equal(await cached.text(), 'png-bytes');
-    assert.equal(counters.r2Get, 1, 'a cache hit must read only the original (the tombstone stays untouched)');
+    assert.equal(counters.r2Get, 2, 'a cache hit must read the tombstone first and then the original');
     assert.equal(counters.upstream, 1, 'cached reads must not call the generation service');
     const headHit = await worker.fetch(new Request(targetUrl, { method: 'HEAD' }), env, {});
     assert.equal(headHit.status, 200);
@@ -779,13 +1020,27 @@ async function testImageRenderApi() {
     assert.equal(deletedRead.status, 200, 'a tombstoned image must render the placeholder');
     assert.match(deletedRead.headers.get('content-type') || '', /svg/);
     assert.match(await deletedRead.text(), /图片已清理/);
-    assert.equal(counters.r2Get, 2, 'a deleted read costs the original miss plus the tombstone hit');
+    assert.equal(counters.r2Get, 1, 'tombstone-first lookup lets a deleted read return after the tombstone hit');
     assert.equal(counters.upstream, 2, 'reads of deleted images must not regenerate them');
 
     const deletedGenerate = await worker.fetch(new Request(targetUrl, { method: 'POST' }), env, {});
     assert.equal(deletedGenerate.status, 200);
     assert.match(deletedGenerate.headers.get('content-type') || '', /svg/);
     assert.equal(counters.upstream, 2, 'a tombstone must outlive regeneration attempts');
+
+    // 清理失败的边界：墓碑已写但原图清理被 R2 故障卡住，原图残留
+    // —— 墓碑优先保证读取仍然只返回占位图，不会泄漏旧原图。
+    {
+        const cleanupStuck = putKeys[0];
+        objects.set(cleanupStuck, { key: cleanupStuck, bytes: Buffer.from('png-bytes'), size: 9, etag: '"stuck"', uploaded: new Date() });
+        counters.r2Get = 0;
+        const staleRead = await worker.fetch(new Request(targetUrl), env, {});
+        assert.equal(staleRead.status, 200);
+        assert.match(staleRead.headers.get('content-type') || '', /svg/, 'a stale original left by failed cleanup must stay hidden');
+        assert.match(await staleRead.text(), /图片已清理/);
+        assert.ok(objects.has(cleanupStuck), 'the stale original file stays in the bucket for housekeeping');
+        objects.delete(cleanupStuck);
+    }
 
     upstreamResponse = () => new Response('nope', { status: 503, headers: { 'content-type': 'text/plain' } });
     const upstreamError = await worker.fetch(new Request(imageUrl({
@@ -817,8 +1072,12 @@ async function testImageRenderApi() {
 // catch-all 代理：本地资源直出、作者未来新增页面自动回源、注入面最小化。
 async function testCatchAllProxy() {
     const authorHome = await readFromUpstream('index.html');
+    const authorAppJs = await readFromUpstream('assets/js/app.js');
+    const authorUiComponents = await readFromUpstream('assets/js/ui-components.js');
     const authorPages = new Map([
         ['index.html', authorHome],
+        ['assets/js/app.js', authorAppJs],
+        ['assets/js/ui-components.js', authorUiComponents],
         ['brand-new-page.html', '<html><head></head><body>added after deploy</body></html>'],
         ['favicon.ico', 'icon-bytes']
     ]);
@@ -868,24 +1127,25 @@ async function testCatchAllProxy() {
     assert.equal(future.status, 200, 'author pages added after deploy must be proxied automatically');
     const futureText = await future.text();
     assert.match(futureText, /added after deploy/);
-    assert.match(futureText, /<script src="\/DB\/dirty-tracker\.js"><\/script>/, 'every author page must still get the base tracker');
+    assert.match(futureText, /<script src="\/DB\/dirty-tracker\.js"><\/script>/, 'healthy non-main pages keep the base tracker');
     assert.doesNotMatch(futureText, /DB\/bootstrap\.js/, 'non-main pages must not load the sync panel');
-    assert.deepEqual(upstreamCalls, ['GET brand-new-page.html']);
+    assert.equal(upstreamCalls.length, 4, 'the first HTML request performs the complete cached source check');
 
     const home = await worker.fetch(new Request('https://local.test/'), env, {});
     const homeText = await home.text();
-    assert.equal(upstreamCalls.length, 2);
+    assert.equal(upstreamCalls.length, 5, 'the main page adds one author HTML request after checks');
     const injectionMarkers = [
         '<link rel="stylesheet" href="/DB/styles.css">',
         '<script src="/DB/dirty-tracker.js"></script>',
-        'window.RPHUB_MAGIC_ADAPTER=',
         '<script src="/magic-extension.js"></script>',
         '<script src="/DB/bootstrap.js"></script>'
     ];
     const positions = injectionMarkers.map(marker => homeText.indexOf(marker));
     positions.forEach((position, index) => assert.ok(position >= 0, `main page must inject: ${injectionMarkers[index]}`));
     assert.ok(positions.every((position, index) => index === 0 || position > positions[index - 1]),
-        'the five injected nodes must appear in order');
+        'the four injected nodes must appear in order');
+    // 适配配置不再内联：扩展自行拉取 /__rphub/adapter.json，页面保持干净。
+    assert.doesNotMatch(homeText, /RPHUB_MAGIC_ADAPTER/, 'the adapter config must not be inlined into author pages');
     assert.doesNotMatch(homeText, /upload-engine\.js|persistence-bridge\.js/, 'merged files must not be referenced again');
 
     const posted = await worker.fetch(new Request('https://local.test/brand-new-page.html', { method: 'POST', body: 'payload' }), env, {});
@@ -910,7 +1170,10 @@ async function testCatchAllProxy() {
 async function testImageAdminPageRuntime() {
     const checksumOf = index => String(index).padStart(64, '0');
     const objects = new Map();
-    const bucket = makeR2BucketMock(objects);
+    // 钉死上传时间戳：图库按 uploaded 降序排序，真实挂钟在批量写入中途
+    // 跳秒会重排图库顺序，让按位置选图的断言间歇性失败（偶发 flake 根因）。
+    // 固定值让排序退化为稳定的键序（checksum 升序），测试才可复现。
+    const bucket = makeR2BucketMock(objects, { uploadedAt: Date.parse('2026-01-01T00:00:00Z') });
     const imageKey = (name, index) => `rp-images/characters/${name}/${checksumOf(index)}`;
     for (let index = 0; index < 1040; index += 1) {
         await bucket.put(imageKey('Alice', index), new Uint8Array([index % 251 + 1, 3, 3, 7]));
@@ -1066,19 +1329,22 @@ async function testImageAdminPageRuntime() {
     }
 
     // 失败路径：40 张分两批，第 2 批失败 —— 已接受的 20 张保持删除，
-    // 失败的 20 张必须留在页面上。
+    // 失败的 20 张必须留在页面上。按请求序号计数，避免依赖 onclick()
+    // 与标志位之间的微任务时序。
     deleteRequests.length = 0;
     const realFetch = sandbox.fetch;
-    let failNextDelete = false;
+    let deleteCalls = 0;
     sandbox.fetch = async (input, init = {}) => {
         const url = new URL(String(input), 'https://local.test');
-        if (url.pathname === '/image/api/delete' && failNextDelete) {
-            failNextDelete = false;
-            deleteRequests.push(init.body ? JSON.parse(init.body) : null);
-            return new Response(JSON.stringify({ ok: false, error: '模拟批次失败' }), {
-                status: 500,
-                headers: { 'content-type': 'application/json' }
-            });
+        if (url.pathname === '/image/api/delete') {
+            deleteCalls += 1;
+            if (deleteCalls === 2) {
+                deleteRequests.push(init.body ? JSON.parse(init.body) : null);
+                return new Response(JSON.stringify({ ok: false, error: '模拟批次失败' }), {
+                    status: 500,
+                    headers: { 'content-type': 'application/json' }
+                });
+            }
         }
         return realFetch(input, init);
     };
@@ -1086,7 +1352,6 @@ async function testImageAdminPageRuntime() {
     assert.equal(bobImages.length, 45);
     bobImages.slice(0, 40).forEach(image => sandbox.selected.add(image.key));
     element('deleteSelected').onclick();
-    failNextDelete = true;
     await waitFor(() => !sandbox.deleteBusy, 'the failed delete flow to settle');
 
     assert.equal(deleteRequests.length, 2);
@@ -1134,7 +1399,10 @@ async function testSourceCheckEnforcement() {
     const healthy = await loadWorker(makeFetchMock());
     const healthyPage = await healthy.fetch(new Request('https://local.test/'), env, {});
     const healthyPageBody = await healthyPage.text();
-    assert.match(healthyPageBody, /window\.RPHUB_MAGIC_ADAPTER=/, 'matching markers must keep the UI config injected');
+    // 适配配置不再内联；扩展启动时自行拉取 /__rphub/adapter.json。
+    assert.doesNotMatch(healthyPageBody, /RPHUB_MAGIC_ADAPTER/, 'the adapter config must not be inlined into author pages');
+    assert.match(healthyPageBody, /\/DB\/dirty-tracker\.js/);
+    assert.match(healthyPageBody, /\/magic-extension\.js/);
     assert.match(healthyPageBody, /\/DB\/bootstrap\.js/);
     const healthyConfig = await healthy.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(healthyConfig.status, 200);
@@ -1147,8 +1415,9 @@ async function testSourceCheckEnforcement() {
     }));
     const stalePage = await staleIndex.fetch(new Request('https://local.test/'), env, {});
     const stalePageBody = await stalePage.text();
-    assert.doesNotMatch(stalePageBody, /RPHUB_MAGIC_ADAPTER/, 'a failed page marker must drop the UI config');
-    assert.match(stalePageBody, /\/DB\/dirty-tracker\.js/, 'base scripts are still injected and self-disable');
+    assert.doesNotMatch(stalePageBody, /RPHUB_MAGIC_ADAPTER/, 'a failed page marker must drop all custom injection');
+    assert.doesNotMatch(stalePageBody, /\/DB\/dirty-tracker\.js/, 'a failed page marker must not load the tracker');
+    assert.doesNotMatch(stalePageBody, /\/magic-extension\.js|\/DB\/bootstrap\.js/, 'a failed page marker must not load custom features');
     const staleConfig = await staleIndex.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(staleConfig.status, 503, 'the adapter config endpoint must refuse a stale adapter');
     const staleAppJs = await staleIndex.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
@@ -1158,7 +1427,7 @@ async function testSourceCheckEnforcement() {
         uiComponents: 'author rewrote the navigation components'
     }));
     const componentsPage = await staleComponents.fetch(new Request('https://local.test/'), env, {});
-    assert.match(await componentsPage.text(), /RPHUB_MAGIC_ADAPTER=/, 'page markers alone do not fail the page request');
+    assert.doesNotMatch(await componentsPage.text(), /RPHUB_MAGIC_ADAPTER=/, 'any failed source check must keep the page unchanged');
     const componentsAppJs = await staleComponents.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
     assert.equal(await componentsAppJs.text(), appJsSource, 'a failed ui-components check must skip the rewrite too');
 }
@@ -1172,7 +1441,9 @@ await testImageRenderApi();
 await testCatchAllProxy();
 await testSourceCheckEnforcement();
 await testAdapterFromFileUrl();
-await testManifestEtagCache();
+    await testEmptySnapshotProtocol();
+    await testOrphanPackGc();
+    await testManifestEtagCache();
 await testAdapterConfigEndpoint();
 await testAppJsRewriteCache();
 await testBoundedUploadEngine();

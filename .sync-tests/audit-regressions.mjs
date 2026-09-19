@@ -52,5 +52,65 @@ for (const stage of ['dirty', 'baseline', 'state']) {
         assert.ok(flushes.some(flush => flush < pos),
             'every durable cache mutation must be preceded by a pendingBuckets flush');
     }
-    console.log('PASS updateCachedSnapshot flushes pendingBuckets before every durable mutation');
+}
+
+// IndexedDB transaction helpers must reject on abort instead of leaving callers
+// pending forever. Use a tiny EventTarget-like transaction so this stays a
+// deterministic unit regression rather than depending on browser timing.
+{
+    const helperStart = source.indexOf('    function waitForTransaction(');
+    const helperEnd = source.indexOf('    function openDbByName(', helperStart);
+    assert.ok(helperStart >= 0 && helperEnd > helperStart, 'waitForTransaction source boundaries');
+    const context = vm.createContext({});
+    vm.runInContext(source.slice(helperStart, helperEnd), context);
+    const listeners = new Map();
+    const failure = new Error('QuotaExceededError');
+    const tx = {
+        error: failure,
+        addEventListener(type, handler) { listeners.set(type, handler); }
+    };
+    const pending = context.waitForTransaction(tx, 'restore write failed');
+    listeners.get('abort')();
+    await assert.rejects(
+        Promise.race([
+            pending,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('abort promise remained pending')), 100))
+        ]),
+        error => error === failure
+    );
+    console.log('PASS transaction abort rejects instead of remaining pending');
+}
+
+// Schema migration cleanup must not run until the local snapshot has been
+// fully prepared. A serialization/cache failure therefore leaves R2 intact.
+{
+    const commitStart = source.indexOf('    async function commitObjectSnapshot(');
+    const commitEnd = source.indexOf('    async function pullFromServerUnlocked(', commitStart);
+    assert.ok(commitStart >= 0 && commitEnd > commitStart, 'commitObjectSnapshot source boundaries');
+    const calls = [];
+    const failure = new Error('unsupported local data');
+    const storage = {
+        removeItem() { calls.push('remove baseline'); },
+        setItem() { },
+        getItem() { return null; }
+    };
+    const context = vm.createContext({
+        CONFIG: { commitTimeoutMs: 1 },
+        SNAPSHOT_SCHEMA_VERSION: 12,
+        postSync: async payload => {
+            calls.push(payload.action);
+            if (payload.action === 'prepare-upload') return { resetRequired: true, remote: null };
+            throw new Error(`unexpected ${payload.action}`);
+        },
+        readBaseline: () => null,
+        prepareLocalSnapshot: async () => { calls.push('validate local snapshot'); throw failure; },
+        updateProgress() { },
+        localStorage: storage,
+        window: { RPH_SYNC_TRACKER: { acknowledge: async () => { } } }
+    });
+    vm.runInContext(source.slice(commitStart, commitEnd), context);
+    await assert.rejects(context.commitObjectSnapshot({ check: 1, uploadStart: 2, uploadEnd: 3, commit: 4 }), error => error === failure);
+    assert.deepEqual(calls, ['prepare-upload', 'validate local snapshot'],
+        'remote migration must wait for successful local snapshot preparation');
+    console.log('PASS local snapshot failure preserves remote migration state');
 }

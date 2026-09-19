@@ -98,7 +98,7 @@ async function loadAdapter(env) {
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (contentLength > ADAPTER_MAX_BYTES) throw new Error('适配清单超过大小上限。');
     const source = String(await response.text()).replace(/^\uFEFF/, '');
-    if (new TextEncoder().encode(source).byteLength > ADAPTER_MAX_BYTES) {
+    if (textEncoder.encode(source).byteLength > ADAPTER_MAX_BYTES) {
         throw new Error('适配清单超过大小上限。');
     }
     let adapter;
@@ -143,6 +143,8 @@ const MAX_PACK_BYTES = 512 * 1024;
 const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const MAX_OBJECT_COUNT = 8192;
 const MAX_PACK_ENTRIES = 256;
+// TextEncoder.encode 无内部状态，全 isolate 共享一个实例，避免热路径反复分配。
+const textEncoder = new TextEncoder();
 const SYNC_CONTROL_MAX_BYTES = 2 * 1024 * 1024;
 const SYNC_UPLOAD_BATCH_MAX_PACKS = 8;
 const SYNC_UPLOAD_BATCH_MAX_BYTES = 4 * 1024 * 1024;
@@ -151,6 +153,9 @@ const SYNC_UPLOAD_BATCH_MAX_BODY_BYTES = 4 + SYNC_UPLOAD_BATCH_MAX_HEADER_BYTES 
 const SYNC_UPLOAD_BATCH_PUT_CONCURRENCY = 3;
 const SYNC_DELETE_BATCH_SIZE = 1000;
 const SYNC_COMMIT_MAX_LIST_PAGES = 32;
+const SYNC_PACK_GC_GRACE_MS = 24 * 60 * 60 * 1000;
+const SYNC_PACK_GC_MAX_LIST_PAGES = 8;
+const SYNC_PACK_GC_MAX_DELETES = 100;
 const STREAM_SNAPSHOT_FORMAT = 'rp-sync-bounded-jsonl-v3';
 const STREAM_SNAPSHOT_SCHEMA_VERSION = 12;
 const IMAGE_API_PATH = '/api/rp-image';
@@ -207,7 +212,7 @@ function error(message, status = 400, extra = {}) {
 }
 
 async function sha256Text(text) {
-    return sha256Bytes(new TextEncoder().encode(text));
+    return sha256Bytes(textEncoder.encode(text));
 }
 
 async function sha256Bytes(bytes) {
@@ -353,12 +358,6 @@ function createImageDeletedKey(characterName, checksum) {
     return `${IMAGE_DELETED_PREFIX}/${sanitizeImageKeySegment(characterName)}/${checksum}.json`;
 }
 
-function createImageDeletedKeyFromImageKey(key) {
-    const checksum = getImageChecksumFromKey(key);
-    const characterName = getImageCharacterFromKey(key);
-    return checksum && characterName ? createImageDeletedKey(characterName, checksum) : '';
-}
-
 function createImageThumbKeyFromImageKey(key) {
     const checksum = getImageChecksumFromKey(key);
     const characterName = getImageCharacterFromKey(key);
@@ -487,18 +486,20 @@ async function handleImageRender(request, env) {
         || (request.method === 'GET' && url.searchParams.get('generate') === '1');
     const params = buildImageParams(url, token);
     const primary = await buildImageLookupCandidate(params);
-    // 先取原图：命中（最常见的浏览路径）只花 1 个 R2 get；只有未命中
-    // 时才需要读墓碑来区分“已删除”和“从未生成”。
-    const cached = await bucket.get(primary.key);
-    if (cached) {
-        return imageResponse(request.method === 'HEAD' ? null : cached.body, cached.httpMetadata?.contentType, {
-            'content-length': String(cached.size || 0)
-        });
-    }
+    // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
+    // 证明未删除；先查墓碑才能保证删除后的读取立即返回占位图。
     const deleted = await bucket.get(primary.deletedKey);
     if (deleted) {
         return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
             'cache-control': 'public, max-age=3600'
+        });
+    }
+    // 非删除路径：命中原图（最常见的浏览路径）只花 2 个 R2 get（原图 +
+    // 墓碑），未命中的生图请求也需要墓碑来排除“已删除”。
+    const cached = await bucket.get(primary.key);
+    if (cached) {
+        return imageResponse(request.method === 'HEAD' ? null : cached.body, cached.httpMetadata?.contentType, {
+            'content-length': String(cached.size || 0)
         });
     }
 
@@ -769,7 +770,7 @@ function render(){if(!data)return;var q=filter.value.trim().toLowerCase();var ch
 function setDeleteMode(value){deleteMode=!!value;selected.clear();library.querySelectorAll('.photo.selected').forEach(function(tile){tile.classList.remove('selected');});syncToolbar();}
 async function load(){if(deleteBusy)return;var scrollPosition=window.scrollY;setNotice('');stats.textContent='\u6b63\u5728\u8bfb\u53d6...';syncToolbar();refreshButton.disabled=true;try{data=await api('/image/api/library',{method:'GET'});var keys=new Set(visibleImages().map(function(image){return image.key;}));selected.forEach(function(key){if(!keys.has(key))selected.delete(key);});stats.textContent=data.totalCount+' \u5f20\u56fe\u7247 / '+data.totalHuman;render();requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});}catch(e){stats.textContent='\u8bfb\u53d6\u5931\u8d25';if(!data)library.innerHTML='<div class="empty">'+esc(e.message)+'</div>';setNotice(e.message,true);}finally{refreshButton.disabled=deleteBusy;}}
 var deleteChunkSize=20;
-async function deletePayload(payload,message){if(deleteBusy||!confirm(message||'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002'))return;deleteBusy=true;var previousCharacters=data&&data.characters;var previousSelected=new Set(selected);var previousLimits=Object.assign({},characterRenderLimits);removeDeletedImages(payload);var accepted=[],deletedCount=0,deletedBytes=0,failedCount=0,queue=[];function pushKeyChunks(keys){for(var start=0;start<keys.length;start+=deleteChunkSize)queue.push({keys:keys.slice(start,start+deleteChunkSize)});}try{if(payload.characterNames&&payload.characterNames.length){queue.push({characterNames:payload.characterNames.slice(0,4)});}else{pushKeyChunks((payload.keys||[]).filter(function(key,index,list){return list.indexOf(key)===index;}));}for(var index=0;index<queue.length;index+=1){var r=await api('/image/api/delete',{method:'POST',body:JSON.stringify(queue[index])});deletedCount+=r.deletedCount||0;deletedBytes+=r.deletedBytes||0;failedCount+=r.failedCount||0;(r.acceptedKeys||[]).forEach(function(key){accepted.push(key);});pushKeyChunks(r.remainingKeys||[]);}if(failedCount){data.characters=previousCharacters;characterRenderLimits=previousLimits;removeDeletedImages({keys:accepted});}setNotice('\u5df2\u5220\u9664 '+deletedCount+' \u5f20 / '+formatBytes(deletedBytes)+(failedCount?'\uff0c'+failedCount+' \u5f20\u672a\u5b8c\u6210':''),failedCount>0);}catch(e){data.characters=previousCharacters;characterRenderLimits=previousLimits;if(accepted.length){removeDeletedImages({keys:accepted});}else{selected=previousSelected;refreshLibraryStats();render();}setNotice(e.message,true);}finally{deleteBusy=false;syncToolbar();}}
+async function deletePayload(payload,message){if(deleteBusy||!confirm(message||'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002'))return;deleteBusy=true;var previousCharacters=data&&data.characters;var previousSelected=new Set(selected);var previousLimits=Object.assign({},characterRenderLimits);removeDeletedImages(payload);var accepted=[],deletedCount=0,deletedBytes=0,failedCount=0,queue=[];function pushKeyChunks(keys){for(var start=0;start<keys.length;start+=deleteChunkSize)queue.push({keys:keys.slice(start,start+deleteChunkSize)});}try{if(payload.characterNames&&payload.characterNames.length){queue.push({characterNames:payload.characterNames.slice(0,4)});}else{var seenKeys=new Set();pushKeyChunks((payload.keys||[]).filter(function(key){if(seenKeys.has(key))return false;seenKeys.add(key);return true;}));}for(var index=0;index<queue.length;index+=1){var r=await api('/image/api/delete',{method:'POST',body:JSON.stringify(queue[index])});deletedCount+=r.deletedCount||0;deletedBytes+=r.deletedBytes||0;failedCount+=r.failedCount||0;(r.acceptedKeys||[]).forEach(function(key){accepted.push(key);});pushKeyChunks(r.remainingKeys||[]);}if(failedCount){data.characters=previousCharacters;characterRenderLimits=previousLimits;removeDeletedImages({keys:accepted});}setNotice('\u5df2\u5220\u9664 '+deletedCount+' \u5f20 / '+formatBytes(deletedBytes)+(failedCount?'\uff0c'+failedCount+' \u5f20\u672a\u5b8c\u6210':''),failedCount>0);}catch(e){data.characters=previousCharacters;characterRenderLimits=previousLimits;if(accepted.length){removeDeletedImages({keys:accepted});}else{selected=previousSelected;refreshLibraryStats();render();}setNotice(e.message,true);}finally{deleteBusy=false;syncToolbar();}}
 function deleteCharacterImages(characterName,count){if(!characterName)return;deletePayload({characterNames:[characterName]},'\u786e\u5b9a\u6e05\u7a7a\u300c'+characterName+'\u300d\u4e0b\u7684 '+(Number(count)||0)+' \u5f20\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');}
 function openViewer(key){previewList=visibleImages();previewIndex=previewList.findIndex(function(img){return img.key===key;});if(previewIndex<0)previewIndex=0;renderViewer();viewer.classList.remove('hidden');}
 function closeViewer(){viewer.classList.add('hidden');}
@@ -831,13 +832,22 @@ function formatBytes(bytes) {
 }
 
 function normalizeImageObject(object) {
-    const thumbKey = createImageThumbKeyFromImageKey(object.key);
+    // 图库列表是热点路径：key 只拆一次，角色名/校验和与两条派生键一次算完
+    // （原实现对同一 key 重复 split/正则 4-5 次）。派生键仍走
+    // createImageThumbKey/createImageDeletedKey，保留 sanitize 语义。
+    const parts = String(object.key || '').split('/');
+    const characterName = parts.length >= 4 && parts[0] === IMAGE_PREFIX && parts[1] === 'characters'
+        ? parts[2] || ''
+        : '';
+    const checksum = getImageChecksumFromKey(parts[parts.length - 1]);
+    const derivable = Boolean(checksum && characterName);
     return {
         key: object.key,
-        thumbKey,
+        thumbKey: derivable ? createImageThumbKey(characterName, checksum) : '',
+        deletedKey: derivable ? createImageDeletedKey(characterName, checksum) : '',
         size: Number(object.size || 0),
         uploaded: object.uploaded ? new Date(object.uploaded).toISOString() : '',
-        characterName: getImageCharacterFromKey(object.key)
+        characterName
     };
 }
 
@@ -915,7 +925,6 @@ function buildImageLibrary(objects) {
         const character = characters.get(name);
         character.count += 1;
         character.size += object.size;
-        character.sizeHuman = formatBytes(character.size);
         character.images.push({
             key: object.key,
             size: object.size,
@@ -923,11 +932,14 @@ function buildImageLibrary(objects) {
             uploaded: object.uploaded
         });
     }
+    // uploaded 是 normalizeImageObject 产出的定长 ISO 串，字典序即时间序，
+    // 用普通比较替代 localeCompare（免 ICU 排序与每次比较的 String 分配）。
     return Array.from(characters.values())
         .map((character) => ({
             ...character,
+            sizeHuman: formatBytes(character.size),
             images: character.images
-                .sort((a, b) => String(b.uploaded).localeCompare(String(a.uploaded)))
+                .sort((a, b) => (a.uploaded < b.uploaded ? 1 : a.uploaded > b.uploaded ? -1 : 0))
                 .map(image => ({
                     key: image.key,
                     size: image.size,
@@ -986,7 +998,7 @@ async function handleImageAdmin(request, env, url, ctx) {
         ]);
         const staleObjects = [];
         const objects = allObjects.filter(object => {
-            const deleted = tombstoneKeys.has(createImageDeletedKeyFromImageKey(object.key));
+            const deleted = tombstoneKeys.has(object.deletedKey);
             if (deleted) staleObjects.push(object);
             return !deleted;
         });
@@ -1082,14 +1094,23 @@ function createPackKey(checksum) {
     return `${PACK_PREFIX}/${String(checksum || '').toLowerCase()}.bin`;
 }
 
+// Single pass over the client manifest: validates every pack entry and
+// builds both the normalized entries and the snapshot-checksum source arrays,
+// so the cold manifest path walks the data once instead of twice.
 function normalizePackManifest(manifest, totalBytes, entryCount) {
-    if (!Array.isArray(manifest) || manifest.length === 0 || manifest.length > MAX_OBJECT_COUNT) return null;
+    if (!Array.isArray(manifest) || manifest.length > MAX_OBJECT_COUNT) return null;
+    const emptySnapshot = Number(totalBytes) === 0 && Number(entryCount) === 0 && manifest.length === 0;
+    if (emptySnapshot) return { packs: [], checksumSource: [] };
+    if (manifest.length === 0) return null;
 
     let manifestBytes = 0;
     let manifestEntries = 0;
     const bucketParts = new Map();
     const contentDefinitions = new Map();
-    const normalized = manifest.map((item, index) => {
+    const packs = new Array(manifest.length);
+    const checksumSource = new Array(manifest.length);
+    for (let index = 0; index < manifest.length; index += 1) {
+        const item = manifest[index];
         const bucketKey = String(item?.bucketKey || '');
         const group = String(item?.group || '');
         const part = Number(item?.part);
@@ -1119,12 +1140,16 @@ function normalizePackManifest(manifest, totalBytes, entryCount) {
         contentDefinitions.set(checksum, { length, entryCount: entries });
         manifestBytes += length;
         manifestEntries += entries;
-        return { bucketKey, group, part, checksum, length, entryCount: entries };
-    });
+        packs[index] = { bucketKey, group, part, checksum, length, entryCount: entries };
+        // Entries are already canonical (lowercase checksum, plain strings and
+        // numbers), so this tuple serializes byte-identically to the old
+        // String()/Number() wrapping in buildStreamSnapshotChecksumSource.
+        checksumSource[index] = [bucketKey, group, part, checksum, length, entries];
+    }
 
     if (manifestBytes !== totalBytes) throw new Error('数据包大小合计不一致。');
     if (manifestEntries !== entryCount) throw new Error('记录数量合计不一致。');
-    return normalized;
+    return { packs, checksumSource };
 }
 
 function normalizeManifest(value) {
@@ -1137,48 +1162,48 @@ function normalizeManifest(value) {
     const totalBytes = Number(value.totalBytes);
     const packManifest = Array.isArray(value.packManifest) ? value.packManifest : [];
     if (!Number.isInteger(version) || version < 0) return null;
-    if (!Number.isInteger(packCount) || packCount <= 0 || packCount > MAX_OBJECT_COUNT) return null;
-    if (!Number.isInteger(entryCount) || entryCount <= 0 || entryCount > MAX_OBJECT_COUNT * MAX_PACK_ENTRIES) return null;
-    if (!Number.isInteger(totalBytes) || totalBytes <= 0 || totalBytes > MAX_TOTAL_BYTES) return null;
+    const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0 && packManifest.length === 0;
+    if (!Number.isInteger(packCount) || packCount < 0 || packCount > MAX_OBJECT_COUNT) return null;
+    if (!Number.isInteger(entryCount) || entryCount < 0 || entryCount > MAX_OBJECT_COUNT * MAX_PACK_ENTRIES) return null;
+    if (!Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > MAX_TOTAL_BYTES) return null;
+    if (!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0)) return null;
     if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/i.test(value.checksum)) return null;
     if (snapshotFormat !== STREAM_SNAPSHOT_FORMAT || schemaVersion !== STREAM_SNAPSHOT_SCHEMA_VERSION) return null;
     if (packManifest.length !== packCount) return null;
-    let normalizedPacks;
+    let normalized;
     try {
-        normalizedPacks = normalizePackManifest(packManifest, totalBytes, entryCount);
+        normalized = normalizePackManifest(packManifest, totalBytes, entryCount);
     } catch (err) {
         return null;
     }
-    if (!normalizedPacks || normalizedPacks.length !== packCount) return null;
+    if (!normalized || normalized.packs.length !== packCount) return null;
 
+    // checksumSource is consumed by validation and then dropped: keeping it on
+    // the cached manifest would double the cache footprint for no reuse.
     return {
-        version,
-        checksum: value.checksum.toLowerCase(),
-        updatedAt: Number(value.updatedAt || 0),
-        totalBytes,
-        packCount,
-        entryCount,
-        packManifest: normalizedPacks,
-        snapshotFormat,
-        schemaVersion
+        manifest: {
+            version,
+            checksum: value.checksum.toLowerCase(),
+            updatedAt: Number(value.updatedAt || 0),
+            totalBytes,
+            packCount,
+            entryCount,
+            packManifest: normalized.packs,
+            snapshotFormat,
+            schemaVersion
+        },
+        checksumSource: normalized.checksumSource
     };
 }
 
-function buildStreamSnapshotChecksumSource(totalBytes, packCount, entryCount, packManifest) {
+function buildStreamSnapshotChecksumSource(totalBytes, packCount, entryCount, checksumSource) {
     return JSON.stringify([
         STREAM_SNAPSHOT_FORMAT,
         STREAM_SNAPSHOT_SCHEMA_VERSION,
         Number(totalBytes || 0),
         Number(packCount || 0),
         Number(entryCount || 0),
-        packManifest.map((pack) => [
-            String(pack.bucketKey),
-            String(pack.group),
-            Number(pack.part),
-            String(pack.checksum).toLowerCase(),
-            Number(pack.length),
-            Number(pack.entryCount)
-        ])
+        checksumSource
     ]);
 }
 
@@ -1198,6 +1223,38 @@ function cacheManifestByEtag(etag, manifest) {
         if (entry.expiresAt <= now) manifestCache.delete(key);
     }
     manifestCache.set(etag, { manifest, expiresAt: now + MANIFEST_CACHE_TTL_MS });
+}
+
+// Second-level validation cache keyed by the manifest's own checksum. The
+// checksum is content-derived (sha256 over format, schema, sizes and every
+// pack entry), so a manifest that once passed validation never needs
+// re-validating; the cache only skips the parse-and-derive work when the etag
+// cache has expired but the same manifest version is seen again (the common
+// case: each push commits a new etag, so the next push's first read is always
+// an etag miss). Bounded to the last few versions per isolate.
+const validatedManifestCache = new Map();
+const VALIDATED_MANIFEST_CACHE_MAX = 8;
+
+function rememberValidatedManifest(manifest) {
+    const key = `${manifest.checksum}:${manifest.totalBytes}:${manifest.packCount}:${manifest.entryCount}`;
+    if (validatedManifestCache.has(key)) return;
+    validatedManifestCache.set(key, manifest);
+    while (validatedManifestCache.size > VALIDATED_MANIFEST_CACHE_MAX) {
+        validatedManifestCache.delete(validatedManifestCache.keys().next().value);
+    }
+}
+
+function readValidatedManifest(value) {
+    if (!value || typeof value !== 'object' || typeof value.checksum !== 'string') return null;
+    const key = `${value.checksum.toLowerCase()}:${Number(value.totalBytes)}:${Number(value.packCount)}:${Number(value.entryCount)}`;
+    const cached = validatedManifestCache.get(key);
+    if (!cached) return null;
+    // Structural guard: a corrupted or forged object must fall through to
+    // full validation (and rejection) instead of being silently healed. Only
+    // version/updatedAt are checked here because everything else is bound by
+    // the cache key and, transitively, by the verified checksum.
+    if (Number(value.version || 0) !== cached.version || Number(value.updatedAt || 0) !== cached.updatedAt) return null;
+    return cached;
 }
 
 async function getManifestState(bucket) {
@@ -1223,17 +1280,23 @@ async function getManifestState(bucket) {
     } catch (err) {
         throw new SyncRequestError('现有云端清单 JSON 损坏，已停止读写以保护数据。', 409);
     }
-    const manifest = normalizeManifest(value);
-    if (manifest
+    const validated = readValidatedManifest(value);
+    if (validated) {
+        if (object.etag) cacheManifestByEtag(object.etag, validated);
+        return { manifest: validated, etag };
+    }
+    const normalized = normalizeManifest(value);
+    if (normalized
         && await isValidPackSnapshotChecksum(
-            manifest.checksum,
-            manifest.totalBytes,
-            manifest.packCount,
-            manifest.entryCount,
-            manifest.packManifest
+            normalized.manifest.checksum,
+            normalized.manifest.totalBytes,
+            normalized.manifest.packCount,
+            normalized.manifest.entryCount,
+            normalized.checksumSource
         )) {
-        if (object.etag) cacheManifestByEtag(object.etag, manifest);
-        return { manifest, etag };
+        rememberValidatedManifest(normalized.manifest);
+        if (object.etag) cacheManifestByEtag(object.etag, normalized.manifest);
+        return { manifest: normalized.manifest, etag };
     }
     throw new SyncRequestError('现有云端清单格式或校验无效，已停止读写以保护数据。', 409);
 }
@@ -1252,14 +1315,9 @@ function buildRemoteInfo(manifest) {
         entryCount: manifest.entryCount,
         snapshotFormat: manifest.snapshotFormat,
         schemaVersion: manifest.schemaVersion,
-        packManifest: manifest.packManifest.map((pack) => ({
-            bucketKey: pack.bucketKey,
-            group: pack.group,
-            part: pack.part,
-            checksum: pack.checksum,
-            length: pack.length,
-            entryCount: pack.entryCount
-        }))
+        // packManifest entries are already canonical plain objects in this key
+        // order; re-mapping them would only allocate a second copy.
+        packManifest: manifest.packManifest
     };
 }
 
@@ -1509,8 +1567,10 @@ async function handleUploadPackBatch(request, bucket) {
             if (uploadError) throw uploadError;
             const bytes = await reader.readExact(pack.length);
             let entryCount = 0;
-            for (let index = 0; index < bytes.byteLength; index += 1) {
-                if (bytes[index] === 10 && ++entryCount > MAX_PACK_ENTRIES) {
+            // 原生 indexOf 扫描替代逐字节循环：这是免费版 CPU 预算里最贵的
+            // 单段热循环（每批最多 4MiB），语义不变——数 0x0A，超 256 行即拒。
+            for (let offset = bytes.indexOf(10); offset !== -1; offset = bytes.indexOf(10, offset + 1)) {
+                if (++entryCount > MAX_PACK_ENTRIES) {
                     throw new SyncRequestError('上传数据包记录数量超过上限。', 409);
                 }
             }
@@ -1534,7 +1594,59 @@ async function handleUploadPackBatch(request, bucket) {
     }
 }
 
-async function handleUploadComplete(bucket, body) {
+async function runOrphanPackGc(bucket) {
+    try {
+        // Re-read the manifest after commit so a concurrent writer's newer
+        // snapshot is protected before any old pack is considered for deletion.
+        const manifest = await getManifest(bucket);
+        if (!manifest) return;
+        const referencedKeys = new Set(
+            manifest.packManifest.map(pack => createPackKey(pack.checksum))
+        );
+        const cutoff = Date.now() - SYNC_PACK_GC_GRACE_MS;
+        const candidates = [];
+        let cursor;
+        for (let pageIndex = 0; pageIndex < SYNC_PACK_GC_MAX_LIST_PAGES; pageIndex += 1) {
+            const page = await bucket.list({
+                prefix: `${PACK_PREFIX}/`,
+                cursor,
+                limit: SYNC_DELETE_BATCH_SIZE
+            });
+            for (const object of page.objects || []) {
+                const key = typeof object?.key === 'string' ? object.key : '';
+                const name = key.startsWith(`${PACK_PREFIX}/`) ? key.slice(PACK_PREFIX.length + 1) : '';
+                if (!/^[a-f0-9]{64}\.bin$/.test(name) || referencedKeys.has(key)) continue;
+                const uploaded = object.uploaded;
+                const uploadedAt = uploaded instanceof Date
+                    ? uploaded.getTime()
+                    : typeof uploaded === 'number'
+                        ? uploaded
+                        : Date.parse(String(uploaded || ''));
+                if (!Number.isFinite(uploadedAt) || uploadedAt >= cutoff) continue;
+                candidates.push(key);
+                if (candidates.length >= SYNC_PACK_GC_MAX_DELETES) break;
+            }
+            if (candidates.length >= SYNC_PACK_GC_MAX_DELETES) break;
+            cursor = getNextSyncCursor(page, cursor);
+            if (!cursor) break;
+        }
+        if (candidates.length) await bucket.delete(candidates);
+    } catch (_) {
+        // Cleanup is best effort. A manifest that already committed must not
+        // become an upload failure because R2 listing or deletion is degraded.
+    }
+}
+
+function scheduleOrphanPackGc(bucket, ctx) {
+    const cleanup = runOrphanPackGc(bucket);
+    if (ctx && typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(cleanup);
+        return;
+    }
+    return cleanup;
+}
+
+async function handleUploadComplete(bucket, body, ctx) {
     const baseVersion = Number(body.baseVersion);
     const checksum = typeof body.checksum === 'string' ? body.checksum.toLowerCase() : '';
     const packCount = Number(body.packCount);
@@ -1549,20 +1661,28 @@ async function handleUploadComplete(bucket, body) {
     if (!Number.isInteger(baseVersion) || baseVersion < 0) return error('上传基础版本无效。', 409);
     if (!/^[a-f0-9]{64}$/.test(checksum)) return error('上传快照校验码无效。', 409);
 
-    if (!Number.isInteger(packCount) || packCount <= 0 || packCount > MAX_OBJECT_COUNT) return error('上传数据包数量异常。');
-    if (!Number.isInteger(entryCount) || entryCount <= 0 || entryCount > MAX_OBJECT_COUNT * MAX_PACK_ENTRIES) return error('上传记录数量异常。');
-    if (!Number.isInteger(totalBytes) || totalBytes <= 0 || totalBytes > MAX_TOTAL_BYTES) {
+    if (!Number.isInteger(packCount) || packCount < 0 || packCount > MAX_OBJECT_COUNT) return error('上传数据包数量异常。');
+    if (!Number.isInteger(entryCount) || entryCount < 0 || entryCount > MAX_OBJECT_COUNT * MAX_PACK_ENTRIES) return error('上传记录数量异常。');
+    if (!Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > MAX_TOTAL_BYTES) {
         return error(`本地数据太大：${totalBytes}/${MAX_TOTAL_BYTES}。`);
     }
+    const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0
+        && Array.isArray(body.packManifest) && body.packManifest.length === 0;
+    if (!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0)) {
+        return error('空快照字段必须同时为零。', 409);
+    }
 
-    let packManifest;
+    let normalizedPackManifest;
     try {
-        packManifest = normalizePackManifest(body.packManifest, totalBytes, entryCount);
+        normalizedPackManifest = normalizePackManifest(body.packManifest, totalBytes, entryCount);
     } catch (err) {
         return error(err instanceof Error ? err.message : '上传数据包清单无效。', 409);
     }
-    if (!packManifest || packManifest.length !== packCount) return error('上传数据包清单数量不一致。', 409);
-    if (!await isValidPackSnapshotChecksum(checksum, totalBytes, packCount, entryCount, packManifest)) {
+    if (!normalizedPackManifest || normalizedPackManifest.packs.length !== packCount) {
+        return error('上传数据包清单数量不一致。', 409);
+    }
+    const packManifest = normalizedPackManifest.packs;
+    if (!await isValidPackSnapshotChecksum(checksum, totalBytes, packCount, entryCount, normalizedPackManifest.checksumSource)) {
         return error('上传快照清单校验失败。', 409);
     }
     if (!await bucket.head(MIGRATION_MARKER_KEY)) {
@@ -1619,7 +1739,7 @@ async function handleUploadComplete(bucket, body) {
         schemaVersion
     };
 
-    const manifestBytes = new TextEncoder().encode(JSON.stringify(committedManifest));
+    const manifestBytes = textEncoder.encode(JSON.stringify(committedManifest));
     if (manifestBytes.byteLength > SYNC_CONTROL_MAX_BYTES) return error('上传快照清单超过大小上限。', 413);
     const committedObject = await bucket.put(MANIFEST_KEY, manifestBytes, {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
@@ -1631,6 +1751,18 @@ async function handleUploadComplete(bucket, body) {
         return error('服务器同步版本已变化，请重新检查后上传。', 409);
     }
     if (committedObject.etag) cacheManifestByEtag(committedObject.etag, committedManifest);
+    // The committed manifest just passed validation above; priming the
+    // checksum-keyed cache lets the next push's first read skip the
+    // parse-and-derive work even after the 30s etag window has expired.
+    rememberValidatedManifest(committedManifest);
+
+    // Reclaim unreferenced packs in the background; a no-op when the
+    // snapshot only replaced packs still referenced by the new manifest.
+    // With waitUntil the GC runs after the response; without one (tests,
+    // non-Workers callers) it completes before the response so cleanup
+    // stays deterministic.
+    const gc = scheduleOrphanPackGc(bucket, ctx);
+    if (gc) await gc;
 
     return json({
         ok: true,
@@ -1660,7 +1792,7 @@ async function runConcurrent(items, limit, worker) {
     return results;
 }
 
-async function handleJsonApi(request, env) {
+async function handleJsonApi(request, env, ctx) {
     if (request.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: { allow: 'POST, OPTIONS' } });
     }
@@ -1676,11 +1808,11 @@ async function handleJsonApi(request, env) {
     if (body.action === 'list-upload-packs') return handleListUploadPacks(bucket, body);
     if (body.action === 'pull-manifest') return handleStatus(bucket, body);
     if (body.action === 'pull-pack') return handlePullPack(bucket, body);
-    if (body.action === 'upload-complete') return handleUploadComplete(bucket, body);
+    if (body.action === 'upload-complete') return handleUploadComplete(bucket, body, ctx);
     return error('Unsupported action.', 404);
 }
 
-async function handleApi(request, env, url) {
+async function handleApi(request, env, url, ctx) {
     try {
         const action = url.searchParams.get('action');
         if (action === 'upload-pack-batch') {
@@ -1688,7 +1820,7 @@ async function handleApi(request, env, url) {
             if (!await isRequestAuthorized(request, env)) return error('Sync password required.', 401, { authRequired: true });
             return await handleUploadPackBatch(request, getBucket(env));
         }
-        return await handleJsonApi(request, env);
+        return await handleJsonApi(request, env, ctx);
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unexpected server error.';
         const status = err instanceof SyncRequestError
@@ -1712,13 +1844,6 @@ function serveSyncRestorePage() {
             'cache-control': 'no-store'
         }
     });
-}
-
-function encodeAdapterForHtml(adapter) {
-    return JSON.stringify(adapterPublicView(adapter))
-        .replace(/</g, '\\u003c')
-        .replace(/>/g, '\\u003e')
-        .replace(/&/g, '\\u0026');
 }
 
 // sourceChecks markers are verified against the live upstream before the
@@ -1756,7 +1881,10 @@ async function sourceCheckResults(adapter, knownContent = null, fetchUnknownPath
                 if (!cache.get(path)) allPassed = false;
                 continue;
             }
-            if (!fetchUnknownPaths) continue;
+            if (!fetchUnknownPaths) {
+                allPassed = false;
+                continue;
+            }
             const response = await fetch(new URL(check.path.replace(/^\/+/, ''), AUTHOR_BASE));
             let passed = false;
             if (response.ok) {
@@ -1780,14 +1908,16 @@ async function tryLoadAdapter(env) {
     }
 }
 
-function rewriteAuthorHtml(response, pathname, adapter = null) {
+function rewriteAuthorHtml(response, pathname, adapter = null, adapterReady = false) {
     const isMain = pathname === '/' || pathname === '/index.html';
-    const adapterConfig = isMain && adapter
-        ? `<script>window.RPHUB_MAGIC_ADAPTER=${encodeAdapterForHtml(adapter)};</script>`
-        : '';
+    // 注入面保持最小：主页 4 节点（styles.css、dirty-tracker、magic-extension、bootstrap），
+    // 其他作者 HTML 页只有 dirty-tracker。适配配置不再内联进页面——
+    // magic-extension 自行拉取 /__rphub/adapter.json（该路径已是扩展测试
+    // 的既有供给方式），页面响应因此少一个脚本节点与整份适配 JSON。
+    if (!adapterReady) return response;
     const injection = (isMain ? '<link rel="stylesheet" href="/DB/styles.css">' : '')
         + '<script src="/DB/dirty-tracker.js"></script>'
-        + (isMain ? `${adapterConfig}<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
+        + (isMain ? '<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>' : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
     headers.set('cache-control', 'no-store');
@@ -1811,9 +1941,9 @@ async function serveAdapterConfig(request, env) {
     }
     try {
         const adapter = await loadAdapter(env);
-        // Only consult already-verified source check results here; the pages
-        // and app.js requests perform the full verification.
-        if (!await sourceCheckResults(adapter, null, false)) {
+        // The config endpoint is also a verification boundary: do not expose
+        // an adapter that has not passed every source check.
+        if (!await sourceCheckResults(adapter)) {
             throw new Error('适配清单与作者页面不匹配。');
         }
         const response = json(adapterPublicView(adapter));
@@ -1906,24 +2036,16 @@ async function serveAuthor(request, env) {
     if (response.status === 304) return response;
     const isHtml = contentType.toLowerCase().includes('text/html');
     if (isHtml) {
-        const isMain = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html';
-        let pageAdapter = isMain ? await tryLoadAdapter(env) : null;
-        let pageResponse = response;
-        if (pageAdapter) {
-            // Verify the in-hand page markers here; other check paths are only
-            // consulted from cache so serving a page never downloads extra
-            // assets. The app.js request verifies the remaining paths.
-            const pageText = await response.text();
-            if (!await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText }, false)) {
-                pageAdapter = null;
-            }
-            pageResponse = new Response(pageText, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
-            });
-        }
-        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, pageAdapter);
+        const pageText = await response.text();
+        const pageAdapter = await tryLoadAdapter(env);
+        const adapterReady = Boolean(pageAdapter)
+            && await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText }, true);
+        const pageResponse = new Response(pageText, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers
+        });
+        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, pageAdapter, adapterReady);
     }
     return response;
 }

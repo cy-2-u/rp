@@ -6,6 +6,7 @@
   "scripts": {
     "runtime-smoke": "node runtime-smoke.mjs",
     "restore-sim": "node restore-sim.mjs",
+    "scale-sim": "node --max-old-space-size=8192 --expose-gc scale-sim.mjs",
     "audit-regressions": "node audit-regressions.mjs && node worker-regressions.mjs && node image-task-regressions.mjs",
     "test": "npm run runtime-smoke && npm run restore-sim && npm run audit-regressions"
   },

@@ -4,20 +4,37 @@
     const FIXED_IMAGE_KEY = 'rp_hub_magic_fixed_image';
     const LEGACY_REGEX_MIGRATION_KEY = 'rp_hub_magic_regex_migration_v2';
     const IMAGE_STORAGE_PREFIX = 'rp_hub_image_renders_';
+    const IMAGE_RECORD_LIMIT = 256;
+    const DEFAULT_STORY_SCOPE_ID = 'main';
     const IMAGE_PARAM_KEYS = ['provider', 'tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
-    let activeAdapter = window.RPHUB_MAGIC_ADAPTER || null;
+    const isUsableAdapter = value => value && typeof value === 'object' && !Array.isArray(value)
+        && value.ok !== false
+        && Number(value.schema) === 1
+        && typeof value.id === 'string'
+        && value.id.trim();
+    const inlineAdapter = window.RPHUB_MAGIC_ADAPTER_READY === true
+        ? window.RPHUB_MAGIC_ADAPTER
+        : null;
+    let activeAdapter = isUsableAdapter(inlineAdapter) ? inlineAdapter : null;
     let adapterLoadPromise = null;
 
     const loadUiAdapter = async () => {
         if (activeAdapter) return activeAdapter;
         if (adapterLoadPromise) return adapterLoadPromise;
         adapterLoadPromise = fetch('/__rphub/adapter.json', { cache: 'no-store' })
-            .then(response => response.ok ? response.json() : null)
+            .then(async response => {
+                if (!response.ok) return null;
+                const value = await response.json().catch(() => null);
+                return isUsableAdapter(value) ? value : null;
+            })
             .then(value => {
-                activeAdapter = value && typeof value === 'object' ? value : null;
+                activeAdapter = value;
                 return activeAdapter;
             })
-            .catch(() => null);
+            .catch(() => {
+                activeAdapter = null;
+                return null;
+            });
         return adapterLoadPromise;
     };
     const uiConfig = () => activeAdapter?.ui || {};
@@ -37,10 +54,15 @@
     };
 
     const isObject = value => value && typeof value === 'object' && !Array.isArray(value);
+    const normalizeStoryScopeId = value => {
+        const normalized = String(value ?? '').trim();
+        return normalized || DEFAULT_STORY_SCOPE_ID;
+    };
     const isFixedImageEnabled = () => localStorage.getItem(FIXED_IMAGE_KEY) !== '0';
     const imageStores = new Map();
 
     const buildRecordKey = descriptor => [
+        encodeURIComponent(normalizeStoryScopeId(descriptor.storyScopeId)),
         descriptor.messageId || (descriptor.messageIndex !== null ? `index:${descriptor.messageIndex}` : descriptor.contentHash || 'message'),
         descriptor.occurrenceIndex ?? 0,
         descriptor.promptHash || hashText(descriptor.prompt || '')
@@ -73,13 +95,14 @@
         return target;
     };
 
-    const buildDescriptor = (card, message, requestUrl) => {
+    const buildDescriptor = (card, message, requestUrl, storyScopeId = DEFAULT_STORY_SCOPE_ID) => {
         const row = card?.closest?.('[data-chat-index]');
         const occurrenceIndex = row ? [...row.querySelectorAll('.generated-image-card')].indexOf(card) : -1;
         if (occurrenceIndex < 0) return null;
         const messageIndex = Number(row?.dataset.chatIndex);
         const prompt = String(requestUrl.searchParams.get('tag') || '').trim();
         const descriptor = {
+            storyScopeId: normalizeStoryScopeId(storyScopeId),
             messageId: String(message?.id || ''),
             messageIndex: Number.isFinite(messageIndex) ? messageIndex : null,
             contentHash: hashText(String(message?.content || prompt)),
@@ -101,6 +124,7 @@
         delete paramsSnapshot.tag;
         paramsSnapshot.characterName = String(paramsSnapshot.characterName || characterName || '未命名角色');
         const normalized = {
+            storyScopeId: normalizeStoryScopeId(record.storyScopeId),
             messageId: String(record.messageId || ''),
             messageIndex: record.messageIndex === null || record.messageIndex === undefined
                 ? null
@@ -124,6 +148,38 @@
         request.onsuccess = () => resolve(request.result);
     });
 
+    const normalizeRecordList = (value, characterName = '') => {
+        if (!Array.isArray(value)) return [];
+        const records = new Map();
+        value.forEach(record => {
+            const normalized = normalizeRecord(record, characterName);
+            if (!normalized.prompt) return;
+            records.delete(normalized.key);
+            records.set(normalized.key, normalized);
+        });
+        return [...records.values()].slice(-IMAGE_RECORD_LIMIT);
+    };
+
+    const mergeRecordLists = (base, additions, deletedKeys, characterName = '') => {
+        const records = new Map(normalizeRecordList(base, characterName).map(record => [record.key, record]));
+        deletedKeys.forEach(key => records.delete(key));
+        for (const record of additions) {
+            const normalized = normalizeRecord(record, characterName);
+            if (!normalized.prompt) continue;
+            records.delete(normalized.key);
+            records.set(normalized.key, normalized);
+        }
+        return [...records.values()].slice(-IMAGE_RECORD_LIMIT);
+    };
+
+    const withImageStoreLock = (state, callback) => {
+        const lockName = `${IMAGE_STORAGE_PREFIX}${state.id}`;
+        if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+            return navigator.locks.request(lockName, { mode: 'exclusive' }, callback);
+        }
+        return callback();
+    };
+
     const loadImageStore = (characterId, characterName) => {
         const id = String(characterId || '');
         if (!id) return Promise.resolve(null);
@@ -133,6 +189,8 @@
             characterName: String(characterName || ''),
             records: [],
             transientRecords: new Map(),
+            pendingUpserts: new Map(),
+            pendingDeleteKeys: new Set(),
             writeQueue: Promise.resolve(),
             saveRevision: 0,
             savedRevision: 0,
@@ -147,9 +205,15 @@
                     request.onsuccess = () => resolve(request.result);
                     request.onerror = () => reject(request.error || new Error('图片记录读取失败'));
                 });
-                state.records = Array.isArray(value)
+                const rawRecords = Array.isArray(value)
                     ? value.map(record => normalizeRecord(record, state.characterName)).filter(record => record.prompt)
                     : [];
+                state.records = rawRecords.slice(-IMAGE_RECORD_LIMIT);
+                if (rawRecords.length > state.records.length) {
+                    rawRecords.slice(0, rawRecords.length - state.records.length)
+                        .forEach(record => state.pendingDeleteKeys.add(record.key));
+                    saveImageStore(state).catch(error => { state.saveError = error; });
+                }
                 return state;
             } finally {
                 db.close();
@@ -166,26 +230,49 @@
         if (!state) return Promise.resolve();
         if (!retry) state.saveRevision += 1;
         const write = state.writeQueue.catch(() => undefined).then(async () => {
-            if (state.savedRevision === state.saveRevision) return;
+            if (state.savedRevision === state.saveRevision
+                && state.pendingUpserts.size === 0 && state.pendingDeleteKeys.size === 0) return;
             const revision = state.saveRevision;
-            const payload = state.records.map(record => normalizeRecord(record, state.characterName));
-            const db = await openImageDatabase();
-            try {
-                await new Promise((resolve, reject) => {
-                    const transaction = db.transaction(['store'], 'readwrite');
-                    transaction.objectStore('store').put(payload, IMAGE_STORAGE_PREFIX + state.id);
-                    transaction.oncomplete = resolve;
-                    transaction.onerror = () => reject(transaction.error || new Error('图片记录保存失败'));
-                    transaction.onabort = () => reject(transaction.error || new Error('图片记录保存中止'));
-                });
-                state.savedRevision = revision;
-                state.saveError = null;
-            } catch (error) {
-                state.saveError = error;
-                throw error;
-            } finally {
-                db.close();
-            }
+            const upserts = new Map(state.pendingUpserts);
+            const deletedKeys = new Set(state.pendingDeleteKeys);
+            return withImageStoreLock(state, async () => {
+                const db = await openImageDatabase();
+                try {
+                    let merged;
+                    await new Promise((resolve, reject) => {
+                        const transaction = db.transaction(['store'], 'readwrite');
+                        const store = transaction.objectStore('store');
+                        const request = store.get(IMAGE_STORAGE_PREFIX + state.id);
+                        request.onerror = () => reject(request.error || new Error('图片记录读取失败'));
+                        request.onsuccess = () => {
+                            merged = mergeRecordLists(request.result, upserts.values(), deletedKeys, state.characterName);
+                            store.put(merged, IMAGE_STORAGE_PREFIX + state.id);
+                        };
+                        transaction.oncomplete = resolve;
+                        transaction.onerror = () => reject(transaction.error || new Error('图片记录保存失败'));
+                        transaction.onabort = () => reject(transaction.error || new Error('图片记录保存中止'));
+                    });
+                    state.pendingUpserts.forEach((record, key) => {
+                        if (upserts.get(key) === record) state.pendingUpserts.delete(key);
+                    });
+                    deletedKeys.forEach(key => {
+                        if (state.pendingDeleteKeys.has(key)) state.pendingDeleteKeys.delete(key);
+                    });
+                    state.records = mergeRecordLists(
+                        merged,
+                        state.pendingUpserts.values(),
+                        state.pendingDeleteKeys,
+                        state.characterName
+                    );
+                    state.savedRevision = revision;
+                    state.saveError = null;
+                } catch (error) {
+                    state.saveError = error;
+                    throw error;
+                } finally {
+                    db.close();
+                }
+            });
         });
         state.writeQueue = write;
         write.catch(error => { state.saveError = error; });
@@ -216,7 +303,8 @@
     };
 
     const findSlotRecord = (records, descriptor) => records.find(record => (
-        record.occurrenceIndex === descriptor.occurrenceIndex
+        normalizeStoryScopeId(record.storyScopeId) === normalizeStoryScopeId(descriptor.storyScopeId)
+        && record.occurrenceIndex === descriptor.occurrenceIndex
         && (descriptor.messageId
             ? record.messageId === descriptor.messageId
             : record.messageIndex === descriptor.messageIndex && record.contentHash === descriptor.contentHash)
@@ -368,14 +456,17 @@
         const previousWasStored = Boolean(previous && state.records.some(item => item.key === previous.key));
         if (previous) state.transientRecords.delete(previous.key);
         state.transientRecords.delete(record.key);
-        if (persistRequested || previousWasStored) {
+        if (persistRequested) {
+            if (previousWasStored) state.pendingDeleteKeys.add(previous.key);
             state.records = [
                 ...state.records.filter(item => item.key !== record.key && item.key !== previous?.key),
                 record
-            ];
+            ].slice(-IMAGE_RECORD_LIMIT);
+            state.pendingUpserts.set(record.key, record);
             await saveImageStore(state);
             return;
         }
+        // 关闭固定图后，旧的持久记录保留；reroll 只覆盖当前页的临时结果。
         state.transientRecords.set(record.key, record);
     };
 
@@ -414,19 +505,30 @@
         return task;
     };
 
-    const startMagicImageTask = async ({ card, requestUrl, fresh, message, characterId, characterName, render }) => {
+    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, render }) => {
         const currentUrl = normalizeRequestUrl(requestUrl, characterName);
         const token = currentUrl.searchParams.get('token') || '';
-        const descriptor = buildDescriptor(card, message, currentUrl);
+        const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);
         if (!descriptor) {
             const record = normalizeRecord({
+                storyScopeId,
                 prompt: currentUrl.searchParams.get('tag') || '',
                 paramsSnapshot: snapshotFromUrl(currentUrl, characterName, fresh === true)
             }, characterName);
-            return createGenerationTask({ slotKey: buildRecordUrl(record), record, token, render });
+            return createGenerationTask({
+                slotKey: JSON.stringify([String(characterId || ''), normalizeStoryScopeId(storyScopeId), buildRecordUrl(record)]),
+                record,
+                token,
+                render
+            });
         }
         const state = await loadImageStore(characterId, characterName);
-        const slotKey = JSON.stringify([String(characterId || ''), descriptor.messageId || `index:${descriptor.messageIndex}`, descriptor.occurrenceIndex]);
+        const slotKey = JSON.stringify([
+            String(characterId || ''),
+            normalizeStoryScopeId(descriptor.storyScopeId),
+            descriptor.messageId || `index:${descriptor.messageIndex}`,
+            descriptor.occurrenceIndex
+        ]);
         const activeTask = imageSlotTasks.get(slotKey);
         if (fresh !== true && activeTask && activeTask.job?.status !== 'failed'
             && (activeTask.record.promptHash === descriptor.promptHash || activeTask.sourcePromptHash === descriptor.promptHash)) {
@@ -437,9 +539,9 @@
         const storedRecord = state?.records.find(record => record.key === descriptor.key) || null;
         const transientRecord = state?.transientRecords.get(descriptor.key) || null;
         const slotRecord = fresh === true && state
-            ? findSlotRecord([...state.records, ...state.transientRecords.values()], descriptor)
+            ? findSlotRecord([...state.transientRecords.values(), ...state.records], descriptor)
             : null;
-        const previous = storedRecord || transientRecord || slotRecord;
+        const previous = transientRecord || storedRecord || slotRecord;
 
         if (fresh === true) {
             const record = normalizeRecord({
@@ -557,6 +659,7 @@
         return { value: next, changed };
     };
     const migrateLegacyImageRegex = () => new Promise(resolve => {
+        if (!activeAdapter) return resolve(false);
         if (localStorage.getItem(LEGACY_REGEX_MIGRATION_KEY) === '1') return resolve(false);
         const request = indexedDB.open('RPHubDB');
         request.onupgradeneeded = event => {
@@ -598,7 +701,10 @@
         };
     });
 
-    migrateLegacyImageRegex().then(changed => {
+    loadUiAdapter().then(adapter => {
+        if (!adapter) return false;
+        return migrateLegacyImageRegex();
+    }).then(changed => {
         if (changed) location.reload();
     });
 
