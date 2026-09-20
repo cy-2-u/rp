@@ -2034,7 +2034,19 @@ async function handleApi(request, env, url) {
 
 async function serveStatic(request, env) {
     if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') return null;
-    return env.ASSETS.fetch(request);
+    const assetResponse = await env.ASSETS.fetch(request);
+    if (!assetResponse || assetResponse.status === 404) return assetResponse;
+    // 同步客户端的全部代码都在这四个部署文件里。409 版本门的
+    // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
+    // 页面与 app.js 已是 no-store，这里把资产同样设为 no-store，
+    // 不给浏览器或边缘缓存任何回放旧客户端的机会。
+    const headers = new Headers(assetResponse.headers);
+    headers.set('cache-control', 'no-store');
+    return new Response(assetResponse.body, {
+        status: assetResponse.status,
+        statusText: assetResponse.statusText,
+        headers
+    });
 }
 
 function serveSyncRestorePage() {
@@ -2108,16 +2120,16 @@ async function tryLoadAdapter(env) {
     }
 }
 
-function rewriteAuthorHtml(response, pathname, adapter = null, adapterReady = false) {
+function rewriteAuthorHtml(response, pathname, adapterReady = false) {
     const isMain = pathname === '/' || pathname === '/index.html';
     // 注入面保持最小：主页 4 节点（styles.css、dirty-tracker、magic-extension、bootstrap），
     // 其他作者 HTML 页只有 dirty-tracker。适配配置不再内联进页面——
     // magic-extension 自行拉取 /__rphub/adapter.json（该路径已是扩展测试
     // 的既有供给方式），页面响应因此少一个脚本节点与整份适配 JSON。
     if (!adapterReady) return response;
-    const injection = (isMain ? '<link rel="stylesheet" href="/DB/styles.css">' : '')
-        + '<script src="/DB/dirty-tracker.js"></script>'
-        + (isMain ? '<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>' : '');
+    const injection = (isMain ? `<link rel="stylesheet" href="/DB/styles.css">` : '')
+        + `<script src="/DB/dirty-tracker.js"></script>`
+        + (isMain ? `<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
     headers.set('cache-control', 'no-store');
@@ -2233,7 +2245,6 @@ async function serveAuthor(request, env) {
         }
         return rewrittenAppJsResponse(body);
     }
-    if (response.status === 304) return response;
     const isHtml = contentType.toLowerCase().includes('text/html');
     if (isHtml) {
         const pageText = await response.text();
@@ -2245,7 +2256,7 @@ async function serveAuthor(request, env) {
             statusText: response.statusText,
             headers: response.headers
         });
-        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, pageAdapter, adapterReady);
+        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, adapterReady);
     }
     return response;
 }

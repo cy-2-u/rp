@@ -60,7 +60,7 @@ https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json
 1. 在 `.sync-tests` 安装依赖并运行 `npm test`。
 2. 运行 `npm run scale-sim` 完成默认 300MB 规模测试。
 3. 把五个根目录正本同步到 `page/`，逐字节核对。
-4. 重新生成 `page.zip`，确认归档根目录直接包含 `_worker.js`。
+4. 重新生成 `page.zip`，确认归档根目录直接包含 `_worker.js`；zip 条目路径必须用正斜杠（如 `DB/bootstrap.js`）。PowerShell `Compress-Archive` 写出的是反斜杠条目，Pages 导入后 `DB/` 子目录会整体丢失，站点表现为 `/DB/*` 全部 404，请用常规压缩工具打包。
 5. 部署 `page/`，或让 Pages Git 集成把构建输出目录设置为 `page`；构建命令留空。
 6. 部署后执行第 7 节自检并观察 Cloudflare CPU 指标。
 

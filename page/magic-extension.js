@@ -12,10 +12,7 @@
         && Number(value.schema) === 1
         && typeof value.id === 'string'
         && value.id.trim();
-    const inlineAdapter = window.RPHUB_MAGIC_ADAPTER_READY === true
-        ? window.RPHUB_MAGIC_ADAPTER
-        : null;
-    let activeAdapter = isUsableAdapter(inlineAdapter) ? inlineAdapter : null;
+    let activeAdapter = null;
     let adapterLoadPromise = null;
 
     const loadUiAdapter = async () => {

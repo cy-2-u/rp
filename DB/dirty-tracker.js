@@ -283,9 +283,6 @@
         return nativeCommit.call(this);
     };
     window.RPH_SYNC_TRACKER = Object.freeze({
-        journalStore: JOURNAL,
-        intentPrefix: STORAGE_INTENT_PREFIX,
-        epoch: trackingEpoch,
         async flush() {
             while (pendingWrites.size) await Promise.all([...pendingWrites]);
             if (journalFailure) throw new Error(`本地变更日志写入失败：${journalFailure.message || journalFailure}`);

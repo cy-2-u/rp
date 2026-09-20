@@ -2632,7 +2632,9 @@
             schemaVersion: SNAPSHOT_SCHEMA_VERSION
         }));
         await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
-        return baseRemote?.checksum === snapshot.checksum;
+        // 与快照相同校验和的基线已在上面提前返回 true；
+        // 走到这里必然是一次全新提交。
+        return false;
     }
 
     async function pullFromServerUnlocked() {

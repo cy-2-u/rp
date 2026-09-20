@@ -670,6 +670,9 @@ async function testCatchAllProxy() {
         const response = await worker.fetch(new Request(`https://local.test${pathname}`), env, {});
         assert.equal(response.status, 200);
         assert.equal(await response.text(), `local:${pathname}`);
+        // 注入的同步客户端文件必须 no-store：409 版本门的“请刷新页面后
+        // 重试”只有在刷新必然拿到当前部署副本时才成立。
+        assert.equal(response.headers.get('cache-control'), 'no-store');
     }
     assert.equal(upstreamCalls.length, 0, 'local assets must be served without an upstream request');
 
@@ -677,9 +680,9 @@ async function testCatchAllProxy() {
     const restoreHtml = await restorePage.text();
     assert.equal(restorePage.status, 200);
     assert.match(restoreHtml, /<html[^>]*data-rp-sync-restore/, 'restore mode must use an explicit internal document marker');
-    assert.match(restoreHtml, /<link rel="stylesheet" href="\/DB\/styles\.css">/);
-    assert.match(restoreHtml, /<script src="\/DB\/dirty-tracker\.js"><\/script>/);
-    assert.match(restoreHtml, /<script src="\/DB\/bootstrap\.js"><\/script>/);
+    assert.ok(restoreHtml.includes('<link rel="stylesheet" href="/DB/styles.css">'));
+    assert.ok(restoreHtml.includes('<script src="/DB/dirty-tracker.js"></script>'));
+    assert.ok(restoreHtml.includes('<script src="/DB/bootstrap.js"></script>'));
     assert.doesNotMatch(restoreHtml, /magic-extension|assets\/js\/app\.js|上传到云端|重建本地索引/,
         'the isolated restore document must not load the author app or normal sync actions');
     assert.equal(upstreamCalls.length, 0, 'the internal restore document must never reach the author upstream');
@@ -692,7 +695,7 @@ async function testCatchAllProxy() {
     assert.equal(future.status, 200, 'author pages added after deploy must be proxied automatically');
     const futureText = await future.text();
     assert.match(futureText, /added after deploy/);
-    assert.match(futureText, /<script src="\/DB\/dirty-tracker\.js"><\/script>/, 'healthy non-main pages keep the base tracker');
+    assert.ok(futureText.includes('<script src="/DB/dirty-tracker.js"></script>'), 'healthy non-main pages keep the base tracker');
     assert.doesNotMatch(futureText, /DB\/bootstrap\.js/, 'non-main pages must not load the sync panel');
     assert.equal(upstreamCalls.length, 4, 'the first HTML request performs the complete cached source check');
 
