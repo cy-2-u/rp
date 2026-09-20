@@ -5,10 +5,12 @@
   "description": "Isolated local Worker runtime and IndexedDB verification only.",
   "scripts": {
     "runtime-smoke": "node runtime-smoke.mjs",
+    "sync-v13-smoke": "node sync-v13-smoke.mjs",
+    "sync-v13-budget": "node --max-old-space-size=512 --expose-gc sync-v13-budget.mjs",
     "restore-sim": "node restore-sim.mjs",
     "scale-sim": "node --max-old-space-size=8192 --expose-gc scale-sim.mjs",
     "audit-regressions": "node audit-regressions.mjs && node worker-regressions.mjs && node image-task-regressions.mjs",
-    "test": "npm run runtime-smoke && npm run restore-sim && npm run audit-regressions"
+    "test": "npm run sync-v13-smoke && npm run sync-v13-budget && npm run runtime-smoke && npm run restore-sim && npm run audit-regressions"
   },
   "devDependencies": {
     "fake-indexeddb": "6.2.5"

@@ -168,15 +168,27 @@
     };
 })();
 (function () {
-    const SNAPSHOT_FORMAT = 'rp-sync-bounded-jsonl-v3';
-    const SNAPSHOT_SCHEMA_VERSION = 12;
+    const SNAPSHOT_FORMAT = 'rp-sync-paged-jsonl-v4';
+    const SNAPSHOT_SCHEMA_VERSION = 13;
+    const MANIFEST_PAGE_FORMAT = 'rp-sync-manifest-page-v1';
+    const MANIFEST_PAGE_PACKS = 32;
+    const MANIFEST_CHAIN_SEED = '0'.repeat(64);
+    const GC_BLOOM_BYTES = 32 * 1024;
     const DOWNLOAD_STAGING_DB = 'RPHubSyncStaging';
     const DOWNLOAD_STAGING_DB_VERSION = 3;
     const DOWNLOAD_STAGING_STORE = 'packs';
-    const RESTORE_PAGE = location.pathname === '/sync-restore';
+    const RESTORE_PAGE = Boolean(
+        typeof document !== 'undefined'
+        && document.documentElement?.hasAttribute?.('data-rp-sync-restore')
+        || typeof location !== 'undefined' && location.pathname === '/sync-restore'
+    );
     const PAGE_SCOPE = ['/', '/index.html', '/sync-restore'];
-    if (!PAGE_SCOPE.includes(location.pathname)) {
+    if (!RESTORE_PAGE && !PAGE_SCOPE.includes(location.pathname)) {
         return;
+    }
+    if (RESTORE_PAGE && location.pathname === '/sync-restore'
+        && typeof history !== 'undefined' && typeof history.replaceState === 'function') {
+        history.replaceState(null, '', '/');
     }
 
     // TextEncoder.encode 无内部状态，整个同步模块共享一个实例；
@@ -193,12 +205,12 @@
         ],
         localStoragePrefixes: ['rp_hub_', 'ai_chargen_'],
         maxSnapshotBytes: 1024 * 1024 * 1024,
-        // Keep one bounded request in flight by default on the free plan.
-        // The server still accepts up to three R2 writes inside that request.
+        // One request carries exactly one 1 MiB pack. The Worker forwards the
+        // request stream directly into R2 without copying or scanning it.
         uploadBatchConcurrency: 1,
-        uploadBatchMaxPacks: 8,
-        uploadBatchMaxBytes: 4 * 1024 * 1024,
-        downloadPackConcurrency: 10,
+        uploadBatchMaxPacks: 1,
+        uploadBatchMaxBytes: 1024 * 1024,
+        downloadPackConcurrency: 4,
         requestTimeoutMs: 60_000,
         packTransferTimeoutMs: 120_000,
         commitTimeoutMs: 120_000,
@@ -228,7 +240,7 @@
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
     const BASELINE_KEY = 'rp_sync_baseline_v2';
     const CACHE_STATE_KEY = 'snapshot';
-    const CACHE_FORMAT_VERSION = 6;
+    const CACHE_FORMAT_VERSION = 7;
     const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
     const STABLE_BUCKET_COUNT = 32;
@@ -304,6 +316,7 @@
         try {
             const parsed = JSON.parse(value);
             if (!Number.isSafeInteger(parsed.version) || typeof parsed.checksum !== 'string') throw new Error();
+            if (Number(parsed.schemaVersion) !== SNAPSHOT_SCHEMA_VERSION) return null;
             return parsed;
         } catch (_) { throw new Error('同步基线损坏，请先导出本地数据，再重新建立基线。'); }
     }
@@ -790,6 +803,14 @@
         return waitForTransaction(tx, '本地分片缓存失败。', () => request.result);
     }
 
+    function cacheWritePacks(db, packs) {
+        if (!Array.isArray(packs) || packs.length === 0) return Promise.resolve();
+        const tx = db.transaction(LOCAL_CACHE_PACK_STORE, 'readwrite');
+        const store = tx.objectStore(LOCAL_CACHE_PACK_STORE);
+        packs.forEach(pack => store.put(pack.bytes, pack.checksum));
+        return waitForTransaction(tx, '本地分片缓存失败。');
+    }
+
     async function pruneCachedPacks(db, manifest) {
         const active = new Set(manifest.map(pack => pack.checksum));
         const keys = await readObjectStoreKeys(db, LOCAL_CACHE_PACK_STORE);
@@ -988,7 +1009,7 @@
         if (serializeSnapshotObject(snapshot).byteLength > CONFIG.maxManifestBytes - 1024) {
             throw new Error('本地同步清单超过 2MiB 上限。');
         }
-        snapshot.checksum = await sha256(buildPackSnapshotChecksumSource(snapshot));
+        await addPagedManifestMetadata(snapshot);
         state.packs = ordered;
         state.snapshot = snapshot;
         return { state, snapshot };
@@ -1318,18 +1339,27 @@
         return waitForTransaction(tx, '同步临时数据写入失败。');
     }
 
-    function readDownloadStagingObject(stagingDb, index) {
+    function readDownloadStagingObjects(stagingDb, packManifest, start) {
+        const packs = packManifest.slice(start, start + CONFIG.downloadPackConcurrency);
+        if (packs.length === 0) return Promise.resolve([]);
         const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readonly');
-        const request = tx.objectStore(DOWNLOAD_STAGING_STORE).get(index);
-        return waitForTransaction(tx, '同步临时数据读取失败。', () => {
+        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
+        const requests = packs.map((_, offset) => store.get(start + offset));
+        return waitForTransaction(tx, '同步临时数据读取失败。', () => requests.map((request, offset) => {
             const value = request.result;
-            if (value instanceof Uint8Array) return value;
-            if (value instanceof ArrayBuffer) return new Uint8Array(value);
-            throw new Error(`同步临时对象 ${index + 1} 不存在。`);
-        });
+            const bytes = value instanceof Uint8Array
+                ? value
+                : value instanceof ArrayBuffer
+                    ? new Uint8Array(value)
+                    : null;
+            if (!bytes || bytes.byteLength !== packs[offset].length) {
+                throw new Error(`同步临时对象 ${start + offset + 1} 校验失败。`);
+            }
+            return { ...packs[offset], index: start + offset, bytes };
+        }));
     }
 
-    async function downloadPacksToStaging(remote, packManifest, stagingDb) {
+    async function* downloadPacksToStaging(remote, packManifest, stagingDb) {
         await clearDownloadStagingStore(stagingDb);
         let completed = 0;
         for (let start = 0; start < packManifest.length; start += CONFIG.downloadPackConcurrency) {
@@ -1339,7 +1369,11 @@
                 const bytes = await postSyncBinary({
                     action: 'pull-pack',
                     version: remote.version,
-                    checksum: pack.checksum
+                    pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
+                    packIndex: index % MANIFEST_PAGE_PACKS,
+                    checksum: pack.checksum,
+                    length: pack.length,
+                    entryCount: pack.entryCount
                 }, { timeoutMs: CONFIG.packTransferTimeoutMs });
                 if (bytes.byteLength !== pack.length) {
                     throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
@@ -1347,22 +1381,22 @@
                 if (await sha256Bytes(bytes) !== pack.checksum) {
                     throw new Error(`服务器数据包 ${index + 1} 校验失败。`);
                 }
-                completed += 1;
-                const percent = 8 + Math.round((completed / packManifest.length) * 57);
-                updateProgress(percent, '正在下载…');
-                return { index, bytes };
+                return { ...pack, index, bytes };
             }));
+            for (const pack of downloaded) {
+                completed += 1;
+                updateProgress(8 + Math.round((completed / packManifest.length) * 57), '正在恢复…');
+                yield pack;
+            }
             await writeDownloadStagingObjects(stagingDb, downloaded);
         }
     }
 
     async function* iterateStagedSnapshotPacks(stagingDb, packManifest) {
-        for (let index = 0; index < packManifest.length; index += 1) {
-            const bytes = await readDownloadStagingObject(stagingDb, index);
-            if (bytes.byteLength !== packManifest[index].length) {
-                throw new Error(`同步临时数据包 ${index + 1} 校验失败。`);
+        for (let start = 0; start < packManifest.length; start += CONFIG.downloadPackConcurrency) {
+            for (const pack of await readDownloadStagingObjects(stagingDb, packManifest, start)) {
+                yield pack;
             }
-            yield { ...packManifest[index], bytes };
         }
     }
 
@@ -1624,13 +1658,13 @@
         }
     }
 
-    async function parseStagedPackSnapshot(stagingDb, packManifest, consumer, options = {}) {
+    async function parsePackSnapshot(packSource, packCount, consumer, options = {}) {
         const decoder = new TextDecoder('utf-8', { fatal: true });
         let completed = 0;
         let fragments = [];
         let fragmentBytes = 0;
         let previousBucket = null;
-        for await (const pack of iterateStagedSnapshotPacks(stagingDb, packManifest)) {
+        for await (const pack of packSource) {
             if (previousBucket !== pack.bucketKey && fragmentBytes) {
                 throw new Error('服务器同步分片记录不完整。');
             }
@@ -1660,13 +1694,43 @@
                 offset = end + 1;
             }
             if (count !== pack.entryCount) throw new Error('服务器同步数据包记录数量不一致。');
+            if (typeof consumer.packComplete === 'function') await consumer.packComplete(pack);
             completed += 1;
-            if (typeof options.onProgress === 'function') {
-                options.onProgress(completed, packManifest.length);
-            }
+            if (typeof options.onProgress === 'function') options.onProgress(completed, packCount);
         }
+        if (completed !== packCount) throw new Error('服务器同步数据包数量不一致。');
         if (fragmentBytes || fragments.length) throw new Error('服务器同步记录尚未结束。');
         await consumer.finish();
+    }
+
+    function assertPackEntryPlacement(value, pack) {
+        const id = snapshotEntryId(value);
+        const group = snapshotEntryGroup(value);
+        const sourceKey = snapshotEntrySource(value);
+        const bucketKey = snapshotEntryBucket(value, id, sourceKey);
+        if (bucketKey !== pack.bucketKey || group !== pack.group) {
+            throw new Error('服务器同步分片索引不一致。');
+        }
+    }
+
+    function manifestPackTuple(pack) {
+        return [
+            String(pack.bucketKey),
+            String(pack.group),
+            Number(pack.part),
+            String(pack.checksum).toLowerCase(),
+            Number(pack.length),
+            Number(pack.entryCount)
+        ];
+    }
+
+    function buildManifestPageChecksumSource(pageIndex, previousPageHash, packs) {
+        return JSON.stringify([
+            MANIFEST_PAGE_FORMAT,
+            pageIndex,
+            previousPageHash,
+            packs.map(manifestPackTuple)
+        ]);
     }
 
     function buildPackSnapshotChecksumSource(snapshot) {
@@ -1676,15 +1740,40 @@
             Number(snapshot.totalBytes || 0),
             Number(snapshot.packCount || 0),
             Number(snapshot.entryCount || 0),
-            (snapshot.packManifest || []).map((pack) => [
-                String(pack.bucketKey),
-                String(pack.group),
-                Number(pack.part),
-                String(pack.checksum).toLowerCase(),
-                Number(pack.length),
-                Number(pack.entryCount)
-            ])
+            Number(snapshot.pageCount || 0),
+            String(snapshot.pageRoot || MANIFEST_CHAIN_SEED),
+            String(snapshot.bloomChecksum || '')
         ]);
+    }
+
+    function bloomIndexes(checksum) {
+        const bitCount = GC_BLOOM_BYTES * 8;
+        return [0, 8, 16, 24].map(offset => parseInt(checksum.slice(offset, offset + 8), 16) % bitCount);
+    }
+
+    function buildPackBloom(packManifest) {
+        const bloom = new Uint8Array(GC_BLOOM_BYTES);
+        for (const pack of packManifest) {
+            for (const bit of bloomIndexes(pack.checksum)) bloom[bit >>> 3] |= 1 << (bit & 7);
+        }
+        return bloom;
+    }
+
+    async function addPagedManifestMetadata(snapshot) {
+        let previousPageHash = MANIFEST_CHAIN_SEED;
+        const pageCount = Math.ceil(snapshot.packManifest.length / MANIFEST_PAGE_PACKS);
+        for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+            const packs = snapshot.packManifest.slice(
+                pageIndex * MANIFEST_PAGE_PACKS,
+                (pageIndex + 1) * MANIFEST_PAGE_PACKS
+            );
+            previousPageHash = await sha256(buildManifestPageChecksumSource(pageIndex, previousPageHash, packs));
+        }
+        const bloom = buildPackBloom(snapshot.packManifest);
+        snapshot.pageCount = pageCount;
+        snapshot.pageRoot = previousPageHash;
+        snapshot.bloomChecksum = await sha256Bytes(bloom);
+        snapshot.checksum = await sha256(buildPackSnapshotChecksumSource(snapshot));
     }
 
     async function validateRemotePackManifest(remote) {
@@ -1692,107 +1781,151 @@
             || Number(remote?.schemaVersion) !== SNAPSHOT_SCHEMA_VERSION) {
             throw new Error('服务器同步格式不受支持。');
         }
-
         const packCount = Number(remote.packCount);
         const entryCount = Number(remote.entryCount);
         const totalBytes = Number(remote.totalBytes);
-        const sourceManifest = Array.isArray(remote.packManifest) ? remote.packManifest : [];
-        const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0 && sourceManifest.length === 0;
-        if (!Number.isInteger(packCount) || packCount < 0 || packCount > CONFIG.maxPackCount) {
-            throw new Error('服务器同步数据包数量异常。');
+        const pageCount = Number(remote.pageCount);
+        const pageRoot = String(remote.pageRoot || '').toLowerCase();
+        const bloomChecksum = String(remote.bloomChecksum || '').toLowerCase();
+        const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0 && pageCount === 0;
+        if (!Number.isInteger(packCount) || packCount < 0 || packCount > CONFIG.maxPackCount
+            || !Number.isInteger(entryCount) || entryCount < 0 || entryCount > 10_000_000
+            || !Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > CONFIG.maxSnapshotBytes
+            || !Number.isInteger(pageCount) || pageCount !== Math.ceil(packCount / MANIFEST_PAGE_PACKS)
+            || !/^[a-f0-9]{64}$/.test(pageRoot) || !/^[a-f0-9]{64}$/.test(bloomChecksum)) {
+            throw new Error('服务器同步根清单异常。');
         }
-        if (!Number.isInteger(entryCount) || entryCount < 0 || entryCount > 10_000_000) {
-            throw new Error('服务器同步记录数量异常。');
+        if ((!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0))
+            || (emptySnapshot && pageRoot !== MANIFEST_CHAIN_SEED)) {
+            throw new Error('服务器空快照字段必须同时为空。');
         }
-        if (!Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > CONFIG.maxSnapshotBytes) {
-            throw new Error(`服务器数据太大：${totalBytes}/${CONFIG.maxSnapshotBytes}。`);
+        const rootChecksum = await sha256(buildPackSnapshotChecksumSource({
+            totalBytes, packCount, entryCount, pageCount, pageRoot, bloomChecksum
+        }));
+        if (String(remote.checksum || '').toLowerCase() !== rootChecksum) {
+            throw new Error('服务器同步根清单校验失败。');
         }
-        if (!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0)) {
-            throw new Error('服务器空快照字段必须同时为零。');
+
+        const packManifest = [];
+        let previousPageHash = MANIFEST_CHAIN_SEED;
+        for (let start = 0; start < pageCount; start += CONFIG.downloadPackConcurrency) {
+            const indexes = Array.from(
+                { length: Math.min(CONFIG.downloadPackConcurrency, pageCount - start) },
+                (_, offset) => start + offset
+            );
+            const pages = await Promise.all(indexes.map(pageIndex => postSync({
+                action: 'pull-manifest-page',
+                schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+                version: remote.version,
+                pageIndex
+            })));
+            for (let offset = 0; offset < pages.length; offset += 1) {
+                const pageIndex = indexes[offset];
+                const page = pages[offset];
+                if (Number(page.pageIndex) !== pageIndex || page.previousPageHash !== previousPageHash
+                    || !Array.isArray(page.packs)) throw new Error('服务器同步清单页顺序异常。');
+                const normalized = page.packs.map(pack => ({
+                    bucketKey: String(pack?.bucketKey || ''),
+                    group: String(pack?.group || ''),
+                    part: Number(pack?.part),
+                    checksum: String(pack?.checksum || '').toLowerCase(),
+                    length: Number(pack?.length),
+                    entryCount: Number(pack?.entryCount)
+                }));
+                const expectedPageHash = await sha256(buildManifestPageChecksumSource(
+                    pageIndex, previousPageHash, normalized
+                ));
+                if (page.pageHash !== expectedPageHash) throw new Error('服务器同步清单页校验失败。');
+                previousPageHash = expectedPageHash;
+                packManifest.push(...normalized);
+            }
         }
-        if (sourceManifest.length !== packCount) {
-            throw new Error('服务器同步数据包清单数量不一致。');
+        if (previousPageHash !== pageRoot || packManifest.length !== packCount) {
+            throw new Error('服务器同步清单页根不一致。');
         }
 
         let manifestBytes = 0;
         let manifestEntries = 0;
         const bucketParts = new Map();
-        const packManifest = sourceManifest.map((pack) => {
-            const bucketKey = String(pack?.bucketKey || '');
-            const group = String(pack?.group || '');
-            const part = Number(pack?.part);
-            const checksum = String(pack?.checksum || '').toLowerCase();
-            const length = Number(pack?.length);
-            const entries = Number(pack?.entryCount);
-            if (!bucketKey || bucketKey.length > 4000 || !group || group.length > 1000
-                || !Number.isInteger(part) || part < 0) {
-                throw new Error('服务器同步数据包索引异常。');
+        for (const pack of packManifest) {
+            if (!pack.bucketKey || pack.bucketKey.length > 4000 || !pack.group || pack.group.length > 1000
+                || !Number.isInteger(pack.part) || pack.part < 0
+                || !/^[a-f0-9]{64}$/.test(pack.checksum)
+                || !Number.isInteger(pack.length) || pack.length <= 0 || pack.length > CONFIG.targetPackBytes
+                || !Number.isInteger(pack.entryCount) || pack.entryCount < 0 || pack.entryCount > CONFIG.maxPackEntries) {
+                throw new Error('服务器同步数据包清单异常。');
             }
-            if (!/^[a-f0-9]{64}$/.test(checksum)) throw new Error('服务器同步数据包校验码异常。');
-            if (!Number.isInteger(length) || length <= 0 || length > CONFIG.targetPackBytes) {
-                throw new Error('服务器同步数据包大小异常。');
-            }
-            if (!Number.isInteger(entries) || entries < 0 || entries > CONFIG.maxPackEntries) {
-                throw new Error('服务器同步数据包记录数量异常。');
-            }
-            const bucketState = bucketParts.get(bucketKey) || { group, nextPart: 0 };
-            if (bucketState.group !== group || part !== bucketState.nextPart) {
+            const bucketState = bucketParts.get(pack.bucketKey) || { group: pack.group, nextPart: 0 };
+            if (bucketState.group !== pack.group || pack.part !== bucketState.nextPart) {
                 throw new Error('服务器同步数据包顺序异常。');
             }
             bucketState.nextPart += 1;
-            bucketParts.set(bucketKey, bucketState);
-            manifestBytes += length;
-            manifestEntries += entries;
-            return { bucketKey, group, part, checksum, length, entryCount: entries };
-        });
-        if (manifestBytes !== totalBytes) {
-            throw new Error('服务器同步数据包大小合计不一致。');
+            bucketParts.set(pack.bucketKey, bucketState);
+            manifestBytes += pack.length;
+            manifestEntries += pack.entryCount;
         }
-        if (manifestEntries !== entryCount) {
-            throw new Error('服务器同步记录数量不一致。');
-        }
-
-        const expectedChecksum = await sha256(buildPackSnapshotChecksumSource({
-            totalBytes,
-            packCount,
-            entryCount,
-            packManifest
-        }));
-        if (String(remote.checksum || '').toLowerCase() !== expectedChecksum) {
-            throw new Error('服务器同步清单校验失败。');
+        if (manifestBytes !== totalBytes || manifestEntries !== entryCount) {
+            throw new Error('服务器同步清单合计不一致。');
         }
         return packManifest;
     }
 
-    async function rebuildLocalSyncCacheFromStaging(stagingDb, packManifest, remote) {
+    async function restoreSnapshotAndCache(stagingDb, packManifest, remote, restoreWatermark) {
         const cacheDb = await openLocalSyncCache();
+        const restorer = new ObjectSnapshotRestorer(remote.entryCount);
+        let pendingEntries = [];
+        let pendingBytes = 0;
+        let pendingPacks = [];
+        let entryCount = 0;
+        const flushEntries = async () => {
+            if (pendingEntries.length === 0) return;
+            const entries = pendingEntries;
+            pendingEntries = [];
+            pendingBytes = 0;
+            await cacheWriteEntries(cacheDb, entries);
+        };
+        const flushPacks = async () => {
+            if (pendingPacks.length === 0) return;
+            const packs = pendingPacks;
+            pendingPacks = [];
+            await cacheWritePacks(cacheDb, packs);
+        };
+
         try {
             await cacheClear(cacheDb);
-            let pending = [];
-            let pendingBytes = 0;
-            let entryCount = 0;
-            await parseStagedPackSnapshot(stagingDb, packManifest, {
-                async consume(value, pack) {
-                    const entry = buildCacheEntry(value);
-                    if (entry.bucketKey !== pack.bucketKey || entry.group !== pack.group) {
-                        throw new Error('服务器同步缓存索引不一致。');
-                    }
-                    pending.push(entry);
-                    pendingBytes += entry.bytes.byteLength;
-                    entryCount += 1;
-                    if (pendingBytes >= CONFIG.cacheWriteBytes || pending.length >= CONFIG.readBatchSize) {
-                        await cacheWriteEntries(cacheDb, pending);
-                        pending = [];
-                        pendingBytes = 0;
+            await parsePackSnapshot(
+                iterateStagedSnapshotPacks(stagingDb, packManifest),
+                packManifest.length,
+                {
+                    async consume(value, pack) {
+                        await restorer.consume(value);
+                        const entry = buildCacheEntry(value);
+                        if (entry.bucketKey !== pack.bucketKey || entry.group !== pack.group) {
+                            throw new Error('服务器同步缓存索引不一致。');
+                        }
+                        pendingEntries.push(entry);
+                        pendingBytes += entry.bytes.byteLength;
+                        entryCount += 1;
+                        if (pendingBytes >= CONFIG.cacheWriteBytes || pendingEntries.length >= CONFIG.readBatchSize) {
+                            await flushEntries();
+                        }
+                    },
+                    async packComplete(pack) {
+                        pendingPacks.push({ checksum: pack.checksum, bytes: pack.bytes });
+                        if (pendingPacks.length >= CONFIG.downloadPackConcurrency) await flushPacks();
+                    },
+                    async finish() {
+                        await restorer.finish();
+                        await flushEntries();
+                        await flushPacks();
                     }
                 },
-                async finish() { await cacheWriteEntries(cacheDb, pending); }
-            });
-            for (let index = 0; index < packManifest.length; index += 1) {
-                const pack = packManifest[index];
-                const bytes = await readDownloadStagingObject(stagingDb, index);
-                await cachePack(cacheDb, pack.checksum, bytes);
-            }
+                {
+                    onProgress: (completed, total) => {
+                        updateProgress(72 + Math.round((completed / total) * 27), '正在恢复…');
+                    }
+                }
+            );
             if (entryCount !== Number(remote.entryCount)) {
                 throw new Error('服务器同步缓存记录数量不一致。');
             }
@@ -1802,6 +1935,9 @@
                 packCount: Number(remote.packCount),
                 entryCount: Number(remote.entryCount),
                 totalBytes: Number(remote.totalBytes),
+                pageCount: Number(remote.pageCount),
+                pageRoot: String(remote.pageRoot).toLowerCase(),
+                bloomChecksum: String(remote.bloomChecksum).toLowerCase(),
                 packManifest: packManifest.map(pack => ({ ...pack })),
                 checksum: String(remote.checksum).toLowerCase()
             };
@@ -1813,9 +1949,14 @@
                 epochs: (await readDirtyState()).epochs,
                 snapshot
             });
-            localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: remote.version, checksum: remote.checksum }));
-            await window.RPH_SYNC_TRACKER.acknowledge(remote.restoreWatermark);
+            localStorage.setItem(BASELINE_KEY, JSON.stringify({
+                version: remote.version,
+                checksum: remote.checksum,
+                schemaVersion: SNAPSHOT_SCHEMA_VERSION
+            }));
+            await window.RPH_SYNC_TRACKER.acknowledge(restoreWatermark);
         } catch (error) {
+            restorer.abort();
             await cacheClear(cacheDb);
             throw error;
         } finally {
@@ -1828,33 +1969,42 @@
         const stagingDb = await openDownloadStagingDb();
 
         try {
-            await downloadPacksToStaging(remote, packManifest, stagingDb);
-            updateProgress(72, '正在校验…');
-            await parseStagedPackSnapshot(
-                stagingDb,
-                packManifest,
-                new ObjectSnapshotRestorer(remote.entryCount, { validateOnly: true })
+            const validator = new ObjectSnapshotRestorer(remote.entryCount, { validateOnly: true });
+            await parsePackSnapshot(
+                downloadPacksToStaging(remote, packManifest, stagingDb),
+                packManifest.length,
+                {
+                    async consume(value, pack) {
+                        assertPackEntryPlacement(value, pack);
+                        await validator.consume(value);
+                    },
+                    async finish() { await validator.finish(); }
+                }
             );
-            updateProgress(82, '正在应用…');
+            updateProgress(72, '正在恢复…');
+            const previousRestoreActive = localStorage.getItem(RESTORE_ACTIVE_KEY);
             const restoreEpoch = crypto.randomUUID();
-            const restorer = new ObjectSnapshotRestorer(remote.entryCount);
+            let restoreStarted = false;
+            localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
+            localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
             try {
-                localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
-                localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
                 await withRestoreWriteLock(async () => {
+                    restoreStarted = true;
                     await waitForIndexedDbWriteBarrier();
                     const restoreWatermark = (await readDirtyState()).watermark;
-                    await parseStagedPackSnapshot(stagingDb, packManifest, restorer, {
-                        onProgress: (completed, total) => {
-                            const percent = Math.round((completed / total) * 100);
-                            updateProgress(82 + Math.round(percent * 0.16), '正在应用…');
-                        }
-                    });
-                    await rebuildLocalSyncCacheFromStaging(stagingDb, packManifest, { ...remote, restoreWatermark });
-                    if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) localStorage.removeItem(RESTORE_ACTIVE_KEY);
+                    await restoreSnapshotAndCache(stagingDb, packManifest, remote, restoreWatermark);
+                    if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
+                        localStorage.removeItem(RESTORE_ACTIVE_KEY);
+                    }
                 });
             } catch (error) {
-                restorer.abort();
+                if (!restoreStarted && localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
+                    if (previousRestoreActive) {
+                        localStorage.setItem(RESTORE_ACTIVE_KEY, previousRestoreActive);
+                    } else {
+                        localStorage.removeItem(RESTORE_ACTIVE_KEY);
+                    }
+                }
                 throw error;
             }
         } finally {
@@ -1950,30 +2100,51 @@
         });
     }
 
-    function buildUploadBatchBody(records) {
-        const manifest = textEncoder.encode(JSON.stringify(records.map(record => ({
+    async function postUploadPack(records, uploadId) {
+        if (!Array.isArray(records) || records.length !== 1) throw new Error('每次只能上传一个同步分片。');
+        const record = records[0];
+        const body = record.bytes;
+        record.bytes = null;
+        const params = new URLSearchParams({
+            action: 'upload-pack',
+            uploadId,
             checksum: record.checksum,
-            length: record.length
-        }))));
-        const prefix = new Uint8Array(4);
-        new DataView(prefix.buffer).setUint32(0, manifest.byteLength);
-        return new Blob([prefix, manifest, ...records.map(record => record.bytes)], { type: 'application/octet-stream' });
-    }
-
-    async function postUploadPackBatch(records) {
-        const body = buildUploadBatchBody(records);
-        // Blob owns this bounded batch; retries reuse it without cloning the source packs again.
-        records.forEach(record => { record.bytes = null; });
-        const params = new URLSearchParams({ action: 'upload-pack-batch' });
-
+            length: String(record.length),
+            entryCount: String(record.entryCount)
+        });
         return withSyncRetry({
             timeoutMs: CONFIG.packTransferTimeoutMs,
             abortMessage: '上传超时，请检查网络后重试。'
         }, async signal => {
             const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
                 method: 'POST',
-                headers: buildSyncHeaders({}, false),
+                headers: {
+                    ...buildSyncHeaders({}, false),
+                    'content-type': 'application/octet-stream'
+                },
                 body,
+                credentials: 'same-origin',
+                signal
+            });
+            if (!response.ok) {
+                throwSyncHttpError(response, await response.json().catch(() => ({})));
+            }
+        });
+    }
+
+    async function postUploadBloom(uploadId, bloom) {
+        const params = new URLSearchParams({ action: 'upload-bloom', uploadId });
+        return withSyncRetry({
+            timeoutMs: CONFIG.packTransferTimeoutMs,
+            abortMessage: '同步过滤器上传超时，请检查网络后重试。'
+        }, async signal => {
+            const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
+                method: 'POST',
+                headers: {
+                    ...buildSyncHeaders({}, false),
+                    'content-type': 'application/octet-stream'
+                },
+                body: bloom,
                 credentials: 'same-origin',
                 signal
             });
@@ -2016,22 +2187,84 @@
         }
     }
 
-    async function* iterateMissingUploadPacks(snapshot, remotePackManifest) {
-        // 直接用基线远端快照的分片清单作种子：已提交到远端的分片必然已在 R2 中，
-        // 不再每次上传都列举全部历史分片（原来是每次 O(历史分片数/1000) 个请求）。
-        // 中断上传等异常由提交时服务器的 409 missingPacks 定向补传兜底。
-        const available = new Set((Array.isArray(remotePackManifest) ? remotePackManifest : [])
-            .map(pack => `${pack.checksum}:${pack.length}`));
-        const yielded = new Set();
-        for (const pack of snapshot.packManifest) {
-            const key = `${pack.checksum}:${pack.length}`;
-            if (available.has(key) || yielded.has(pack.checksum)) continue;
-            yielded.add(pack.checksum);
-            yield pack;
+    async function runGcMaintenance() {
+        const maxSteps = Math.ceil(CONFIG.maxPackCount / 256) + 1;
+        for (let step = 0; step < maxSteps; step += 1) {
+            const result = await postSync({ action: 'gc-step' }, {
+                retryCount: 0,
+                timeoutMs: CONFIG.commitTimeoutMs
+            });
+            if (result.done) return;
         }
     }
 
-    async function uploadCachedSnapshot(packSource, totalBytes, progressStart, progressEnd) {
+    async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
+        const bloom = buildPackBloom(snapshot.packManifest);
+        const begin = await postSync({
+            action: 'begin-upload',
+            baseVersion,
+            baseChecksum,
+            checksum: snapshot.checksum,
+            bloomChecksum: snapshot.bloomChecksum,
+            snapshotFormat: snapshot.snapshotFormat,
+            schemaVersion: snapshot.schemaVersion,
+            packCount: snapshot.packCount,
+            entryCount: snapshot.entryCount,
+            totalBytes: snapshot.totalBytes,
+            pageCount: snapshot.pageCount,
+            pageRoot: snapshot.pageRoot
+        }, { timeoutMs: CONFIG.commitTimeoutMs });
+        if (begin.committed) {
+            try {
+                await runGcMaintenance();
+            } catch (_) { }
+            return begin.remote;
+        }
+        const uploadId = begin.uploadId;
+        await postUploadBloom(uploadId, bloom);
+        for (let pageIndex = Number(begin.nextPage || 0); pageIndex < snapshot.pageCount; pageIndex += 1) {
+            const packs = snapshot.packManifest.slice(
+                pageIndex * MANIFEST_PAGE_PACKS,
+                (pageIndex + 1) * MANIFEST_PAGE_PACKS
+            );
+            let pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
+                timeoutMs: CONFIG.commitTimeoutMs
+            });
+            if (Array.isArray(pageResult.missingPacks) && pageResult.missingPacks.length) {
+                const missing = new Set(pageResult.missingPacks);
+                const pageStart = progress.uploadStart + Math.round(
+                    (pageIndex / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
+                );
+                const pageEnd = progress.uploadStart + Math.round(
+                    ((pageIndex + 1) / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
+                );
+                const pageBytes = packs.reduce((sum, pack) => sum + pack.length, 0);
+                await uploadCachedSnapshot(
+                    packs.filter(pack => missing.has(pack.checksum)),
+                    uploadId,
+                    pageBytes,
+                    pageStart,
+                    pageEnd
+                );
+                pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
+                    timeoutMs: CONFIG.commitTimeoutMs
+                });
+                if (pageResult.missingPacks?.length) throw new Error('服务器仍缺少刚上传的同步分片。');
+            }
+            const ratio = snapshot.pageCount ? (pageIndex + 1) / snapshot.pageCount : 1;
+            updateProgress(progress.uploadStart + Math.round(ratio * (progress.commit - progress.uploadStart)), '正在分页校验…');
+        }
+        const finalized = await postSync({ action: 'finalize-upload', uploadId }, {
+            retryCount: 1,
+            timeoutMs: CONFIG.commitTimeoutMs
+        });
+        try {
+            await runGcMaintenance();
+        } catch (_) { }
+        return finalized.remote;
+    }
+
+    async function uploadCachedSnapshot(packSource, uploadId, totalBytes, progressStart, progressEnd) {
         const cacheDb = await openLocalSyncCache();
         try {
             const engine = window.RPH_SYNC_UPLOAD_ENGINE;
@@ -2049,7 +2282,7 @@
                     }
                     return { bytes };
                 },
-                send: postUploadPackBatch,
+                send: records => postUploadPack(records, uploadId),
                 onBatchSuccess: ({ bytes }) => {
                     const ratio = totalBytes > 0 ? Math.min(1, bytes / totalBytes) : 1;
                     updateProgress(progressStart + Math.round(ratio * (progressEnd - progressStart)), '正在按分片上传…');
@@ -2242,8 +2475,24 @@
         if (modalRoot) return;
 
         modalRoot = document.createElement('div');
-        modalRoot.className = 'rp-sync-modal';
-        modalRoot.innerHTML = `
+        modalRoot.className = RESTORE_PAGE
+            ? 'rp-sync-modal rp-sync-modal--restore'
+            : 'rp-sync-modal';
+        modalRoot.innerHTML = RESTORE_PAGE ? `
+            <div class="rp-sync-modal__backdrop"></div>
+            <main class="rp-sync-modal__panel" aria-live="polite">
+                <h1 class="rp-sync-modal__title-main">恢复数据</h1>
+                <p class="rp-sync-modal__status">正在恢复…</p>
+                <div class="rp-sync-progress">
+                    <div class="rp-sync-progress__bar"></div>
+                </div>
+                <div class="rp-sync-progress__value">0%</div>
+                <div class="rp-sync-restore-actions">
+                    <button type="button" class="rp-sync-modal__button is-primary" data-action="pull">重试</button>
+                    <button type="button" class="rp-sync-modal__button" data-action="return">返回</button>
+                </div>
+            </main>
+        ` : `
             <div class="rp-sync-modal__backdrop"></div>
             <div class="rp-sync-modal__panel">
                 <div class="rp-sync-modal__header">
@@ -2270,35 +2519,29 @@
         modalProgressBar = modalRoot.querySelector('.rp-sync-progress__bar');
         modalProgressValue = modalRoot.querySelector('.rp-sync-progress__value');
         pullButton = modalRoot.querySelector('[data-action="pull"]');
+
+        if (RESTORE_PAGE) {
+            pullButton.addEventListener('click', () => pullFromServer().catch(showSyncError));
+            modalRoot.querySelector('[data-action="return"]').addEventListener('click', () => location.replace('/'));
+            return;
+        }
+
         pushButton = modalRoot.querySelector('[data-action="push"]');
         rebuildButton = modalRoot.querySelector('[data-action="rebuild"]');
         // 重建是恢复手段不是常规操作：默认隐藏。推送遇索引错误时经确认
         // 自动重建并继续；拒绝时才显示按钮走手动路径。
         rebuildButton.style.display = 'none';
 
-        const closeButton = modalRoot.querySelector('.rp-sync-modal__close');
-        if (RESTORE_PAGE) {
-            modalRoot.classList.add('rp-sync-modal--restore');
-            pullButton.textContent = '重新恢复';
-            pushButton.style.display = 'none';
-            closeButton.textContent = '返回';
-            closeButton.setAttribute('aria-label', '返回');
-        }
-        closeButton.addEventListener('click', () => {
-            if (RESTORE_PAGE && !state.syncing) {
-                location.replace('/');
-                return;
-            }
-            closeModal();
-        });
+        modalRoot.querySelector('.rp-sync-modal__close').addEventListener('click', closeModal);
         modalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', () => {
             if (!state.syncing) closeModal();
         });
-        if (pullButton) pullButton.addEventListener('click', () => {
-            if (RESTORE_PAGE) { pullFromServer().catch(showSyncError); return; }
-            if (confirm('从云端恢复将替换此浏览器的本地数据，其他已打开的页面会刷新。继续吗？')) location.assign('/sync-restore');
+        pullButton.addEventListener('click', () => {
+            if (confirm('从云端恢复将替换此浏览器的本地数据。继续吗？')) {
+                location.replace('/sync-restore');
+            }
         });
-        modalRoot.querySelector('[data-action="rebuild"]').addEventListener('click', async () => {
+        rebuildButton.addEventListener('click', async () => {
             if (state.syncing || !confirm('这会完整读取本地数据重建索引，但不会上传或覆盖云端。请先导出本地数据备份。继续吗？')) return;
             await withCrossTabSyncLock(async () => {
                 state.syncing = true;
@@ -2354,21 +2597,18 @@
         }
         const snapshot = incremental.snapshot;
         if (statusResponse.resetRequired) {
-            updateProgress(progress.check, '正在一次性清理旧云端同步数据…');
-            let cursor;
-            do {
-                const migration = await postSync({ action: 'reset-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION, cursor });
-                cursor = migration.cursor || null;
-            } while (cursor);
-            // One-time schema 12 cleanup wiped the remote dataset; the old
-            // acknowledged baseline no longer refers to any cloud version.
-            localStorage.removeItem(BASELINE_KEY);
+            updateProgress(progress.check, '正在初始化新版同步协议…');
+            await postSync({ action: 'initialize-storage', schemaVersion: SNAPSHOT_SCHEMA_VERSION });
             baseRemote = null;
             baseVersion = 0;
             baseChecksum = '';
         }
         if (baseRemote?.checksum === snapshot.checksum) {
-            localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: baseRemote.version, checksum: snapshot.checksum }));
+            localStorage.setItem(BASELINE_KEY, JSON.stringify({
+                version: baseRemote.version,
+                checksum: snapshot.checksum,
+                schemaVersion: SNAPSHOT_SCHEMA_VERSION
+            }));
             await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
             return true;
         }
@@ -2376,54 +2616,21 @@
             throw new Error('云端与此浏览器的已确认基线不同，已停止上传以防覆盖。请先导出本地数据，再恢复云端并合并本地修改。');
         }
 
-        updateProgress(progress.uploadStart, '正在上传…');
-        await uploadCachedSnapshot(
-            iterateMissingUploadPacks(snapshot, baseRemote?.packManifest),
-            snapshot.totalBytes,
-            progress.uploadStart,
-            progress.uploadEnd
-        );
-
-        updateProgress(progress.commit, '即将完成…');
-        const payload = {
-            action: 'upload-complete',
+        updateProgress(progress.uploadStart, '正在上传并分页校验…');
+        const committedRemote = await resumePagedUpload(
+            snapshot,
             baseVersion,
             baseChecksum,
-            checksum: snapshot.checksum,
-            snapshotFormat: snapshot.snapshotFormat,
-            schemaVersion: snapshot.schemaVersion,
-            packCount: snapshot.packCount,
-            entryCount: snapshot.entryCount,
-            totalBytes: snapshot.totalBytes,
-            packManifest: snapshot.packManifest
-        };
-        const submit = () => postSync(payload, { retryCount: 1, timeoutMs: CONFIG.commitTimeoutMs });
-        let commitResponse;
-        try {
-            commitResponse = await submit();
-        } catch (error) {
-            if (error.status !== 409 || !Array.isArray(error.response?.missingPacks)) throw error;
-            const missing = new Set(error.response.missingPacks);
-            const packs = snapshot.packManifest.filter(pack => missing.has(pack.checksum));
-            await uploadCachedSnapshot(
-                (async function* () {
-                    const unique = new Set();
-                    for (const pack of packs) {
-                        if (unique.has(pack.checksum)) continue;
-                        unique.add(pack.checksum);
-                        yield pack;
-                    }
-                })(),
-                snapshot.totalBytes,
-                progress.uploadEnd,
-                progress.commit
-            );
-            commitResponse = await submit();
-        }
-        if (commitResponse.checksum !== snapshot.checksum) {
+            progress
+        );
+        if (committedRemote?.checksum !== snapshot.checksum) {
             throw new Error('服务器没有确认新快照。');
         }
-        localStorage.setItem(BASELINE_KEY, JSON.stringify({ version: commitResponse.version, checksum: snapshot.checksum }));
+        localStorage.setItem(BASELINE_KEY, JSON.stringify({
+            version: committedRemote.version,
+            checksum: snapshot.checksum,
+            schemaVersion: SNAPSHOT_SCHEMA_VERSION
+        }));
         await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
         return baseRemote?.checksum === snapshot.checksum;
     }
@@ -2436,18 +2643,17 @@
         try {
             openModal();
             setActionButtonsDisabled(true);
-            await waitForIndexedDbWriteBarrier();
-            updateProgress(4, '正在连接…');
+            updateProgress(4, '正在恢复…');
             const manifestResponse = await postSync({ action: 'pull-manifest', schemaVersion: SNAPSHOT_SCHEMA_VERSION });
             if (manifestResponse.resetRequired) {
-                throw new Error('云端同步存储尚未完成升级清理。请先在主页面执行一次“上传到云端”，再回到此页恢复。');
+                throw new Error('云端数据尚未准备好，请先完成一次上传。');
             }
             const remote = manifestResponse.remote;
 
             if (!remote) {
-                updateProgress(100, '暂无云端数据');
+                updateProgress(100, '没有可恢复的数据');
                 setActionButtonsDisabled(false);
-                if (RESTORE_PAGE) setTimeout(() => location.replace('/'), 700);
+                if (RESTORE_PAGE) location.replace('/');
                 return;
             }
             if (Number(remote.totalBytes || 0) > CONFIG.maxSnapshotBytes) {
@@ -2455,16 +2661,18 @@
             }
 
             if (remote.snapshotFormat !== SNAPSHOT_FORMAT) {
-                throw new Error('服务器快照格式不受支持。');
+                throw new Error('云端数据格式不受支持。');
             }
-            updateProgress(8, '正在下载…');
+            updateProgress(8, '正在恢复…');
             await restorePackSnapshot(remote);
 
-            updateProgress(100, '已完成，正在刷新…');
-            setTimeout(() => {
-                if (RESTORE_PAGE) location.replace('/');
-                else location.reload();
-            }, 700);
+            updateProgress(100, '恢复完成');
+            setActionButtonsDisabled(false);
+            if (RESTORE_PAGE) {
+                location.replace('/');
+            } else {
+                location.reload();
+            }
         } catch (error) {
             showSyncError(error);
             if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');

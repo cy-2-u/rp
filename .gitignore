@@ -2,3 +2,5 @@
 *.log
 *.tmp
 *.tmp.mjs
+.zcode/
+page.zip

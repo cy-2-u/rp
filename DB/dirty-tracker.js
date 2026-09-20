@@ -5,7 +5,10 @@
     const JOURNAL = '__rp_sync_journal_v2';
     const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
-    const RESTORE_PAGE = location.pathname === '/sync-restore';
+    const RESTORE_PAGE = Boolean(
+        document.documentElement?.hasAttribute?.('data-rp-sync-restore')
+        || location.pathname === '/sync-restore'
+    );
     const KNOWN_STORES = { RPHubDB: ['store'], AICharGen: ['characters'] };
     const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';

@@ -87,11 +87,28 @@
     border-color: rgba(156, 163, 175, 0.9);
 }
 
-.rp-sync-modal--restore .rp-sync-modal__close {
-    width: auto;
-    padding: 0 12px;
+.rp-sync-modal--restore .rp-sync-modal__panel {
+    width: min(88vw, 360px);
+    max-height: none;
+    overflow: visible;
     border-radius: 8px;
-    font-size: 13px;
+    padding: 20px;
+}
+
+.rp-sync-modal--restore .rp-sync-modal__title-main,
+.rp-sync-modal--restore .rp-sync-modal__status {
+    text-align: center;
+}
+
+.rp-sync-restore-actions {
+    display: none;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.rp-sync-modal--restore.is-error .rp-sync-restore-actions {
+    display: flex;
 }
 
 .rp-sync-modal.is-error .rp-sync-modal__status,
@@ -285,6 +302,18 @@
         height: 42px;
         font-size: 14px;
         border-radius: 12px;
+    }
+
+    .rp-sync-modal--restore .rp-sync-modal__panel {
+        left: 50%;
+        right: auto;
+        bottom: auto;
+        top: 50%;
+        width: min(88vw, 360px);
+        transform: translate(-50%, -50%);
+        border: 1px solid rgba(229, 231, 235, 0.95);
+        border-radius: 8px;
+        padding: 20px;
     }
 
 }

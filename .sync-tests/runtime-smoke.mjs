@@ -98,372 +98,6 @@ async function readFromUpstream(relative) {
     return fs.readFile(path.join(upstreamRoot, relative), 'utf8');
 }
 
-async function testEmptySnapshotProtocol() {
-    const objects = new Map();
-    const bucket = makeR2BucketMock(objects);
-    const worker = await loadWorker();
-    const env = { RP_SYNC_R2: bucket };
-    const post = payload => worker.fetch(new Request('https://local.test/api/rp-sync', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
-    }), env, {});
-    const checksum = await (async () => {
-        const source = JSON.stringify([
-            'rp-sync-bounded-jsonl-v3',
-            12,
-            0,
-            0,
-            0,
-            []
-        ]);
-        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
-        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
-    })();
-
-    await bucket.put('rp-sync/main/migration-v12.done', '1');
-    const payload = {
-        action: 'upload-complete',
-        baseVersion: 0,
-        baseChecksum: '',
-        checksum,
-        snapshotFormat: 'rp-sync-bounded-jsonl-v3',
-        schemaVersion: 12,
-        packCount: 0,
-        entryCount: 0,
-        totalBytes: 0,
-        packManifest: []
-    };
-    const committed = await post(payload);
-    assert.equal(committed.status, 200, 'a zero-record snapshot must be accepted');
-    const committedBody = await committed.json();
-    assert.equal(committedBody.checksum, checksum);
-    const manifest = JSON.parse(Buffer.from(objects.get('rp-sync/main/manifest.json').bytes).toString('utf8'));
-    assert.deepEqual({
-        packCount: manifest.packCount,
-        entryCount: manifest.entryCount,
-        totalBytes: manifest.totalBytes,
-        packManifest: manifest.packManifest
-    }, { packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
-
-    const pulled = await post({ action: 'pull-manifest', schemaVersion: 12 });
-    assert.equal(pulled.status, 200);
-    const pulledBody = await pulled.json();
-    assert.deepEqual({
-        packCount: pulledBody.remote.packCount,
-        entryCount: pulledBody.remote.entryCount,
-        totalBytes: pulledBody.remote.totalBytes,
-        packManifest: pulledBody.remote.packManifest
-    }, { packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
-
-    const repeated = await post(payload);
-    assert.equal(repeated.status, 200, 'repeating the same empty commit must be idempotent');
-    for (const partial of [
-        { packCount: 0, entryCount: 1, totalBytes: 0 },
-        { packCount: 1, entryCount: 0, totalBytes: 1 },
-        { packCount: 1, entryCount: 1, totalBytes: 0 }
-    ]) {
-        const response = await post({ ...payload, checksum: 'f'.repeat(64), ...partial });
-        assert.ok(response.status >= 400, 'partially empty snapshots must be rejected');
-    }
-}
-
-async function testOrphanPackGc() {
-    const worker = await loadWorker();
-    const env = { RP_SYNC_R2: null };
-    const now = Date.now();
-    const HOUR = 60 * 60 * 1000;
-    const streamFormat = 'rp-sync-bounded-jsonl-v3';
-    const packKey = hex => `rp-sync/main/packs/${hex}.bin`;
-
-    // Replicates buildStreamSnapshotChecksumSource so seeded manifests and
-    // commits pass the worker-side snapshot checksum validation.
-    const snapshotChecksum = async packManifest => {
-        const totalBytes = packManifest.reduce((sum, pack) => sum + pack.length, 0);
-        const entryCount = packManifest.reduce((sum, pack) => sum + pack.entryCount, 0);
-        const source = JSON.stringify([
-            streamFormat,
-            12,
-            totalBytes,
-            packManifest.length,
-            entryCount,
-            packManifest.map(pack => [pack.bucketKey, pack.group, pack.part, pack.checksum, pack.length, pack.entryCount])
-        ]);
-        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
-        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
-    };
-    const referencedOld = { bucketKey: 'b1', group: 'g', part: 0, checksum: 'a'.repeat(64), length: 4, entryCount: 1 };
-    const referencedNew = { ...referencedOld, bucketKey: 'b2' };
-    const seedManifestObject = checksum => ({
-        key: 'rp-sync/main/manifest.json',
-        bytes: Buffer.from(JSON.stringify({
-            version: 7,
-            checksum,
-            updatedAt: now,
-            totalBytes: 4,
-            packCount: 1,
-            entryCount: 1,
-            packManifest: [referencedOld],
-            snapshotFormat: streamFormat,
-            schemaVersion: 12
-        })),
-        size: JSON.stringify({
-            version: 7,
-            checksum,
-            updatedAt: now,
-            totalBytes: 4,
-            packCount: 1,
-            entryCount: 1,
-            packManifest: [referencedOld],
-            snapshotFormat: streamFormat,
-            schemaVersion: 12
-        }).length,
-        etag: '"m1"',
-        uploaded: new Date(now - 2 * HOUR)
-    });
-
-    const commit = async (objects, hooks, base, useCtx = true) => {
-        const waitList = [];
-        const bucket = makeR2BucketMock(objects, hooks);
-        env.RP_SYNC_R2 = bucket;
-        const ctx = useCtx ? { waitUntil: promise => waitList.push(promise) } : {};
-        const response = await worker.fetch(new Request('https://local.test/api/rp-sync', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-                action: 'upload-complete',
-                schemaVersion: 12,
-                snapshotFormat: streamFormat,
-                baseVersion: base.baseVersion,
-                baseChecksum: base.baseChecksum,
-                checksum: base.checksum,
-                packCount: base.packCount,
-                entryCount: base.entryCount,
-                totalBytes: base.totalBytes,
-                packManifest: base.packManifest
-            })
-        }), env, ctx);
-        for (const promise of waitList) await promise;
-        return response;
-    };
-
-    // Scenario 1: expired orphans vanish while packs referenced by the newly
-    // committed manifest, young orphans and other namespaces survive.
-    {
-        const oldChecksum = await snapshotChecksum([referencedOld]);
-        const newChecksum = await snapshotChecksum([referencedNew]);
-        const objects = new Map();
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
-        objects.set(packKey('a'.repeat(64)), { key: packKey('a'.repeat(64)), bytes: Buffer.from([1, 2, 3, 4]), size: 4, etag: '"a"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set(packKey('b'.repeat(64)), { key: packKey('b'.repeat(64)), bytes: Buffer.from([5, 6, 7, 8]), size: 4, etag: '"b"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set(packKey('e'.repeat(64)), { key: packKey('e'.repeat(64)), bytes: Buffer.from([9]), size: 1, etag: '"e"', uploaded: new Date(now - 12 * HOUR) });
-        objects.set('rp-sync/other/notes.txt', { key: 'rp-sync/other/notes.txt', bytes: Buffer.from('keep'), size: 4, etag: '"o"', uploaded: new Date(now - 48 * HOUR) });
-        const response = await commit(objects, {}, {
-            baseVersion: 7,
-            baseChecksum: oldChecksum,
-            checksum: newChecksum,
-            packCount: 1,
-            entryCount: 1,
-            totalBytes: 4,
-            packManifest: [referencedNew]
-        });
-        assert.equal(response.status, 200, 'the GC scenario expects a committed snapshot');
-        assert.ok(objects.has(packKey('a'.repeat(64))), 'packs referenced by the committed manifest must survive GC');
-        assert.ok(!objects.has(packKey('b'.repeat(64))), 'expired orphan packs must be deleted');
-        assert.ok(objects.has(packKey('e'.repeat(64))), 'orphan packs inside the grace period must be kept');
-        assert.ok(objects.has('rp-sync/other/notes.txt'), 'objects outside the pack namespace must be kept');
-    }
-
-    // Scenario 2: objects without readable uploaded metadata are never
-    // considered expired, so they are preserved.
-    {
-        const objects = new Map();
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set(packKey('f'.repeat(64)), { key: packKey('f'.repeat(64)), bytes: Buffer.from([1]), size: 1, etag: '"f"' });
-        const response = await commit(objects, {}, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
-        assert.equal(response.status, 200);
-        assert.ok(objects.has(packKey('f'.repeat(64))), 'packs without uploaded metadata must be preserved');
-    }
-
-    // Scenario 3: a degraded R2 list after the commit request itself must not
-    // break anything; the GC swallows the error.
-    {
-        const objects = new Map();
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        const response = await commit(objects, { throwOnList: 1 }, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
-        assert.equal(response.status, 200, 'GC list failures must not affect the committed response');
-    }
-
-    // Scenario 4: a failing GC delete must not affect the committed response.
-    {
-        const oldChecksum = await snapshotChecksum([referencedOld]);
-        const objects = new Map();
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
-        objects.set(packKey('b'.repeat(64)), { key: packKey('b'.repeat(64)), bytes: Buffer.from([5]), size: 1, etag: '"b"', uploaded: new Date(now - 48 * HOUR) });
-        const response = await commit(objects, { throwOnDelete: new Error('delete degraded') }, { baseVersion: 7, baseChecksum: oldChecksum, checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] });
-        assert.equal(response.status, 200, 'GC delete failures must not affect the committed response');
-        assert.ok(objects.has(packKey('b'.repeat(64))), 'the orphan stays when deletion fails');
-    }
-
-    // Scenario 5: without waitUntil the returned GC promise still completes
-    // within the process.
-    {
-        const objects = new Map();
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set(packKey('1'.repeat(64)), { key: packKey('1'.repeat(64)), bytes: Buffer.from([1]), size: 1, etag: '"p1"', uploaded: new Date(now - 48 * HOUR) });
-        const response = await commit(objects, {}, { baseVersion: 0, baseChecksum: '', checksum: await snapshotChecksum([]), packCount: 0, entryCount: 0, totalBytes: 0, packManifest: [] }, false);
-        assert.equal(response.status, 200, 'first-commit empty snapshot must succeed before GC');
-        for (let tick = 0; tick < 5; tick += 1) await new Promise(resolve => setImmediate(resolve));
-        assert.ok(!objects.has(packKey('1'.repeat(64))), 'first-commit GC must remove orphans when nothing is referenced');
-        assert.ok(objects.has('rp-sync/main/manifest.json'), 'the fresh manifest must survive its own GC run');
-    }
-
-    // Scenario 6: a pre-GC orphan backlog larger than the commit scan budget
-    // (32 pages x 1000 keys) used to deadlock — the 503 meant no commit and
-    // therefore no GC. The verification-503 path must schedule the GC so each
-    // attempt shaves the backlog (up to 1000 packs) until verification fits.
-    {
-        const objects = new Map();
-        const oldChecksum = await snapshotChecksum([referencedOld]);
-        const newChecksum = await snapshotChecksum([referencedNew]);
-        objects.set('rp-sync/main/migration-v12.done', { key: 'rp-sync/main/migration-v12.done', bytes: Buffer.from('1'), size: 1, etag: '"mk"', uploaded: new Date(now - 48 * HOUR) });
-        objects.set('rp-sync/main/manifest.json', seedManifestObject(oldChecksum));
-        // Pack 'a' is both the currently referenced pack and the new
-        // manifest's only pack; 32100 expired orphans sort BEFORE it
-        // (hex digits < 'a'), pushing it beyond the 32-page scan budget.
-        objects.set(packKey('a'.repeat(64)), { key: packKey('a'.repeat(64)), bytes: Buffer.from([1, 2, 3, 4]), size: 4, etag: '"a"', uploaded: new Date(now - 48 * HOUR) });
-        for (let index = 0; index < 32100; index += 1) {
-            const checksum = index.toString(16).padStart(4, '0').padEnd(64, '0');
-            objects.set(packKey(checksum), { key: packKey(checksum), bytes: Buffer.from([1]), size: 1, etag: `"o${index}"`, uploaded: new Date(now - 48 * HOUR) });
-        }
-        const first = await commit(objects, {}, {
-            baseVersion: 7,
-            baseChecksum: oldChecksum,
-            checksum: newChecksum,
-            packCount: 1,
-            entryCount: 1,
-            totalBytes: 4,
-            packManifest: [referencedNew]
-        });
-        assert.equal(first.status, 503, 'the oversized backlog must exhaust the commit scan budget');
-        assert.equal(objects.has('rp-sync/main/manifest.json'), true, 'the failed commit must not touch data');
-        // The 503-path GC deletes exactly 1000 expired orphans per attempt and
-        // must keep the referenced pack.
-        const packsLeft = [...objects.keys()].filter(key => key.startsWith('rp-sync/main/packs/')).length;
-        assert.equal(packsLeft, 32101 - 1000, 'the 503-path GC must delete ~1000 orphans per attempt');
-        // Retry: the shrunken listing now fits the 32-page budget end-to-end.
-        const second = await commit(objects, {}, {
-            baseVersion: 7,
-            baseChecksum: oldChecksum,
-            checksum: newChecksum,
-            packCount: 1,
-            entryCount: 1,
-            totalBytes: 4,
-            packManifest: [referencedNew]
-        });
-        assert.equal(second.status, 200, 'the retry must commit once the backlog fits the scan budget');
-        assert.equal(objects.has(packKey('a'.repeat(64))), true, 'the committed pack must survive');
-    }
-}
-
-async function testManifestEtagCache() {
-    const sha256Hex = async text => {
-        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
-    };
-    const packChecksum = 'a'.repeat(64);
-    const manifestKey = 'rp-sync/main/manifest.json';
-    const packKey = `rp-sync/main/packs/${packChecksum}.bin`;
-    const buildManifest = async version => {
-        const core = {
-            version,
-            updatedAt: 1700000000000 + version,
-            totalBytes: 4,
-            packCount: 1,
-            entryCount: 1,
-            packManifest: [{
-                bucketKey: 'bucket-1',
-                group: 'group-1',
-                part: 0,
-                checksum: packChecksum,
-                length: 4,
-                entryCount: 1
-            }],
-            snapshotFormat: 'rp-sync-bounded-jsonl-v3',
-            schemaVersion: 12
-        };
-        core.checksum = await sha256Hex(JSON.stringify([
-            'rp-sync-bounded-jsonl-v3',
-            core.schemaVersion,
-            core.totalBytes,
-            core.packCount,
-            core.entryCount,
-            core.packManifest.map(pack => [pack.bucketKey, pack.group, pack.part, pack.checksum, pack.length, pack.entryCount])
-        ]));
-        return core;
-    };
-    const objects = new Map();
-    const counters = { manifestGet: 0 };
-    let etagCounter = 0;
-    const bucket = {
-        head: async key => {
-            const object = objects.get(key);
-            return object ? { key, etag: object.etag, size: object.size } : null;
-        },
-        get: async key => {
-            if (key === manifestKey) counters.manifestGet += 1;
-            const object = objects.get(key);
-            if (!object) return null;
-            return {
-                key,
-                etag: object.etag,
-                size: object.size,
-                text: async () => Buffer.from(object.bytes).toString('utf8'),
-                body: new Uint8Array(object.bytes)
-            };
-        },
-        put: async (key, value) => {
-            const bytes = value instanceof Uint8Array ? value : new Uint8Array(await new Response(value).arrayBuffer());
-            etagCounter += 1;
-            const etag = `etag-${etagCounter}`;
-            objects.set(key, { bytes, etag, size: bytes.byteLength });
-            return { key, etag };
-        }
-    };
-    const worker = await loadWorker();
-    const env = { RP_SYNC_R2: bucket };
-    const post = payload => worker.fetch(new Request('https://local.test/api/rp-sync', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload)
-    }), env, {});
-
-    await bucket.put('rp-sync/main/migration-v12.done', '1');
-    await bucket.put(manifestKey, new TextEncoder().encode(JSON.stringify(await buildManifest(1))));
-    await bucket.put(packKey, new TextEncoder().encode('one\n'));
-
-    const first = await post({ action: 'pull-manifest', schemaVersion: 12 });
-    assert.equal(first.status, 200);
-    assert.equal((await first.json()).remote.version, 1);
-    assert.equal(counters.manifestGet, 1);
-
-    const second = await post({ action: 'pull-manifest', schemaVersion: 12 });
-    assert.equal((await second.json()).remote.version, 1);
-    assert.equal(counters.manifestGet, 1, 'second manifest read must come from the etag cache');
-
-    const packPull = await post({ action: 'pull-pack', version: 1, checksum: packChecksum });
-    assert.equal(packPull.status, 200);
-    assert.equal(new Uint8Array(await packPull.arrayBuffer()).byteLength, 4);
-    assert.equal(counters.manifestGet, 1, 'pack pulls must reuse the cached manifest');
-
-    await bucket.put(manifestKey, new TextEncoder().encode(JSON.stringify(await buildManifest(2))));
-    const third = await post({ action: 'pull-manifest', schemaVersion: 12 });
-    assert.equal((await third.json()).remote.version, 2);
-    assert.equal(counters.manifestGet, 2, 'a changed manifest etag must invalidate the cache');
-}
-
 async function loadUploadEngine() {
     // 引擎已并进 DB/bootstrap.js 头部；注入一个无关路径让同步面板 IIFE
     // 自行提前返回，只留引擎本体在上下文里运行。
@@ -600,49 +234,13 @@ async function testAppJsRewriteCache() {
     assert.equal(upstreamBodyDownloads, 2, 'changed upstream must be fetched and rewritten again');
 }
 
-async function testUploadBatchEndpoint() {
-    const objects = new Map();
-    const bucket = {
-        head: async key => key.endsWith('migration-v12.done') ? { key } : objects.get(key) || null,
-        put: async (key, value, options) => {
-            const bytes = value instanceof ArrayBuffer
-                ? new Uint8Array(value)
-                : value instanceof Uint8Array
-                    ? new Uint8Array(value)
-                    : new Uint8Array(await new Response(value).arrayBuffer());
-            objects.set(key, { key, bytes, size: bytes.byteLength, options });
-            return { key };
-        }
-    };
-    const worker = await loadWorker();
-    const definitions = [
-        { checksum: 'a'.repeat(64), length: 4 },
-        { checksum: 'b'.repeat(64), length: 3 }
-    ];
-    const header = new TextEncoder().encode(JSON.stringify(definitions));
-    const body = new Uint8Array(4 + header.byteLength + 7);
-    new DataView(body.buffer).setUint32(0, header.byteLength);
-    body.set(header, 4);
-    body.set(new TextEncoder().encode('one\n'), 4 + header.byteLength);
-    body.set(new TextEncoder().encode('two'), 4 + header.byteLength + 4);
-    const response = await worker.fetch(new Request('https://local.test/api/rp-sync?action=upload-pack-batch', {
-        method: 'POST',
-        headers: {
-            'content-type': 'application/octet-stream',
-            'content-length': String(body.byteLength)
-        },
-        body
-    }), { RP_SYNC_R2: bucket }, {});
-    assert.equal(response.status, 204);
-    assert.equal(objects.get(`rp-sync/main/packs/${'a'.repeat(64)}.bin`).size, 4);
-    assert.equal(objects.get(`rp-sync/main/packs/${'b'.repeat(64)}.bin`).size, 3);
-}
-
 async function testBootstrapUsesBoundedEngine() {
     const bootstrap = await read('DB/bootstrap.js');
     assert.match(bootstrap, /window\.RPH_SYNC_UPLOAD_ENGINE/);
-    assert.match(bootstrap, /async function\* iterateMissingUploadPacks/);
-    assert.doesNotMatch(bootstrap, /const batches = \[\]/);
+    assert.match(bootstrap, /async function resumePagedUpload/);
+    assert.match(bootstrap, /action: 'upload-pack'/);
+    assert.match(bootstrap, /uploadBatchMaxPacks: 1/);
+    assert.doesNotMatch(bootstrap, /upload-pack-batch|upload-complete|reset-upload/);
 }
 
 async function testAdapterConfigEndpoint() {
@@ -678,57 +276,6 @@ async function testAdapterConfigEndpoint() {
     const failed = await failingWorker.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(failed.status, 503);
     assert.deepEqual(await failed.json(), { ok: false });
-}
-
-async function testSchema12MigrationCleanup() {
-    const objects = new Map([
-        ['rp-sync/main/manifest.json', 'old v11 manifest'],
-        ['rp-sync/main/packs/old.bin', 'old pack'],
-        ['rp-sync/main/migration-v11.done', 'old marker'],
-        ['rp-sync/other-dataset/data', 'other dataset'],
-        ['rp-images/characters/keep/a', 'image bytes'],
-        ['rp-images/thumbs/keep/a.webp', 'thumb bytes']
-    ]);
-    for (let index = 0; index < 1200; index += 1) {
-        objects.set(`rp-sync/main/packs/old-${String(index).padStart(4, '0')}.bin`, 'x');
-    }
-    const sortedKeys = () => [...objects.keys()].sort();
-    const bucket = {
-        head: async key => objects.has(key) ? { key } : null,
-        put: async (key, value) => { objects.set(key, value); return { key }; },
-        delete: async keys => { for (const key of keys) objects.delete(key); },
-        list: async ({ prefix, cursor, limit = 1000 } = {}) => {
-            const keys = sortedKeys().filter(key => key.startsWith(prefix));
-            const start = cursor ? keys.indexOf(cursor) + 1 : 0;
-            const page = keys.slice(start, start + limit);
-            const truncated = start + limit < keys.length;
-            return {
-                objects: page.map(key => ({ key, size: 8 })),
-                truncated,
-                cursor: truncated ? page[page.length - 1] : undefined
-            };
-        }
-    };
-    const worker = await loadWorker();
-    const post = payload => worker.fetch(new Request('https://local.test/api/rp-sync', {
-        method: 'POST', body: JSON.stringify(payload)
-    }), { RP_SYNC_R2: bucket }, {});
-    const page1 = await (await post({ action: 'reset-upload', schemaVersion: 12 })).json();
-    assert.equal(page1.done, false, 'large cleanups must continue across list pages');
-    assert.equal(objects.has('rp-sync/main/migration-v12.done'), false, 'marker must not exist before cleanup finishes');
-    const page2 = await (await post({ action: 'reset-upload', schemaVersion: 12, cursor: page1.cursor })).json();
-    assert.equal(page2.done, true);
-    assert.equal(objects.has('rp-sync/main/migration-v12.done'), true);
-    assert.equal(objects.has('rp-sync/main/manifest.json'), false, 'old manifest must be deleted');
-    assert.equal(objects.has('rp-sync/main/migration-v11.done'), false, 'old marker must be deleted');
-    assert.equal(objects.size, 4, 'only images and non-main sync namespaces must survive');
-    assert.equal(objects.has('rp-sync/other-dataset/data'), true);
-    assert.equal(objects.has('rp-images/characters/keep/a'), true);
-    assert.equal(objects.has('rp-images/thumbs/keep/a.webp'), true);
-    const again = await (await post({ action: 'reset-upload', schemaVersion: 12 })).json();
-    assert.equal(again.done, true, 'a migrated bucket must return immediately without re-scanning');
-    const denied = await post({ action: 'reset-upload', schemaVersion: 11 });
-    assert.equal(denied.status, 409, 'old schema versions must be rejected');
 }
 
 function makeR2BucketMock(objects, hooks = {}) {
@@ -783,63 +330,6 @@ function makeR2BucketMock(objects, hooks = {}) {
             };
         }
     };
-}
-
-async function testSyncPasswordFlow() {
-    const objects = new Map();
-    const bucket = makeR2BucketMock(objects);
-    const worker = await loadWorker();
-    const env = { RP_SYNC_R2: bucket, RP_SYNC_PASSWORD: 'secret' };
-    const post = (payload, headers = {}) => worker.fetch(new Request('https://local.test/api/rp-sync', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...headers },
-        body: JSON.stringify(payload)
-    }), env, {});
-
-    const anonymous = await (await post({ action: 'auth-status' })).json();
-    assert.equal(anonymous.ok, true);
-    assert.equal(anonymous.authRequired, true);
-    assert.equal(anonymous.authenticated, false);
-
-    const denied = await post({ action: 'prepare-upload', schemaVersion: 12 });
-    assert.equal(denied.status, 401);
-    assert.equal((await denied.json()).authRequired, true);
-
-    const wrongPassword = await post({ action: 'prepare-upload', schemaVersion: 12 }, { 'x-rp-sync-password': 'nope' });
-    assert.equal(wrongPassword.status, 401);
-
-    const staleClient = await post({ action: 'pull-manifest' }, { 'x-rp-sync-password': 'secret' });
-    assert.equal(staleClient.status, 409, 'pull-manifest without a current schemaVersion must tell stale pages to refresh');
-
-    const allowed = await post({ action: 'pull-manifest', schemaVersion: 12 }, { 'x-rp-sync-password': 'secret' });
-    assert.equal(allowed.status, 200);
-    const allowedBody = await allowed.json();
-    assert.equal(allowedBody.resetRequired, true, 'unmigrated buckets must request schema 12 cleanup');
-    assert.equal(allowedBody.remote, null);
-
-    await bucket.put('rp-sync/main/migration-v12.done', '1');
-    const migrated = await post({ action: 'pull-manifest', schemaVersion: 12 }, { 'x-rp-sync-password': 'secret' });
-    assert.equal(migrated.status, 200);
-    const migratedBody = await migrated.json();
-    assert.equal(migratedBody.resetRequired, false);
-    assert.equal(migratedBody.remote, null, 'no manifest must read as empty, not as an error');
-
-    const batch = await worker.fetch(new Request('https://local.test/api/rp-sync?action=upload-pack-batch', {
-        method: 'POST',
-        headers: { 'content-type': 'application/octet-stream' },
-        body: new Uint8Array(8)
-    }), env, {});
-    assert.equal(batch.status, 401, 'the binary batch endpoint must enforce the password too');
-
-    const open = await worker.fetch(new Request('https://local.test/api/rp-sync', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'auth-status' })
-    }), { RP_SYNC_R2: bucket }, {});
-    assert.equal(open.status, 200, 'no configured password must mean open access');
-    const openBody = await open.json();
-    assert.equal(openBody.authRequired, false);
-    assert.equal(openBody.authenticated, true);
 }
 
 async function testImageAdminApi() {
@@ -1166,6 +656,17 @@ async function testCatchAllProxy() {
     }
     assert.equal(upstreamCalls.length, 0, 'local assets must be served without an upstream request');
 
+    const restorePage = await worker.fetch(new Request('https://local.test/sync-restore'), env, {});
+    const restoreHtml = await restorePage.text();
+    assert.equal(restorePage.status, 200);
+    assert.match(restoreHtml, /<html[^>]*data-rp-sync-restore/, 'restore mode must use an explicit internal document marker');
+    assert.match(restoreHtml, /<link rel="stylesheet" href="\/DB\/styles\.css">/);
+    assert.match(restoreHtml, /<script src="\/DB\/dirty-tracker\.js"><\/script>/);
+    assert.match(restoreHtml, /<script src="\/DB\/bootstrap\.js"><\/script>/);
+    assert.doesNotMatch(restoreHtml, /magic-extension|assets\/js\/app\.js|上传到云端|重建本地索引/,
+        'the isolated restore document must not load the author app or normal sync actions');
+    assert.equal(upstreamCalls.length, 0, 'the internal restore document must never reach the author upstream');
+
     const updateCheck = await worker.fetch(new Request('https://local.test/assets/js/update-check.js'), env, {});
     assert.match(await updateCheck.text(), /useUpdateCheck\(\)\{\}/);
     assert.equal(upstreamCalls.length, 0, 'the update-check stub must never reach the author');
@@ -1479,8 +980,6 @@ async function testSourceCheckEnforcement() {
     assert.equal(await componentsAppJs.text(), appJsSource, 'a failed ui-components check must skip the rewrite too');
 }
 
-await testSchema12MigrationCleanup();
-await testSyncPasswordFlow();
 await testImageAdminApi();
 await testImageAdminInlineScriptSyntax();
 await testImageAdminPageRuntime();
@@ -1488,14 +987,10 @@ await testImageRenderApi();
 await testCatchAllProxy();
 await testSourceCheckEnforcement();
 await testAdapterFromFileUrl();
-    await testEmptySnapshotProtocol();
-    await testOrphanPackGc();
-    await testManifestEtagCache();
 await testAdapterConfigEndpoint();
 await testAppJsRewriteCache();
 await testBoundedUploadEngine();
 await testUploadEngineCleanup();
-await testUploadBatchEndpoint();
 await testBootstrapUsesBoundedEngine();
 console.log('runtime-smoke: ok');
 

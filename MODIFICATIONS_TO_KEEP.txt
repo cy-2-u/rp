@@ -1,297 +1,173 @@
-RP Hub 魔改版：当前实现与维护约定
-更新时间：2026-09-19
+RP Hub 魔改版：修改时必须保留的当前实现
+更新时间：2026-09-20
 
-一、运行结构
+一、部署与文件边界
 
-Worker 代理作者在线网页及其资源，本地不保存整份作者前端。
-项目仓库 github.com/cy-2-u/rp 即项目本体：代码、测试和说明文档都在仓库里，clone 即开发目录，改完 commit + push。
-作者网页：https://sta1n156.github.io/RP-Hub/
-作者页面负责角色、聊天、记忆、预设和正文渲染；魔改扩展负责云同步、聊天图片托管/固定/重绘和少量 UI。
-作者源码参考：仓库同级放一份 RP-Hub-main（或用 RPHUB_UPSTREAM_DIR 指定）；runtime-smoke 按环境变量 → 仓库同级 → 本机旧路径的顺序查找。
+1. 根目录 `_worker.js`、`magic-extension.js`、`DB/bootstrap.js`、`DB/dirty-tracker.js`、`DB/styles.css` 是正本。
+   `page/` 中同路径文件是部署副本，发布前必须逐字节一致；`page.zip` 只包含这五个文件。
 
-文件职责：
-- _worker.js：作者资源代理与源码替换、R2 图片接口/图库、同步 API；保持单文件 Worker。
-- magic-extension.js：图片请求共享、槽位记录保存、图片显示绑定、魔改 UI 入口及下滑按钮。
-- DB/bootstrap.js：同步缓存、分桶构包、受界限的上传、独立页面拉取恢复和同步面板；文件头部按字节内联了有界上传引擎与防抖保存桥（原 upload-engine.js / persistence-bridge.js 已并入并删除）。
-- adapter/rp-hub.json：适配清单正本（文件名与 id 固定，不含日期）；生产环境 Worker 硬编码的 GitHub Raw 地址拉取的就是仓库里这份文件，不随 Pages 资源打包。
-- DB/dirty-tracker.js：记录本地变动，并协调跨标签页恢复期间的写入暂停。
-- DB/styles.css：同步面板样式。
+2. Worker 保持单文件、无构建步骤。不要加入 import、顶层 await 或运行时依赖。
 
-二、部署配置
+3. R2 binding 固定为 `RP_SYNC_R2`；可选密码固定为 `RP_SYNC_PASSWORD`。
+   外部适配地址固定在 `_worker.js` 的 `DEFAULT_ADAPTER_URL`。
+   `RPHUB_ADAPTER_URL` 只允许本地 `file://` 测试覆盖。
 
-R2 绑定：RP_SYNC_R2。
-可选同步/图库密码：RP_SYNC_PASSWORD。不配置时沿用无密码访问。
-适配清单地址已硬编码进 Worker：https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json；部署不需要设置任何清单变量。RPHUB_ADAPTER_URL 仅保留为本地测试的 file:// 覆盖入口。
-Worker 不内置适配规则，只缓存外部清单 30 秒；清单仅维护者本人更新，不设防篡改校验（RPHUB_ADAPTER_SHA256 死代码已删除）。
-ASSETS 由 Pages 提供，部署时需要包含本地 DB 资源及 magic-extension.js；本地资源命中直出，未命中的全部路径（含作者未来新增页面）一律回源作者站点，不再维护代理路径清单。
-作者网页插入和源码替换规则由外部适配清单提供；GET /__rphub/adapter.json 返回当前 UI 配置摘要。
-Worker 对已经按适配清单改写过的 app.js 按适配对象和上游 etag 缓存结果；上游返回 304 时直接复用改写正文，避免重复下载和替换。
-本地测试：在 .sync-tests 目录执行 `npm test`（runtime-smoke 冒烟检查 + restore-sim 全流程同步模拟，使用 fake-indexeddb 与内存 R2）；也可先设置 `RPHUB_ADAPTER_URL=file:///D:/路径/adapter.json` 验证另一份本地清单。
+4. 未注册路径继续回源作者站。适配规则、source checks 和 UI 选择器继续放在 `adapter/rp-hub.json`，不要重新硬编码进 Worker。
 
-三、图片
+5. 作者页面适配必须全有或全无：任一 source check 或替换命中失败，返回作者原内容，不运行半份修改。
+   正常主页注入保持 4 个节点：styles.css、dirty-tracker、magic-extension、bootstrap；其他作者 HTML 页只注入 dirty-tracker。
 
-1. 正式图片协议沿用魔改版1：
-   /api/rp-image 参数请求；R2 key 为角色名称目录加参数 checksum。
-   checksum 保留 provider、nocache、reroll_nonce 的身份含义。
-   历史 provider 字段用于读取旧对象，不代表开启第三方生图。
+二、同步协议硬约束
 
-2. 图片生成仍使用标准上游；Worker 等 R2 写入成功后返回。
-   图片节点使用不含 token/generate 的 R2 读取 URL，不使用上游临时 URL。
-   首次生成和主动重新生成会提交生图请求；普通读取失败后的“重新加载”不调用生图。
+1. 当前协议：
+   - snapshot：`rp-sync-paged-jsonl-v4`
+   - schema：13
+   - root：`rp-sync-manifest-root-v1`
+   - page：`rp-sync-manifest-page-v1`
+   - upload session：`rp-sync-upload-session-v1`
 
-3. 任务职责分离：
-   - 网络请求按读取 URL 共享；
-   - 每个角色/消息/图片槽位独立提交固定记录；
-   - DOM 只绑定槽位任务及显示状态。
-   不同图片保持并发，不新增生图并发限制。
-   DOM 重建不重复生成，也不会让失效的旧绑定覆盖新任务。
+2. 当前 R2 布局：
+   - `rp-sync/main/manifest.json`
+   - `rp-sync/main/manifests/<root-checksum>/<page>.json`
+   - `rp-sync/main/packs/<sha256>.bin`
+   - `rp-sync/main/blooms/<sha256>.bin`
+   - `rp-sync/main/uploads/<root-checksum>.json`
+   - `rp-sync/main/maintenance/gc-v1.json`
+   - `rp-sync/main/maintenance/mutation-lock.json`
+   - `rp-sync/main/migration-v13.done`
 
-4. 固定记录保存在：
-   RPHubDB / store / rp_hub_image_renders_<角色UUID>
-   继续使用 storyScopeId（默认 main）、messageId、messageIndex、contentHash、occurrenceIndex、prompt、promptHash、paramsSnapshot；
-   槽位键与记录键都以 storyScopeId 开头，不同故事作用域不复用同一槽位记录。
-   不新增另一套记录格式或图片迁移系统。
-   写入失败保留待保存状态并提示；同步前补存，仍失败就停止上传。
-   关闭固定只影响后续记录持久化，已固定图片继续读取原记录。
+3. 初始化是非破坏式的。缺少 v13 标记时只写初始化标记并记录旧 manifest etag；不得批量删除 `rp-sync/main/`，不得触碰 `rp-images/`。
 
-5. 图片读取失败与生图失败区分显示。
-   “重新加载”只重读 R2；“重新生成”继续采用作者重绘交互及魔改请求。
-   重绘成功后提交新固定记录；失败不替换已保存的旧记录。
+4. 单次 HTTP 请求只上传一个 pack，客户端在途并发固定为 1。每个 pack 最大 1MiB、512 条；Worker 必须把 `request.body` 直接传给 R2 `put`，并传入 32 字节 SHA-256 digest。
+   不得在 Worker 中读取、拼接、逐字节扫描或重新 hash 1MiB pack 正文。
 
-6. 图库删除维持两阶段，并受子请求预算约束：
-   前端先隐藏（乐观更新，清空分组后该组立即从页面消失），
-   清空分组请求只发角色名，由 Worker 按当前 R2 目录状态展开（页面加载后新生成的图也会被删），
-   前端按每批 20 张循环提交（与服务端单次预算一致，测试断言两个常量耦合）；
-   Worker 单次最多处理 20 个目标（每角色目录一次 list 判存在性，不逐 key head），
-   超出部分以 remainingKeys 返回由前端续传；删除标记逐个写完后才返回，
-   原图/缩略图用 R2 批量 delete 后台清理（ctx.waitUntil）。
-   部分失败只保留成功删除的部分，失败项恢复显示；分批中途抛错时先恢复删除前快照再剔除已接受项。
-   进入/刷新图库时扫描和对账（墓碑过滤 + 批量清理陈旧对象），缩略图补全为 3 路并发。
+5. 上传顺序固定：
+   `prepare-upload` → 可选 `initialize-storage` → `begin-upload` → `upload-bloom` →
+   `upload-manifest-page` → 缺失时逐包 `upload-pack` → 重交页面 → `finalize-upload` → 串行 `gc-step`。
 
-7. 图库返回按钮在标题左侧，刷新/选择在右侧。
-   选择模式显示已选数量和删除操作；多选只更新 tile，不重建全部图片。
-   刷新保留搜索词、展开数量和滚动位置。
+6. 上传会话必须持久化到 R2并可断点续传。同一 snapshot checksum 的重试要返回现有进度；丢失 finalize 响应后重试不得重复提交。
 
-角色生成器的图片继续使用作者原有流程，不纳入聊天图片托管。
+7. 每个 manifest page 最多 32 个 pack，按 page index 顺序提交。页 hash 必须绑定页号、前页 hash 和 pack 元数据；最后页 hash 必须等于 root 的 `pageRoot`。
+   页面对象用 `etagDoesNotMatch: '*'` 不可变写入；会话用 etag CAS 推进。
 
-四、同步
+8. 页面验证每页最多并发 6 个 R2 `head`，且同时核对 pack size 与 `customMetadata.entryCount`。同 checksum 的重复项必须 length 和 entryCount 都一致。
 
-1. 远端协议：
-   rp-sync-bounded-jsonl-v3，schema 12；
-   rp-sync/main/manifest.json；
-   rp-sync/main/packs/<sha256>.bin。
-   上传将已判定需要更新的分片每 8 个或 4MiB 合并为一次 HTTP 请求，客户端默认只保留 1 个批次在途；下载并发为 10。
-   Worker 以流式读取批次正文，单批最多 8 个分片、4MiB，最多 3 个 R2 写入并发；各分片仍保存为独立的内容寻址 R2 对象。
-   schema 12 迁移是维护者批准的一次性清理：检测到 `rp-sync/main/migration-v12.done` 缺失时，上传流程先按 R2 分页
-   批量删除 `rp-sync/main/` 下的旧清单、分片和旧标记，删除完成后才写入新标记；中断可从游标续跑。
-   清理只作用于 `rp-sync/main/` 命名空间，`rp-images/` 图片对象和其他前缀一律保留。
-   已完成迁移的桶重复 reset-upload 直接返回；schema 11 请求被拒绝。恢复页在未迁移的桶上明确提示先执行一次上传，不显示“暂无云端数据”。
-   Worker 对同步 manifest 按 etag 做 isolate 内缓存（上限 30 秒）：每次调用先用 R2 head 校验 etag，命中才复用缓存，pull-pack 逐分片下载不再重新解析整份清单。
-   清单不存在、JSON 损坏或校验不过时 Worker 返回错误并停止读写，不再把坏清单当作“云端无数据”覆盖。
+9. Bloom 固定 32KiB。上传时由 R2 校验 SHA-256；manifest page 验证其包含关系；finalize 在持锁后重新读取并校验 Bloom。
+   Bloom 假阳性只允许多留垃圾，绝不能产生假阴性删除当前数据。
 
-2. 不修改作者本地角色和聊天存储格式。
-   主页面上传前只清空已经存在的待保存任务，不每次无条件调用作者全量 saveData。
-   固定图片写入与已开始的 IndexedDB 写入也必须完成。
+10. 根 manifest 必须保持常数大小，不包含完整 pack 数组。finalize 与 GC 共用短 mutation lock；根切换必须使用旧 root etag CAS，并继续比对 baseVersion、baseChecksum 和 baseEtag。
 
-3. 本地变更日志与稳定分桶：
-   小对象分桶合并，大数组按 128 项分页；每包最多 512 项，目标约 1MiB（2026-09-19 从 256 项/512KB 上调，
-   原因：清单条目数随包数线性膨胀，大库的 upload-complete 在免费版 10ms CPU 上触发 1102；
-   副作用是等长修改的单切片浪费翻倍，知情取舍）。
-   业务写入与变更日志在同一 IndexedDB 事务内提交或回滚：dirty-tracker 在已知库上加内部 `__rp_sync_journal_v2` 存储，
-   put/add/delete（含 IDBKeyRange 范围删除，先 getAllKeys 记录实际键）、clear、cursor.update/delete 全部记日志；
-   自增键在写成功后用 request.result 记录实际键；日志写入失败会中止业务事务，不再吞异常。
-   作者代码 open(name, 1) 由 open 门面转为按当前版本打开，日志升级不会引发 VersionError；跨标签页 versionchange 自动关闭旧连接。
-   localStorage 每次业务写入前先写入 `rp_sync_intent_v2:<uuid>` 意图键（各写各的，跨标签页互不覆盖），上传确认时删除对应意图键；
-   写入相同值不再产生意图；日志存储键与恢复状态键不参与追踪。
-   上传只按日志候选键读取业务数据：正常增量不再全库游标扫描；变化键在单连接上按 64 键一批批量读取
-   （不再逐键重开数据库、逐键开只读事务）；clear 按最终键集合对缓存做差分，只删除真正消失的键，
-   clear 后原样回填的数据继续走字节比较去重，不扫描业务库。
-   首次基线会完整扫描；旧缓存格式、追踪 epoch 变化或日志重建时推送会弹确认，用户同意后自动完整重建
-   并继续上传，拒绝则显示面板中的"重建本地索引"按钮走手动路径；重建只读本地数据，
-   云端保护仍由基线比对与服务端 409 承担，不会静默覆盖云端。
-   序列化使用确定性 canonical JSON（键排序、拒绝 undefined/NaN/bigint/循环引用），对象属性顺序变化不再产生假分片；
-   候选记录与缓存内容逐字节比较，相同则只确认日志、不重建桶、不上传；
-   仅 IndexedDB 内置版本号变化（store 定义等价）时沿用缓存 header 的版本号，字节判等后不再制造无效 header 分片；
-   触桶状态只在内存标记，条目落盘/删除前统一持久化一次 pendingBuckets（崩溃安全不变量：条目已写入 ⇒ 其桶必在待重建列表）。
-   首次扫描 IndexedDB 时每个事务最多读取 64 条记录，并以约 8MiB 的估算记录大小作为提前截断边界；单条超大记录仍允许单独读取。
+11. 下载 pack 必须绑定已提交清单位置：version、pageIndex、packIndex、checksum、length、entryCount 全部匹配后才读取 R2。不得只信任客户端提交的 checksum。
 
-4. 构包和上传相连：
-   已构造的变化包直接比较并送入上传，不在同一次成功上传中再次构建。
-   只保留在途上传及当前桶需要的字节，完成后释放；
-   缓存更新中途失败时受影响桶先写入待重建列表，重试时继续，不回退全扫。
-   上传前先记录日志水位（各库 journal 最后序号 + localStorage 意图键清单），云端提交成功后才确认对应范围；
-   上传期间发生的新写入水位更靠后，保留到下一次上传。
-   相同 checksum 的分片在一次同步中只上传一次；未变化分片仍不读取缓存字节、不上传。
-   上传直接用基线远端快照的分片清单作种子判断缺失（已提交远端的分片必然已在 R2），不再列举全部历史分片，
-   省掉每次推送 O(历史分片数/1000) 个请求；中断上传等异常由提交时服务器 409 missingPacks 定向补传兜底；
-   “改后改回”可能对同一 checksum 幂等重传一次（内容寻址，安全）；服务器 list-upload-packs 端点保留兼容旧客户端。
-   提交时通过 R2 分页 list 统一对照 key 和 size，不再对每个分片单独 head。
-   提交带 baseVersion+baseChecksum，与浏览器已确认基线双重比对；云端与基线不同即拒绝上传，不自动合并、不用旧本地快照覆盖别端。
-   历史孤儿分片由提交后的后台 GC 回收（2026-09-18 起）：提交成功后 waitUntil 里重读清单保护并发写入方，分页扫描分片目录最多 8 页，只删除未被当前清单引用且超过 24 小时宽限期的分片，单次最多 1000 个（R2 批量 delete 单请求上限）；GC 失败不影响提交，下批继续。提交因扫描预算 503 时同样触发 GC，逐步清理 GC 上线前的孤儿积压。
+12. 下载清单页与 pack 的客户端在途并发固定为 4。内部恢复文档是安全执行边界：必须卸载作者应用、不得持有共享 app-writer lease，并立即把地址栏还原为 `/`；用户界面只显示统一恢复进度，不暴露内部路由或下载/校验/应用/索引阶段。
 
-5. 拉取在 /sync-restore 独立页面进行：
-   先下载并完整校验，再暂停其他同源页面写入；
-   等待共享写入锁和现有写入完成后应用远端数据。
-   结束后旧页面刷新，旧内存不允许继续写入。
-   恢复完成时记录云端水位并清空当时已有的本地变更日志与意图键；恢复期间的写入不追踪（写入暂停由锁保证）。
-   恢复需要支持 Web Locks 的浏览器；旧版本标签页应先刷新。
-   恢复失败或 401 时保留“重新恢复”按钮并弹出密码输入，不再把入口移除后无法重试。
+13. 恢复必须保持两遍安全语义：
+   - 下载批次直接复用内存字节完成长度、SHA-256、JSONL 数量、对象顺序和 bucket/group 归属的完整预校验，再写 staging；预校验失败不得触碰业务数据；
+   - 全部预校验成功后才设置恢复标记并取得排他 Web Lock；第二遍每批最多 4 pack 从 staging 读取一次，同时恢复业务数据、重建 entry 缓存并批量缓存原始 pack。
+   不得退回三遍 JSON 解析、每 pack 一个 staging/cache 事务，也不得取消 staging 后重复下载 300MB 快照。进入覆盖阶段后失败必须保留暂停标记，完整重试成功后才能清除。
 
-6. 不创建本地恢复备份，不宣称跨 localStorage 和多个数据库的写入为原子事务。
-   恢复窗口异常关闭后可从等待提示重新进入恢复页面。
-   正式数据应用中断时需要重新拉取完成恢复。
+14. GC 只能由显式 `gc-step` 请求执行，不放进 finalize、`waitUntil` 或长连接。每步最多 list 256 个 pack；只删除 Bloom 明确不引用且超过 24 小时宽限期的对象；游标持久化并可在边界对象被删除后继续。
 
-7. 同步入口点击立即打开面板，再检查连接/密码。
-   操作为“上传到云端”“从云端恢复”，状态只显示当前动作。
-   出错保持当前进度并显示错误，不跳到 100%。
+15. 当前 GC 只回收 pack。上传会话、旧 manifest page 和旧 Bloom 尚无自动清理；未来加入清理时必须证明不会删除并发上传、当前 root 或仍可能恢复的对象。
 
-8. rp_hub_presets 不参与同步、恢复覆盖或清理。
-   预设加载和页面内修改行为继续由作者决定。
+三、严格增量不变量
 
-五、其他 UI 与作者更新
+1. 第一次上传可完整扫描。正常增量上传不得对 `RPHubDB/store` 或 `AICharGen/characters` 打开全量 readonly cursor；只读取日志候选键。
 
-固定生图入口继续位于高级设置原有位置。
-同步入口在侧栏用户区域，图片管理入口在侧栏导航。
-下滑按钮仍位于输入区域上方，使用底部哨兵与单个 IntersectionObserver；本轮不增加其他行为。
-温度和流式选择不在刷新时强制重置。
+2. 业务 IndexedDB 写入和 `__rp_sync_journal_v2` 日志必须在同一事务提交/回滚。put、add、delete、范围删除、clear、cursor.update/delete 都必须追踪；自增键使用请求成功后的真实 key。
 
-作者更新后的检查位置：
-- 外部适配清单：替换规则、源码标记和 UI 选择器；修改后无需重新打包 Worker。
-- sourceChecks 运行时强制校验：Worker 在改写 app.js、注入主页面 UI 配置和 /__rphub/adapter.json 前对照真实上游文件核对 contains 标记
-  （结论按适配对象缓存，不超过 30 秒窗口；页面请求只校验手头内容、其余路径延迟到 app.js 请求，避免额外下载）。
-  任一标记失配即整站回退：app.js 不改写、UI 配置不下发、注入脚本自行降级，与替换规则未命中同一"全有或全无"语义。
-- /__rphub/adapter.json：前端读取当前清单的 UI 摘要。
-- AUTHOR_BASE：作者网页地址。
-- rewriteAuthorHtml：主页面及其他页面的脚本和样式插入。
-- rewriteAuthorScript：共 6 处替换，分别是流式重置、温度重置、图片记录清理、记忆设置保存、设置/角色保存与上传入口、图片任务接入。
-- authorSourcePattern：将固定源码片段转换成允许空白与注释变化的匹配规则。LF/CRLF、缩进、压行和简单字符串的单双引号变化不影响匹配，不修改片段外的作者源码或字符串内容。
-设置、角色和记忆设置复用同一个防抖保存队列；不再单独替换作者 debounce 函数，也不再跟踪 _memorySettingsSaveTimer。
-替换前仍检查匹配数量。函数改名、作用域或实际保存/生图流程变化不属于排版变化，需要重新核对，而不能只放宽匹配。
-任一替换未匹配时，整份 app.js 回退为作者原脚本，不返回适配错误脚本，也不应用半份补丁。
-回退期间同步和固定生图入口不显示；图片管理和下滑按钮继续保留。作者原有生图不具备魔改固定/托管能力，恢复适配并刷新后再使用这些功能。
-适配层校验分两层：本地冒烟测试在更新外部适配清单后用 file:// 地址执行 runtime-smoke，
-其中 sourceChecks 健康场景用真实作者 index.html / ui-components.js 比对，作者改结构会变红；
-线上 Worker 同时在运行时对照真实上游强制校验 sourceChecks，失配整站回退。
-Worker 不提供 /healthy 检查端点（免费版 CPU 限额下无法承载完整校验）。只有 Worker 逻辑变化时才需要重新部署。
+3. localStorage 写入前创建独立 `rp_sync_intent_v2:<uuid>` 意图。只有云端提交成功并确认水位后才能删除；上传期间产生的新日志/意图保留到下一轮。
 
-本轮代码检查：
-- 同步面板重建 UX（2026-09-19）：重建按钮默认隐藏；推送撞索引错误（indexInvalid 标记）时弹一次确认，
-  同意后自动完整重建并继续原上传，拒绝则显示按钮走手动路径。云端保护不变：重建只读本地数据，
-  提交仍带基线双比对，基线丢失时服务端 409 强制对账。
-- 清理测试期遗留钩子（2026-09-19）：删除 window.RPH_SYNC_REBUILD_CACHE 全局导出——重建按钮
-  直接走闭包内 requestExplicitRebuild()，该全局全项目零消费方；其余全局桥
-  （RPH_SYNC_UPLOAD_ENGINE/RPH_SYNC_PERSISTENCE/RPH_SYNC_TRACKER/RPH_MAGIC_IMAGE_TASK/
-  RPH_MAGIC_FLUSH_IMAGES/__RPH_SYNC_DIRTY_TRACKING__）逐一核对均为功能代码。
-- 清单冷路径优化（2026-09-19，行为不变）：normalizePackManifest 单遍同时产出规范化条目与校验源
-  （消除第二轮全量 map 与 String/Number 重包装）；buildRemoteInfo 直接复用规范化条目（同键序，序列化字节不变）；
-  新增按 checksum 的二级校验缓存（key = checksum:totalBytes:packCount:entryCount，含 version/updatedAt
-  结构守卫，损坏对象照旧走完整校验并拒绝；提交成功后预热；上限 8 版本防内存膨胀）。
-  实测：冷首调 prepare-upload 13.2ms→4.0ms，各阶段 upload-complete 普遍下降 1-4ms。
-- 注入面缩减（2026-09-19）：作者主页注入从 5 节点缩到 4 节点——删除内联适配配置脚本
-  （window.RPHUB_MAGIC_ADAPTER / _READY），magic-extension 启动时自行拉取 /__rphub/adapter.json
-  （该路径本就是扩展回归测试的供给方式，isUsableAdapter 校验 + 503 降级语义不变）；
-  encodeAdapterForHtml 因此成为死代码删除；rewriteAuthorHtml 守卫简化为 adapterReady 单条件。
-  styles.css 仍为 <link> 而非懒加载：侵入性最低的节点，懒加载会让面板首开闪无样式。
-  收益：每份主页响应少一个脚本节点与整份适配 JSON；代价：按钮挂载晚一个同源往返。
-- 新增 scale-sim.mjs（npm run scale-sim，不进 npm test）：300MB 规模（SCALE_MB 可调）首次上传 + 无变化空推送 +
-  等长修改增量 + 加长/删除/新增增量的免费版限制强制模拟。实测（2026-09-19）：全量 619 包/manifest 124KB/81 请求，
-  批量上传 wall p50 ≈7ms（门禁 10ms）；空推送 1 请求 0 分片（客户端 checksum 短路）；100 处等长修改 →
-  94 分片/46.6MB/14 请求；40 条漂移/删除/插入 → 219 分片/106MB/30 请求（桶内 512KB 字节切片级联，属设计粒度）；
-  子请求峰值 9/50、客户端在途 1/6、R2 Class A 963 次 = 月度额度 0.096%。暖态基准：prepare-upload p50 ≈1ms、
-  upload-complete p50 ≈4.3ms。测量口径：hrtime wall 为代理（模拟内 mock 全内存，handler 纯计算），
-  n≥5 样本做门禁，n=1 冷首调含 JIT 预热只报告；每 push 前 full GC 清客户端搅动的 GC 债。
-  该文件保持纯 ASCII，中文状态词用 \uXXXX 转义，避免工具链编码往返损坏正则。
-- 性能外科手术（2026-09-19，行为逐位不变）：
-  Worker 批量上传的换行计数从逐字节循环改为原生 TypedArray.indexOf 扫描（每 512KB 包 1.88ms→0.30ms，
-  每 4MiB 批次最多省约 13ms CPU，直接缓解免费版单请求 10ms CPU 峰值）；
-  normalizeImageObject 对同一 key 的 4-5 次 split/正则收敛为单次拆分，并顺带产出 deletedKey 供图库端点复用
-  （原 createImageDeletedKeyFromImageKey 因此成为死代码删除）；
-  buildImageLibrary 排序比较器从 String().localeCompare 改为定长 ISO 串普通比较（5000 张图 11.6ms→2.1ms），
-  sizeHuman 从每张图重算改为每角色一次；角色名排序保留 zh-Hans-CN locale 排序不变；
-  Worker 与 bootstrap 共享无状态 TextEncoder（encode 无内部状态，可并发复用；TextDecoder 有流式状态，保持每请求新建）；
-  图库管理页分批删除的键去重从 list.indexOf 平方级改 Set 线性（批量删除上千张时客户端明显省时）。
-- testImageAdminPageRuntime 偶发 flake 根治：桩桶钉死上传时间戳。根因是图库按 uploaded 降序排序，
-  真实挂钟在 1085 次桩写入中途跳秒会重排图库顺序，而测试按位置选图（slice(0,40)）与按 checksum 断言；
-  固定时间戳让排序退化为稳定的键序。修复后整套测试连跑 4 轮全绿。
-- 缩略图补全使用逐项独立的循环变量，避免三路异步回调都引用最后一项。
-- 清理重复的键序列化函数、无用的密钥包装函数、未读取的图片任务字段、同步下载冗余字段/响应头和未使用的同步副标题样式。
-- 图库列表不再请求未使用的 R2 httpMetadata；原图响应仍正常读取 contentType。
-- 图片协议、R2 图片 key、作者角色/聊天存储不变；同步升级为 schema 12，迁移一次性清理 rp-sync/main/ 并保留图片。
-- 删除 RPHUB_ADAPTER_SHA256 死代码（清单仅维护者更新，无防篡改需求）。
-- 图库删除按子请求预算重构：目录级 list 判存在性 + R2 批量 delete + 单次 20 目标上限与 remainingKeys 续传，前端每批 20 张与服务端预算一致。
-- 行级复查（2026-09-17）：
-  handleImageRender 顺序化——原图命中只花 1 次 R2 get，未命中才读墓碑（浏览热点路径 R2 读减半）；
-  生图缺 token 401、缺 tag 400，不再走异常转 500 的路径，buildImageUpstreamUrl 去掉重复防御只负责拼地址；
-  prepare-upload 与 pull-manifest 的重复实现合并进 handleStatus（同一功能两个函数）；
-  pull-pack 的 some+find 双扫描改单次 find；上传引擎与防抖保存桥按字节合并进 bootstrap.js，
-  作者页注入从 7 个节点缩到 5 个；未注册路径 catch-all 回源作者站点，删除硬编码代理路径清单；
-  bootstrap 缓存比较改为与缓存字节逐位比较（不再 JSON.parse 后重序列化）、三个重试循环合并为 withSyncRetry、
-  删除只写不读的 state.watermark、pull-manifest 请求带 schemaVersion 版本门控；
-  图库管理页 deletePayload 修复"部分批次成功后抛错"的 UI 恢复缺陷（先回滚快照再剔除已接受项）；
-  适配清单删除无代码引用的 ui.navigation.panel/openTrigger 字段；
-  适配文件名与 id 去掉日期（adapter/rp-hub.json，Worker 硬编码地址同步更新），
-  loadAdapter 删除全项目无调用方的 fresh 参数与 _rph_adapter cache-buster 分支，
-  测试脚本 upstreamRoot 增加仓库同级 RP-Hub-main 回退（clone 后无需改路径即可跑测试）。
-- magic-extension：固定生图开关改为相对"沉浸模式"锚点插入（不再依赖 children[4] 位置）；
-  生成任务 Promise 结束即清理，槽位任务上限 128 条按插入顺序淘汰已结算条目，进行中任务保留。
-- 同步缓存状态只持久化一份分片清单（state.packs），读回时回填 state.snapshot.packManifest，大库索引写入体积减半。
+4. 候选键按单连接、每 64 键批量读取。首次全扫事务最多 64 条并受约 8MiB 估算边界约束。
 
-本轮验证范围：
-- 作者本地源码的 LF/CRLF、缩进、空白、压行、注释和引号变体，改写后语法结构一致；缺失、重复和真实结构变更会在内部检查中判定不匹配，普通页面整份回退，本地冒烟测试报告失败。
-- 本地模拟设置/角色/记忆待保存任务合并、聊天保存失败阻止上传，以及失败任务重试。
-- 本地模拟相同图片请求共享生成、两个位置独立保存、刷新后切换画风/清空密钥仍读取固定图、重绘仅更新对应位置。
-- 图库缩略图三路乱序完成和单项失败重试。
-- 使用模拟 IndexedDB、Worker 和内存 R2 完成首次上传、增量上传与独立拉取恢复；验证预设排除。
-- 图片 Worker 的首次生成、缓存读取、缺图只读和删除标记行为。生图 API 全流程通过本地模拟：
-  命中恰好 1 次 R2 get（不读墓碑）；未命中 2 次（原图+墓碑）；墓碑命中返回 SVG 占位且 POST 不重新生成；
-  reroll_nonce 换新签名重新生成；上游 503 透传、非图片 content-type 502、超 64MiB 413、PUT 405；
-  失败请求不写 R2、不产生额外上游调用。
-- catch-all 代理通过本地模拟：本地 4 个静态资源直出且上游调用为 0；作者新增页面自动回源；
-  主页注入 5 个节点（css、dirty-tracker、内联配置、magic-extension、bootstrap）按序出现且不再引用已合并文件；
-  非主页只注入 dirty-tracker；非 GET 保留方法；作者 404 透传；无 ASSETS 绑定时本地路径降级回源；update-check 桩不回源。
-- 同步 manifest 的 etag 缓存通过本地模拟：重复 pull-manifest 和 pull-pack 不再重复读取解析清单；manifest 更新后 etag 变化立即读取新版本，缓存永不返回过期清单。
-- app.js 改写缓存通过本地模拟：相同适配对象和上游 etag 下复用改写正文；仍发送条件请求，但 304 不重新下载正文或执行替换；上游 etag 变化后重新改写。
-- 模拟替换点缺失、重复及图片接入点变化：普通 app.js 返回 HTTP 200 和完整作者原文，不保留部分替换；同步/固定入口在缺少保存接入时不挂载。
-- 首轮 IndexedDB 扫描批量读取最多 64 条记录且约束在 8MiB 估算大小内；大记录不会被拆坏，扫描不会一次性装入全部数据库。
-- 模拟 1000 个变化分片：上传请求为 125 次；1000 个全部未变时为 0 次；仅 3 个变化时为 1 次。
-- 模拟 1000 个分片提交：逐包 head 为 0 次，list 为 1 次，并能识别缺失分片；2501 个 key 只调用 3 次批量删除。
-- schema 12 一次性迁移通过本地模拟：1200+ 旧对象分两页清理、游标续跑、完成后才写标记；`rp-sync/main/` 之外的键全部保留；已完成迁移重复调用直接返回；schema 11 请求被拒绝。
-- 同步密码 401 流程通过本地模拟：auth-status 的无密码/错密码/正确密码三态、未带或错误密码时各 JSON action 与二进制批量端点一律 401、未迁移桶返回 resetRequired、未配置密码时全部放行。
-- 图库管理 API 通过本地模拟：分组列表与墓碑过滤、陈旧对象后台批量清理、登录会话 Cookie 授权、单次删除 20 目标上限与 remainingKeys 分批续传、缩略图读写与原图缺失拒绝、无密码环境直通。
-- sourceChecks 强制校验通过本地模拟：健康场景用真实作者 index.html / ui-components.js 比对通过并注入 UI 配置、改写 app.js；index.html 标记失配时页面不下发配置、adapter.json 503、app.js 返回作者原文；ui-components.js 标记失配时 app.js 同样不改写。
-- 图库管理页内联脚本固化为 runtime-smoke 用例：把 `_worker.js` 里的页面模板字面量按线上相同方式求值后，对每个内联脚本做 `new Function` 纯编译（不执行），
-  并断言前端分批大小与服务端单次预算耦合一致——`node --check` 检查不到嵌在 HTML 里的这段手写脚本。
-  本轮升级为**真实执行**模拟：DOM 桩 + 内存 R2 + 真实 Worker，1085 张大数据跑通登录流（错误密码提示、正确密码进入）、
-  清空本组乐观消失后由服务端实时展开为 1+52 批、把页面加载后新增的 3 张也删掉（共 1043 墓碑、原图全部清理、他组不受影响）、
-  40 张分两批且第 2 批失败时已接受 20 张保持删除、其余 20 张恢复显示、选择清空、报错文案与颜色正确。
-- 批量提交成功、缺失分片识别、批量上传和中断后复用已写入分片均通过本地模拟；旧单包上传接口已拒绝且不会写入 R2。
-- `restore-sim.mjs` 使用 fake-indexeddb 和内存 R2 完成“首次上传 → divergent 本地数据恢复 → 增量上传”三阶段回归，并验证大数组分包、缺失记录删除、预设排除及保留项。
-- 阶段 4 严格增量回归：对象键顺序变化 0 个新分片且不触发新版本；事务中止不产生分片；cursor.update、范围删除、clear+新记录、5105 个变化键全部保留；
-  后续上传对业务库 readonly 游标计数为 0（不再全扫）；上传期间新写入保留到水位之后的下一次上传；提交响应丢失后重试不重复上传分片；
-  云端被别端更新后，陈旧客户端被基线比对拒绝且不产生上传请求、不覆盖云端清单。
-  本轮扩展：无效变化零成本——同值 put、同一日志窗口内改后改回、clear+原样回填、仅 IndexedDB 版本号变化四类场景，
-  均零缓存条目写入/删除（缓存写/删逐推送计数断言）、零分片、零提交；5105 键推送 ≤8 次库打开、80~160 个只读事务
-  （单连接 + 64 键批量读取）；全程 list-upload-packs 请求计数为 0（不再列举历史分片）。
-- audit-regressions 结构级断言：updateCachedSnapshot 内每个缓存条目落盘/删除前必须先持久化 pendingBuckets（崩溃安全不变量）。
-- `_worker.js`、`magic-extension.js`、`DB/bootstrap.js`、`DB/dirty-tracker.js` 及两个同步测试脚本语法检查通过；没有访问真实用户数据、调用真实生图服务或部署。
+5. canonical JSON 保持键排序并拒绝 undefined、NaN、bigint 和循环引用。以下变化必须为零新 pack、零提交：
+   - 同值 put
+   - 对象属性顺序变化
+   - 同一日志窗口改后改回
+   - clear 后原样回填
+   - store 定义等价时仅 IndexedDB version 变化
 
-六、本轮上传边界与平台依据
+6. `updateCachedSnapshot` 中每一个缓存 entry 写入或删除之前，都必须先持久化 `pendingBuckets`。这是崩溃安全不变量，`audit-regressions` 有结构断言。
 
-- Workers Free 当前限制按 100,000 请求/天、每次 10ms CPU、128MiB isolate 内存、每次 50 个子请求和 6 个同时出站连接设计；免费请求额度按 UTC 午夜重置。
-- R2 Standard 免费额度按每月 10GB-month、100 万 Class A、1000 万 Class B 操作设计；超出额度前应先观察实际用量。
-- 4MiB/批次和客户端单批次在途是本项目的保守工程边界，不是 Cloudflare 的硬性最小值；它们用于避免把本地全部文件或多个大批次同时放进浏览器/Worker 内存。
-- 首次上传、确认后的自动/手动重建本地索引以及 schema 12 迁移会完整读取本地数据/旧云端对象；之后的每次上传只读取日志候选键，不在上传路径全库扫描。
-  增量读取在单连接上按 64 键批量进行；同值写入、键序变化、改后改回、clear 原样回填、仅版本号变化均不会产生缓存重写或新分片。
-  本地测试不验证真实免费版 CPU 预算，批量上传 CPU 耗时仍需部署后看指标。
+7. 索引缺失、缓存版本变化、追踪 epoch 重置时，只能经确认完整重建本地索引。重建只读本地；不得跳过远端基线保护。
 
-独立复审补充：
-- prepareLocalSnapshot 的脏日志读取、基线解析、缓存状态读取均在 try/finally 内，任一步失败都会关闭已打开的缓存连接。
-- 图片管理统一 key 结构校验，允许 A..B 等合法角色名；原图和缩略图流式读取分别在 64MiB、2MiB 限额处拒绝并取消，生图超时覆盖正文。
-- 作者回源剥离 Cookie、Authorization 和 x-rp-sync-password，避免本域认证信息被转发到作者站。
-- 清理 runtime-smoke 未使用的源码读取和重复 Worker 加载器，不删除有效测试。
-- 生图失败按记录对象身份清理自身临时记录，避免普通重试误判完成；保留新任务和成功记录。完整扩展脚本的 5 项离线回归验证重试、缓存淘汰和并发交错。
-- 不把墓碑、未确认意图键、历史分片当作项目垃圾删除；它们涉及删除语义和同步完整性。
-- 已知限制：原图优先读取可能在后台删除失败时继续返回旧图片；历史分片目录超过提交扫描预算可能阻止新提交；长期不同步的 localStorage 意图可能耗尽配额。详见 README.md（原 HANDOVER.md）第 10 节。
-- node_modules 是 fake-indexeddb 的可重建依赖，源码、锁文件、有效回归测试与 LICENSE 均保留；.gitignore 排除依赖、日志及临时脚本。
+8. baseline 必须包含 schemaVersion 13。提交前继续执行本地 baseline 与远端 version/checksum 双比对；另一端更新后拒绝覆盖，不做自动合并。
 
-本清单只记录现有实现，不维护作者历次更新的功能汇总。
+9. 不同步：`rp_hub_presets`、同步密码、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、baseline 和恢复状态键。
+
+四、免费版资源边界
+
+1. 设计上限：Workers Free 每请求 10ms CPU、50 子请求、6 个同时出站连接、128MiB isolate；请求/日和 R2 月额度以 Cloudflare 当前官方规则为准。
+
+2. 代码硬上限：快照 1GiB、8192 pack、单 pack 1MiB/512 条、manifest page 32 pack、Bloom 32KiB、GC page 256。
+
+3. 禁止以下回归：
+   - 一个请求上传多个 pack；
+   - Worker 聚合或复制大正文；
+   - finalize 扫描完整 manifest 或完整 pack 目录；
+   - 在一个请求中无界 Promise.all；
+   - GC 放在 finalize 或 waitUntil；
+   - 下载相信未绑定 manifest 位置的 checksum。
+
+4. 本地 `sync-v13-budget` 使用小堆、R2 流外部托管，硬门槛 p95 ≤10ms、max ≤20ms、子请求 ≤50、R2 并发 ≤6。
+   它是高分辨率墙钟代理，不是 Cloudflare 官方 CPU。部署后仍要看 Metrics 和 1102 错误。
+
+5. 2026-09-20 300MB 验证基线：
+   - 首次：0.293GiB、331 pack、448 字节 root、360 请求；
+   - 无变化：1 请求、0 pack；
+   - 100 条等长修改：90 新 pack、87.5MiB、117 请求、业务全扫游标 0；
+   - 20 加长 + 10 删除 + 10 新增：125 新 pack、110.5MiB、154 请求、业务全扫游标 0；
+   - 最终恢复：38,820 条、331 pack、342 个拉取请求、最大并发 4、83 个 staging 读取事务、20.7 秒；
+   - 恢复每条记录固定解析 2 次、每个 staging pack 固定读取 1 次；
+   - 峰值：36 子请求、客户端并发 4、R2 put 1MiB。
+
+6. 最近独立预算 p95 / max：upload-pack 0.58/1.04ms、32-pack manifest page 2.85/3.43ms、finalize 1.60/2.28ms、pull page 1.55/1.81ms、pull pack 1.69/2.13ms、256-item GC 4.32/6.33ms。
+
+五、图片与图库不变量
+
+1. 图片 key、作者角色/聊天存储格式和固定记录路径保持兼容。固定记录继续保存在 `RPHubDB/store/rp_hub_image_renders_<角色UUID>`，并按 storyScopeId 隔离。
+
+2. 网络任务按读取 URL 共享；每个角色/消息/槽位独立提交记录。旧失败不能删除新任务的记录；成功记录继续复用；任务 Map 结束后清理，已结算槽位受上限淘汰。
+
+3. 图库删除保持两阶段：先写墓碑并返回，再后台批量删除原图/缩略图。每请求最多 20 个目标，前端按 20 自动续传；清空分组由服务端按当前目录展开。
+
+4. 墓碑不能当工作区垃圾或 R2 垃圾删除。当前原图优先读取；后台物理删除失败时旧 URL 可能暂时返回原图，这是已知边界。
+
+5. 图片/缩略图继续执行 64MiB/2MiB 流式上限和正文停滞超时。作者回源必须剥离 Cookie、Authorization 和 `x-rp-sync-password`。
+
+六、验证与发布
+
+1. 默认回归：
+   `npm --prefix .sync-tests test`
+
+2. 规模回归：
+   `npm --prefix .sync-tests run scale-sim`
+
+3. 必须保留的测试：
+   - `sync-v13-smoke.mjs`
+   - `sync-v13-budget.mjs`
+   - `runtime-smoke.mjs`
+   - `restore-sim.mjs`
+   - `scale-sim.mjs`
+   - `audit-regressions.mjs`
+   - `worker-regressions.mjs`
+   - `image-task-regressions.mjs`
+
+4. 改协议时测试至少覆盖：空快照、缺包重试、持久会话恢复、清单页 CAS、并发 finalize、finalize/GC 锁、根 CAS、page hash、pack membership、Bloom 缺项/损坏、GC 游标、密码、丢失提交响应和远端版本冲突。
+
+5. 发布前：
+   - 对所有 JS/MJS 做语法检查；
+   - 默认回归和 300MB 规模测试通过；
+   - 五个正本与 `page/` SHA-256 一致；
+   - `page.zip` 重新生成并检查结构；
+   - 不包含 node_modules、日志、临时补丁、计划文件或测试输出；
+   - 未经明确要求不 commit、不 push、不访问真实用户 R2 数据。
+
+七、当前已知待办
+
+1. 为过期 upload session、旧 manifest page 和旧 Bloom 设计安全、分页、有宽限期的控制对象 GC。
+2. 部署后继续观察 Cloudflare 官方 CPU、错误率、R2 Class A/B 和存储增长。
+3. 恢复跨 localStorage 与多个 IndexedDB 仍非原子；保持写暂停、排他锁和“失败后重新完整恢复”语义。
+4. 长期不同步的 localStorage 意图可能占用浏览器配额，不能在未提交前自动删除。
+
+本文件只记录当前实现与必须保留的约束，不保留已废弃协议的历史流水账。

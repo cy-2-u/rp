@@ -4,7 +4,7 @@ import vm from 'node:vm';
 
 const source = fs.readFileSync(new URL('../DB/bootstrap.js', import.meta.url), 'utf8');
 const start = source.indexOf('    async function prepareLocalSnapshot(');
-const end = source.indexOf('    async function* iterateMissingUploadPacks(', start);
+const end = source.indexOf('    async function runGcMaintenance(', start);
 assert.ok(start >= 0 && end > start, 'prepareLocalSnapshot source boundaries');
 
 for (const stage of ['dirty', 'baseline', 'state']) {
