@@ -243,6 +243,23 @@ async function testBootstrapUsesBoundedEngine() {
     assert.doesNotMatch(bootstrap, /upload-pack-batch|upload-complete|reset-upload/);
 }
 
+async function testFixedImageSettingUsesAdapterClasses() {
+    const source = await read('magic-extension.js');
+    assert.match(source, /cfg\.rowClass/, 'fixed image row class must come from adapter config');
+    assert.match(source, /settings-toggle-row/, 'fixed image row fallback must follow the author settings row class');
+    assert.doesNotMatch(source, /settings-toggle--indigo/, 'the removed author toggle variant must not linger');
+    const adapter = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
+    const settings = adapter.ui.settings;
+    assert.equal(settings.rowClass, 'settings-toggle-row group');
+    assert.equal(settings.textClass, 'text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors');
+    assert.equal(settings.toggleWrapClass, 'relative inline-flex flex-none items-center');
+    assert.equal(settings.toggleClass, 'settings-toggle');
+    assert.ok(
+        adapter.author.sourceChecks.some(check => check.path === '/index.html' && check.contains.includes('settings-toggle-row')),
+        'the settings row class must be guarded by a source check'
+    );
+}
+
 async function testAdapterConfigEndpoint() {
     const fetchMock = async input => {
         const url = new URL(String(input));
@@ -992,5 +1009,6 @@ await testAppJsRewriteCache();
 await testBoundedUploadEngine();
 await testUploadEngineCleanup();
 await testBootstrapUsesBoundedEngine();
+await testFixedImageSettingUsesAdapterClasses();
 console.log('runtime-smoke: ok');
 

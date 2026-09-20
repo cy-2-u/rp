@@ -40,7 +40,7 @@
     "sourceChecks": [
       {
         "path": "/index.html",
-        "contains": ["<app-navigation", "chat-input-scrollbar", "input-island"]
+        "contains": ["<app-navigation", "chat-input-scrollbar", "input-island", "settings-toggle-row"]
       },
       {
         "path": "/assets/js/ui-components.js",
@@ -70,7 +70,11 @@
       "labelText": "沉浸模式",
       "occurrence": "last",
       "anchorParentSelector": ".grid",
-      "insert": "before"
+      "insert": "before",
+      "rowClass": "settings-toggle-row group",
+      "textClass": "text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors",
+      "toggleWrapClass": "relative inline-flex flex-none items-center",
+      "toggleClass": "settings-toggle"
     },
     "chat": {
       "input": "textarea.chat-input-scrollbar",

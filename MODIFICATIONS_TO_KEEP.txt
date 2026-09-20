@@ -12,7 +12,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    外部适配地址固定在 `_worker.js` 的 `DEFAULT_ADAPTER_URL`。
    `RPHUB_ADAPTER_URL` 只允许本地 `file://` 测试覆盖。
 
-4. 未注册路径继续回源作者站。适配规则、source checks 和 UI 选择器继续放在 `adapter/rp-hub.json`，不要重新硬编码进 Worker。
+4. 未注册路径继续回源作者站。适配规则、source checks、UI 选择器和注入行样式类（固定生图 rowClass/textClass/toggleWrapClass/toggleClass，跟随作者 `settings-toggle-row` 语义类）继续放在 `adapter/rp-hub.json`，不要重新硬编码进 Worker 或 magic-extension。
 
 5. 作者页面适配必须全有或全无：任一 source check 或替换命中失败，返回作者原内容，不运行半份修改。
    正常主页注入保持 4 个节点：styles.css、dirty-tracker、magic-extension、bootstrap；其他作者 HTML 页只注入 dirty-tracker。

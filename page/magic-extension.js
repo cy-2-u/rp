@@ -835,8 +835,10 @@
         const { grid, anchor } = findFixedImageAnchor();
         if (!grid || grid.querySelector('.magic-fixed-image-toggle')) return;
         const label = document.createElement('label');
-        label.className = 'magic-fixed-image-toggle flex items-center justify-between gap-3 p-3 text-left rounded-xl border-2 border-transparent hover:border-gray-100 hover:bg-gray-50 transition-all cursor-pointer group';
-        label.innerHTML = '<span class="text-sm font-medium text-gray-600 group-hover:text-gray-900">固定生图</span><span class="relative inline-flex flex-none items-center"><input type="checkbox" class="magic-fixed-image-input settings-toggle-input sr-only"><span class="settings-toggle settings-toggle--indigo"></span></span>';
+        // 行样式类全部来自适配层 ui.settings：作者改设置行样式时只更新适配 JSON。
+        // 兜底值跟随作者当前设置行语义类，适配键缺失也不渲染裸样式。
+        label.className = `magic-fixed-image-toggle ${cfg.rowClass || 'settings-toggle-row group'}`;
+        label.innerHTML = `<span class="${cfg.textClass || 'text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors'}">固定生图</span><span class="${cfg.toggleWrapClass || 'relative inline-flex flex-none items-center'}"><input type="checkbox" class="magic-fixed-image-input settings-toggle-input sr-only"><span class="${cfg.toggleClass || 'settings-toggle'}"></span></span>`;
         const input = label.querySelector('input');
         input.checked = isFixedImageEnabled();
         input.addEventListener('change', () => localStorage.setItem(FIXED_IMAGE_KEY, input.checked ? '1' : '0'));
