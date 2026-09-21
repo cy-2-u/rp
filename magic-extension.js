@@ -420,6 +420,23 @@
         return task;
     };
 
+    // 隐藏任务：作者的“自动生图”开关关闭时卡片整体隐藏，不渲染任何占位。
+    // promise 必须正常完成，作者端的 reroll 处理器会等待它。
+    const createSuppressedImageTask = (requestUrl, render) => {
+        const task = {
+            requestUrl,
+            baseUrl: location.origin,
+            token: '',
+            cards: new Set(),
+            render,
+            suppressed: true,
+            job: { status: 'done', imageUrl: '', generationProgress: { percent: 100 } },
+            promise: null
+        };
+        task.promise = Promise.resolve(task.job);
+        return task;
+    };
+
     const createImageGenerationTask = (key, requestUrl) => {
         const existing = imageGenerationTasks.get(key);
         if (existing) return existing;
@@ -502,11 +519,14 @@
         return task;
     };
 
-    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, render }) => {
+    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render }) => {
         const currentUrl = normalizeRequestUrl(requestUrl, characterName);
         const token = currentUrl.searchParams.get('token') || '';
         const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);
         if (!descriptor) {
+            // 无卡片上下文时无法定位槽位：作者的“自动生图”开关关闭时只隐藏。
+            // autoImageGen 未传（旧适配清单）按作者原生行为放行。
+            if (autoImageGen === false) return createSuppressedImageTask(currentUrl.href, render);
             const record = normalizeRecord({
                 storyScopeId,
                 prompt: currentUrl.searchParams.get('tag') || '',
@@ -528,8 +548,8 @@
         ]);
         const activeTask = imageSlotTasks.get(slotKey);
         if (fresh !== true && activeTask && activeTask.job?.status !== 'failed'
-            && (activeTask.record.promptHash === descriptor.promptHash || activeTask.sourcePromptHash === descriptor.promptHash)) {
-            activeTask.requestUrl = buildRecordUrl(activeTask.record, token, true);
+            && (activeTask.record?.promptHash === descriptor.promptHash || activeTask.sourcePromptHash === descriptor.promptHash)) {
+            if (activeTask.record) activeTask.requestUrl = buildRecordUrl(activeTask.record, token, true);
             activeTask.render = render;
             return activeTask;
         }
@@ -539,15 +559,41 @@
             ? findSlotRecord([...state.transientRecords.values(), ...state.records], descriptor)
             : null;
         const previous = transientRecord || storedRecord || slotRecord;
+        // 开关由适配层实时传入，不依赖存储；未传（旧适配清单）按作者原生行为放行。
+        const generationAllowed = autoImageGen !== false;
+
+        if (fresh !== true && previous) {
+            const readUrl = buildRecordUrl(previous);
+            const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
+            Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
+            imageSlotTasks.set(slotKey, task);
+            pruneSlotTasks();
+            return task;
+        }
+
+        if (!previous && !generationAllowed) {
+            // 作者“自动生图”开关关闭：卡片隐藏且不生成，不做任何持久化；
+            // 重新打开开关后按作者原生行为重新生成。
+            return createSuppressedImageTask(currentUrl.href, render);
+        }
 
         if (fresh === true) {
+            if (previous && !generationAllowed) {
+                // 作者“自动生图”开关关闭时的重掷：保留已显示的旧图，不再生成。
+                const readUrl = buildRecordUrl(previous);
+                const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
+                Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
+                imageSlotTasks.set(slotKey, task);
+                pruneSlotTasks();
+                return task;
+            }
             const record = normalizeRecord({
                 ...descriptor,
                 paramsSnapshot: snapshotFromUrl(currentUrl, characterName, true)
             }, characterName);
             return createGenerationTask({
                 slotKey,
-                sourcePromptHash: previous?.promptHash || activeTask?.record.promptHash || descriptor.promptHash,
+                sourcePromptHash: previous?.promptHash || activeTask?.record?.promptHash || descriptor.promptHash,
                 record,
                 previous,
                 state,
@@ -555,15 +601,6 @@
                 render,
                 persistRequested: isFixedImageEnabled()
             });
-        }
-
-        if (previous) {
-            const readUrl = buildRecordUrl(previous);
-            const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
-            Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
-            imageSlotTasks.set(slotKey, task);
-            pruneSlotTasks();
-            return task;
         }
 
         const record = normalizeRecord({
@@ -598,6 +635,8 @@
                 task.cards?.forEach(node => { if (!node.isConnected) task.cards.delete(node); });
                 task.cards?.add(card);
                 card.dataset.imageRequest = deferredTask.requestUrl;
+                card.classList?.toggle('magic-image-suppressed', task.suppressed === true);
+                if (task.suppressed) return;
                 if (task.job) renderDirectImageJob(options.render, card, task, task.job);
             });
             return task.promise || { status: 'failed', error: '图片任务初始化失败' };
@@ -742,6 +781,7 @@
             '.magic-scroll-button svg{width:1rem;height:1rem}',
             '.magic-scroll-button.is-visible{display:flex}',
             '.magic-scroll-sentinel{width:1px;height:1px;pointer-events:none}',
+            '.magic-image-suppressed{display:none!important}',
             '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
             '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}'

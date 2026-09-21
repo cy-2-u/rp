@@ -33,7 +33,7 @@
         {
           "name": "图片任务接入",
           "find": "const task = startGeneratedImageTask(requestUrl, options.fresh === true);",
-          "replace": "const rphMagicMessage = chatHistory.value[Number(card.closest('[data-chat-index]')?.dataset.chatIndex ?? -1)];\nconst task = window.RPH_MAGIC_IMAGE_TASK({\ncard, requestUrl, fresh: options.fresh === true,\nmessage: rphMagicMessage,\nstoryScopeId: activeStoryBranchId.value || 'main',\ncharacterId: currentCharacter.value?.uuid || '',\ncharacterName: currentCharacter.value?.name || '',\nrender: renderGeneratedImageJob\n});"
+          "replace": "const rphMagicMessage = chatHistory.value[Number(card.closest('[data-chat-index]')?.dataset.chatIndex ?? -1)];\nconst task = window.RPH_MAGIC_IMAGE_TASK({\ncard, requestUrl, fresh: options.fresh === true,\nmessage: rphMagicMessage,\nstoryScopeId: activeStoryBranchId.value || 'main',\ncharacterId: currentCharacter.value?.uuid || '',\ncharacterName: currentCharacter.value?.name || '',\nautoImageGen: typeof isAutoImageGenEnabled !== 'undefined' && typeof worldInfo !== 'undefined' && worldInfo.value?.length ? isAutoImageGenEnabled.value : undefined,\nrender: renderGeneratedImageJob\n});"
         }
       ]
     },
