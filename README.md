@@ -128,7 +128,7 @@ rp-sync/main/migration-v13.done                    非破坏式初始化标记
 3. `begin-upload`：创建或恢复 `rp-sync-upload-session-v1` 会话，固定 base version/checksum/etag。
 4. `upload-bloom`：上传 32KiB Bloom；R2 按 SHA-256 校验。
 5. `upload-manifest-page`：每页最多 32 包；Worker 验证顺序、Bloom 包含关系，并以最多 6 个并行 `head` 核对包大小和记录数。
-6. 缺包时，客户端逐个调用 `upload-pack`。每个请求只携带一个包，客户端并发为 1，Worker 直接执行 `bucket.put(key, request.body, { sha256 })`，不在 JavaScript 中复制或扫描正文。
+6. 缺包时，客户端对每个缺包调用一次 `upload-pack`。每个请求只携带一个包，客户端在途并发为 4（重叠网络往返），Worker 直接执行 `bucket.put(key, request.body, { sha256 })`，不在 JavaScript 中复制或扫描正文。
 7. 客户端重交当前清单页；页面以 `onlyIf: { etagDoesNotMatch: '*' }` 不可变写入，会话以 etag CAS 推进。
 8. `finalize-upload`：重新读取并校验 Bloom，取得短 mutation lock，以根清单 etag CAS 切换版本。
 9. 客户端串行调用 `gc-step`，每步最多列举 256 个包，直到完成或达到有界步数。GC 失败不撤销已成功的提交。
@@ -171,7 +171,7 @@ npm test
 `npm test` 包含：
 
 - `sync-v13-smoke`：上传会话、不可变清单页、CAS 竞争、缺包重试、Bloom 损坏、分页 GC、清单绑定下载和密码门控。
-- `sync-v13-budget`：小堆隔离环境下重复测量最大请求形状；硬门槛为 p95 ≤10ms、max ≤20ms、子请求 ≤50、R2 并发 ≤6。
+- `sync-v13-budget`：小堆隔离环境下重复测量最大请求形状；硬门槛为 p95 ≤10ms、max ≤20ms、子请求 ≤50、R2 并发 ≤6。并发压力阶段（8 路同 isolate `upload-pack`、4 推 + 4 拉混合）逐请求套用同一硬门槛，证明客户端 4 路上传并发不会推高单请求 CPU。
 - `runtime-smoke`：真实作者源码适配、注入、代理、图库、图片 API 和浏览器上传引擎。
 - `restore-sim`：两个 fake-indexeddb 浏览器的上传、恢复、严格增量、水位、冲突和空快照；硬断言每条记录恰好解析两遍、每个 staging pack 只读一次、pack 事务最多 4 个对象，并验证晚出现的坏 JSON 不会提前覆盖本地数据。
 - `audit-regressions`、`worker-regressions`、`image-task-regressions`：生图门控（关闭时隐藏且零请求、已存图照常显示、reroll 保留旧图、重开后重新生成、旧适配清单兼容）、资源释放、崩溃安全、图片流限额、代理认证隔离和图片任务并发。
@@ -190,31 +190,33 @@ npm run scale-sim
 
 可用 `SCALE_MB=5`（Windows cmd：`set SCALE_MB=5&& npm run scale-sim`）进行快速预检。
 
-2026-09-20 默认 300MB 结果：
+2026-09-21 默认 300MB 结果：
 
 | 阶段 | 结果 |
 |---|---|
-| 首次上传 | 0.293GiB、331 包、448 字节根、360 请求 |
+| 首次上传 | 0.293GiB、331 包、448 字节根、360 请求、客户端并发 4 |
 | 无变化上传 | 0 包、1 请求 |
 | 100 条等长修改 | 90 个新包、87.5MiB、117 请求、业务 store 全扫游标 0 |
 | 20 条加长 + 10 删除 + 10 新增 | 125 个新包、110.5MiB、154 请求、业务 store 全扫游标 0 |
 | 最终无变化上传 | 0 包、1 请求 |
-| 最终快照恢复 | 0.293GiB、331 包、38,820 条；342 个拉取请求、最大并发 4、83 个 staging 读取事务、20.7 秒 |
+| 最终快照恢复 | 0.293GiB、331 包、38,820 条；342 个拉取请求、最大并发 4、83 个 staging 读取事务、13.6 秒 |
 | 恢复遍历约束 | 每条记录解析 2 次、每个 staging pack 读取 1 次、pack 事务每批最多 4 个 |
 | 全程上限 | 子请求 36/50、客户端并发 4/6、单个 R2 put 1MiB |
 
 规模模拟的墙钟只作宿主诊断，因为同一 Node 进程还持有约 300MB fake IndexedDB 和 R2 数据，V8 GC 停顿不等于 Cloudflare Worker CPU。
 
-独立预算套件在 40 个计时样本中的最近结果：
+独立预算套件的最近结果（串行形状各 40 个计时样本；并发阶段逐请求 40/24 个样本）：
 
 | 最大请求形状 | p95 墙钟代理 | 最大墙钟代理 | 子请求峰值 | R2 并发峰值 |
 |---|---:|---:|---:|---:|
-| 1MiB `upload-pack` | 0.58ms | 1.04ms | 3 | 1 |
-| 32 包 `upload-manifest-page` | 2.85ms | 3.43ms | 36 | 6 |
-| 完整 `finalize-upload` | 1.60ms | 2.28ms | 10 | 1 |
-| 32 包 `pull-manifest-page` | 1.55ms | 1.81ms | 4 | 1 |
-| 1MiB `pull-pack` | 1.69ms | 2.13ms | 5 | 1 |
-| 256 项 `gc-step` | 4.32ms | 6.33ms | 11 | 1 |
+| 1MiB `upload-pack` | 0.30ms | 1.62ms | 3 | 1 |
+| 32 包 `upload-manifest-page` | 1.50ms | 1.65ms | 36 | 6 |
+| 完整 `finalize-upload` | 0.76ms | 0.84ms | 10 | 1 |
+| 32 包 `pull-manifest-page` | 0.64ms | 0.82ms | 4 | 1 |
+| 1MiB `pull-pack` | 0.63ms | 1.00ms | 5 | 1 |
+| 256 项 `gc-step` | 1.89ms | 2.35ms | 11 | 1 |
+| 8 路并发 `upload-pack`（逐请求） | 1.18ms | 1.26ms | 3 | 1 |
+| 4 推 + 4 拉并发混合（逐请求） | 2.71ms | 2.76ms | 5 | 1 |
 
 这些是本地高分辨率墙钟代理，不是 Cloudflare 官方 CPU 计量。上线后仍须以 Cloudflare Metrics 为准。
 

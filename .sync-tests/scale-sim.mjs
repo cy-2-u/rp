@@ -407,6 +407,10 @@ async function accountedFetch(input, init) {
     clientInflight += 1;
     if (clientInflight > maxClientInflight) maxClientInflight = clientInflight;
     const wallStart = process.hrtime.bigint();
+    // Real networks pay an RTT per pack send; the in-process mock resolves
+    // each upload faster than the next pack finishes its IndexedDB read,
+    // which would hide the send overlap the bounded engine provides.
+    if (kind === 'upload-pack') await new Promise(resolve => setTimeout(resolve, 5));
     try {
         return await bucket.runRequest(accounting, async () => {
             if (kind !== 'upload-pack' && kind !== 'pull-pack') {
@@ -632,8 +636,8 @@ const phase1MaxSubrequests = Math.max(...phase1Slices.map(entry => entry.subrequ
 assert.ok(phase1MaxSubrequests <= LIMITS.subrequestsPerRequest,
     `subrequest budget exceeded: ${phase1MaxSubrequests}`);
 assert.ok(maxClientInflight <= LIMITS.outboundConnections, 'client concurrency must stay within 6 outbound connections');
-assert.equal(maxClientInflight, 1, 'the bounded engine must keep exactly one batch in flight');
-assert.ok(bucket.stats.maxInflightPutBytes <= 3 * 1024 * 1024 + 1024, 'R2 writes must stay within the 3-put concurrency bound');
+assert.equal(maxClientInflight, 4, 'the bounded engine must keep exactly four batches in flight');
+assert.ok(bucket.stats.maxInflightPutBytes <= 4 * 1024 * 1024 + 1024, 'R2 writes must stay within the 4-put concurrency bound');
 console.log(`  requests: ${phase1Requests} (~${(phase1Requests / LIMITS.requestsPerDay * 100).toFixed(3)}% of daily 100k), max wall ${Math.max(...phase1Slices.map(e=>e.wallMs)).toFixed(2)} ms, max subrequests ${phase1MaxSubrequests}`);
 console.log(`  R2 ops this phase: A=${phase1Slices.reduce((t, e) => t + e.classA, 0)}, B=${phase1Slices.reduce((t, e) => t + e.classB, 0)}`);
 console.log(`phase 1 (first ${SCALE_MB}MB upload): ok`);

@@ -1,10 +1,16 @@
 // Isolated request-budget proxy for schema 13 Worker handlers.
 // R2 I/O resolves without network delay and pack streams are staged outside
 // the measured window. This keeps wall time focused on Worker-side work.
+// A concurrent stress section replays the same shapes eight-wide (plus a
+// mixed push/pull round) because the client keeps four pack uploads in
+// flight: per-request gates must hold while requests share one runtime.
+// Local wall time is a conservative CPU proxy under concurrency too --
+// wall includes the queueing behind other requests, real CPU does not.
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const PREFIX = 'rp-sync/main';
@@ -18,6 +24,7 @@ const BLOOM_BYTES = 32 * 1024;
 const CHAIN_SEED = '0'.repeat(64);
 const RUNS = 40;
 const WARMUPS = 5;
+const CONCURRENT_UPLOAD_LANES = 8;
 const CPU_PROXY_MS = 10;
 const HARD_WALL_MS = 20;
 const encoder = new TextEncoder();
@@ -453,6 +460,252 @@ await benchmark({
         }
         bucket.setListResult({ objects: listed, truncated: false, cursor: undefined });
         return jsonRequest({ action: 'gc-step' });
+    }
+});
+
+// ------------------------------------------------------ concurrent stress ----
+
+// Same R2 semantics as createBucket, but accounting is per request via
+// AsyncLocalStorage, so several Worker invocations can overlap safely.
+function createConcurrentBucket() {
+    const objects = new Map();
+    const stagedPacks = new Map();
+    const requestContext = new AsyncLocalStorage();
+    let etagSequence = 0;
+    const metadata = object => object ? {
+        key: object.key,
+        etag: object.etag,
+        size: object.size,
+        uploaded: object.uploaded,
+        httpMetadata: object.httpMetadata,
+        customMetadata: object.customMetadata
+    } : null;
+    const charge = () => {
+        const accounting = requestContext.getStore();
+        assert.ok(accounting, 'R2 operation outside concurrent request accounting');
+        accounting.subrequests += 1;
+        return accounting;
+    };
+    const settle = async (accounting, value) => {
+        accounting.inflight += 1;
+        accounting.maxInflight = Math.max(accounting.maxInflight, accounting.inflight);
+        await Promise.resolve();
+        accounting.inflight -= 1;
+        return value;
+    };
+    return {
+        seed(key, bytes, options = {}) {
+            const value = typeof bytes === 'string' ? encoder.encode(bytes) : bytes;
+            etagSequence += 1;
+            objects.set(key, {
+                key,
+                bytes: value,
+                size: value.byteLength,
+                etag: `seed-${etagSequence}`,
+                uploaded: options.uploaded || new Date(),
+                httpMetadata: options.httpMetadata,
+                customMetadata: options.customMetadata
+            });
+        },
+        stagePack(checksum, bytes) { stagedPacks.set(checksum, bytes); },
+        run(accounting, task) { return requestContext.run(accounting, task); },
+        async head(key) {
+            const accounting = charge();
+            return settle(accounting, metadata(objects.get(key)));
+        },
+        async get(key) {
+            const accounting = charge();
+            const object = objects.get(key);
+            const result = object ? {
+                ...metadata(object),
+                body: new ReadableStream({
+                    start(controller) {
+                        controller.enqueue(object.bytes);
+                        controller.close();
+                    }
+                }),
+                text: async () => Buffer.from(object.bytes).toString('utf8')
+            } : null;
+            return settle(accounting, result);
+        },
+        async put(key, value, options = {}) {
+            const accounting = charge();
+            const match = key.match(/^rp-sync\/main\/packs\/([a-f0-9]{64})\.bin$/);
+            const staged = match ? stagedPacks.get(match[1]) : null;
+            const bytes = staged || new Uint8Array(await new Response(value).arrayBuffer());
+            const existing = objects.get(key);
+            const etag = existing?.etag ?? null;
+            if (options.onlyIf?.etagMatches !== undefined && etag !== options.onlyIf.etagMatches) {
+                return settle(accounting, null);
+            }
+            if (options.onlyIf?.etagDoesNotMatch === '*' && etag !== null) {
+                return settle(accounting, null);
+            }
+            if (options.sha256) {
+                const expected = options.sha256 instanceof ArrayBuffer
+                    ? Buffer.from(options.sha256).toString('hex')
+                    : String(options.sha256).toLowerCase();
+                if (match) assert.equal(expected, match[1]);
+                else assert.equal(await sha256(bytes), expected);
+            }
+            if (match) stagedPacks.delete(match[1]);
+            etagSequence += 1;
+            const next = {
+                key,
+                bytes,
+                size: bytes.byteLength,
+                etag: `put-${etagSequence}`,
+                uploaded: new Date(),
+                httpMetadata: options.httpMetadata,
+                customMetadata: options.customMetadata
+            };
+            objects.set(key, next);
+            return settle(accounting, { key, etag: next.etag });
+        },
+        async delete() {
+            const accounting = charge();
+            return settle(accounting, undefined);
+        },
+        async list() {
+            throw new Error('concurrent budget phase must not enumerate R2');
+        }
+    };
+}
+
+async function invokeConcurrent(bucket, request) {
+    const accounting = { subrequests: 0, inflight: 0, maxInflight: 0 };
+    const waitUntil = [];
+    const started = process.hrtime.bigint();
+    const response = await bucket.run(accounting, async () => {
+        const response = await worker.fetch(request, { RP_SYNC_R2: bucket }, {
+            waitUntil: promise => waitUntil.push(Promise.resolve(promise))
+        });
+        while (waitUntil.length) await waitUntil.shift();
+        return response;
+    });
+    const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
+    return { response, wallMs, ...accounting };
+}
+
+// Fires every lane at once and applies the same per-request gates as the
+// sequential benchmarks: status, subrequest budget, R2 concurrency, and the
+// p95/max wall proxy for CPU.
+async function concurrentBenchmark({ name, rounds, prepare }) {
+    const bucket = createConcurrentBucket();
+    const samples = [];
+    for (let round = 0; round < rounds; round += 1) {
+        if (typeof globalThis.gc === 'function') globalThis.gc();
+        const lanes = await prepare(bucket, round);
+        const results = await Promise.all(lanes.map(lane => invokeConcurrent(bucket, lane.request)));
+        for (const [index, result] of results.entries()) {
+            const lane = lanes[index];
+            assert.equal(result.response.status, lane.status,
+                `${name} round ${round} lane ${index} returned ${result.response.status}`);
+            assert.ok(result.subrequests >= lane.minSubrequests,
+                `${name} round ${round} lane ${index} skipped expected R2 work`);
+            assert.ok(result.subrequests <= 50,
+                `${name} round ${round} lane ${index} used ${result.subrequests} subrequests`);
+            assert.ok(result.maxInflight <= 6,
+                `${name} round ${round} lane ${index} used ${result.maxInflight} concurrent R2 operations`);
+            await result.response.body?.cancel();
+            samples.push(result);
+        }
+    }
+    const walls = samples.map(sample => sample.wallMs).sort((a, b) => a - b);
+    const p95 = walls[Math.ceil(walls.length * 0.95) - 1];
+    const max = walls.at(-1);
+    const maxSubrequests = Math.max(...samples.map(sample => sample.subrequests));
+    const maxInflight = Math.max(...samples.map(sample => sample.maxInflight));
+    console.log(`${name}: wall p50=${walls[Math.floor(walls.length / 2)].toFixed(2)} p95=${p95.toFixed(2)} max=${max.toFixed(2)} ms over ${samples.length} concurrent requests, subrequests=${maxSubrequests}, R2 concurrency=${maxInflight}`);
+    assert.ok(p95 <= CPU_PROXY_MS, `${name} p95 ${p95.toFixed(2)}ms exceeds ${CPU_PROXY_MS}ms proxy budget`);
+    assert.ok(max <= HARD_WALL_MS, `${name} max ${max.toFixed(2)}ms exceeds ${HARD_WALL_MS}ms ceiling`);
+}
+
+// Worst realistic load: two devices each running the four-lane upload engine.
+await concurrentBenchmark({
+    name: `concurrent upload-pack (${CONCURRENT_UPLOAD_LANES} x 1MiB)`,
+    rounds: 5,
+    async prepare(bucket, round) {
+        if (round === 0) bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
+        const lanes = [];
+        for (let lane = 0; lane < CONCURRENT_UPLOAD_LANES; lane += 1) {
+            const bytes = new Uint8Array(1024 * 1024);
+            bytes.fill((101 + round * CONCURRENT_UPLOAD_LANES + lane) & 0xff);
+            const checksum = await sha256(bytes);
+            bucket.stagePack(checksum, bytes);
+            const url = new URL('https://local.test/api/rp-sync');
+            url.searchParams.set('action', 'upload-pack');
+            url.searchParams.set('uploadId', fixture.snapshot.checksum);
+            url.searchParams.set('checksum', checksum);
+            url.searchParams.set('length', String(bytes.byteLength));
+            url.searchParams.set('entryCount', '1');
+            lanes.push({
+                request: new Request(url, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/octet-stream' },
+                    body: bytes
+                }),
+                status: 204,
+                minSubrequests: 3
+            });
+        }
+        return lanes;
+    }
+});
+
+// One device pushing while another restores: four upload lanes plus four
+// pull-pack reads in flight together.
+await concurrentBenchmark({
+    name: 'concurrent push+pull (4 upload-pack + 4 pull-pack)',
+    rounds: 3,
+    async prepare(bucket, round) {
+        if (round === 0) {
+            bucket.seed(keys.migration, migration);
+            bucket.seed(keys.manifest, JSON.stringify(fixture.manifest));
+            bucket.seed(keys.page(fixture.snapshot.checksum, 0), JSON.stringify(fixture.page));
+            bucket.seed(keys.bloom(fixture.snapshot.bloomChecksum), fixture.bloom);
+            bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
+            seedPack(bucket, fixture.packs[0]);
+        }
+        const lanes = [];
+        for (let lane = 0; lane < 4; lane += 1) {
+            const bytes = new Uint8Array(1024 * 1024);
+            bytes.fill((201 + round * 4 + lane) & 0xff);
+            const checksum = await sha256(bytes);
+            bucket.stagePack(checksum, bytes);
+            const url = new URL('https://local.test/api/rp-sync');
+            url.searchParams.set('action', 'upload-pack');
+            url.searchParams.set('uploadId', fixture.snapshot.checksum);
+            url.searchParams.set('checksum', checksum);
+            url.searchParams.set('length', String(bytes.byteLength));
+            url.searchParams.set('entryCount', '1');
+            lanes.push({
+                request: new Request(url, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/octet-stream' },
+                    body: bytes
+                }),
+                status: 204,
+                minSubrequests: 3
+            });
+        }
+        const pack = fixture.packs[0];
+        for (let lane = 0; lane < 4; lane += 1) {
+            lanes.push({
+                request: jsonRequest({
+                    action: 'pull-pack',
+                    version: 1,
+                    pageIndex: 0,
+                    packIndex: 0,
+                    checksum: pack.checksum,
+                    length: pack.length,
+                    entryCount: pack.entryCount
+                }),
+                status: 200,
+                minSubrequests: 5
+            });
+        }
+        return lanes;
     }
 });
 

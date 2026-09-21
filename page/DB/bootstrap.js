@@ -205,9 +205,10 @@
         ],
         localStoragePrefixes: ['rp_hub_', 'ai_chargen_'],
         maxSnapshotBytes: 1024 * 1024 * 1024,
-        // One request carries exactly one 1 MiB pack. The Worker forwards the
-        // request stream directly into R2 without copying or scanning it.
-        uploadBatchConcurrency: 1,
+        // One request still carries exactly one 1 MiB pack (the Worker forwards
+        // the request stream directly into R2 without copying or scanning it);
+        // four packs may be in flight at once to overlap network round trips.
+        uploadBatchConcurrency: 4,
         uploadBatchMaxPacks: 1,
         uploadBatchMaxBytes: 1024 * 1024,
         downloadPackConcurrency: 4,
