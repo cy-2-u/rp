@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>RP-Hub 部署器</title>
+<style>
+:root{
+  --win-bg: rgba(248,248,251,.86);
+  --stroke: rgba(0,0,0,.12);
+  --sep: rgba(0,0,0,.09);
+  --text: #1d1d1f;
+  --text-2: #86868b;
+  --inp-bg: #fff;
+  --inp-border: #d9d9de;
+  --chip-bg: rgba(120,120,128,.12);
+  --ghost-bg: rgba(120,120,128,.14);
+  --blue: #007aff;
+  --err-bg: rgba(255,59,48,.09);
+  --err-t: #d70015;
+  --glass-bg: rgba(255,255,255,.52);
+  --glass-line: rgba(0,0,0,.08);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --win-bg: rgba(40,40,46,.84);
+    --stroke: rgba(255,255,255,.14);
+    --sep: rgba(255,255,255,.1);
+    --text: #f5f5f7;
+    --text-2: #98989d;
+    --inp-bg: #1d1d21;
+    --inp-border: #45454b;
+    --chip-bg: rgba(120,120,128,.26);
+    --ghost-bg: rgba(120,120,128,.24);
+    --err-bg: rgba(255,69,58,.14);
+    --err-t: #ff6961;
+    --glass-bg: rgba(28,28,32,.5);
+    --glass-line: rgba(255,255,255,.08);
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Segoe UI",sans-serif;
+  color:var(--text);
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:rgba(0,122,255,.3)}
+
+/* ---------- 桌面壁纸 ---------- */
+.wall{
+  position:fixed; inset:0; z-index:-1;
+  background:
+    radial-gradient(90rem 60rem at 85% 115%, rgba(255,159,64,.55), transparent 60%),
+    radial-gradient(80rem 55rem at -10% 110%, rgba(255,88,110,.42), transparent 55%),
+    radial-gradient(120rem 80rem at 55% -20%, #2f5fd0, transparent 65%),
+    linear-gradient(165deg, #171a33 0%, #2c2454 48%, #6d3f68 100%);
+  animation:drift 80s ease-in-out infinite alternate;
+}
+@keyframes drift{from{filter:hue-rotate(0deg) saturate(1)}to{filter:hue-rotate(16deg) saturate(1.1)}}
+@media (prefers-color-scheme: dark){
+  .wall{
+    background:
+      radial-gradient(90rem 60rem at 85% 115%, rgba(255,138,42,.34), transparent 60%),
+      radial-gradient(80rem 55rem at -10% 110%, rgba(214,57,102,.30), transparent 55%),
+      radial-gradient(120rem 80rem at 55% -20%, #1e2f66, transparent 65%),
+      linear-gradient(165deg, #0b0d1c 0%, #191436 48%, #3c2440 100%);
+  }
+}
+@media (prefers-reduced-motion: reduce){ .wall{animation:none} }
+
+/* ---------- 悬浮时钟 ---------- */
+.clock{
+  position:fixed; top:14px; right:16px; z-index:10;
+  padding:7px 14px; border-radius:999px;
+  background:var(--glass-bg);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 1px 0 var(--glass-line), 0 4px 14px rgba(0,0,0,.12);
+  font-size:13px; font-variant-numeric:tabular-nums;
+}
+
+/* ---------- 窗口 ---------- */
+.window{
+  width:min(660px, calc(100vw - 28px));
+  margin:9vh auto 44px;
+  border-radius:12px; overflow:hidden;
+  background:var(--win-bg);
+  backdrop-filter:blur(36px) saturate(170%);
+  -webkit-backdrop-filter:blur(36px) saturate(170%);
+  box-shadow:0 0 0 .5px var(--stroke), 0 30px 90px rgba(0,0,0,.5), 0 6px 22px rgba(0,0,0,.28);
+}
+.titlebar{
+  height:46px; position:relative;
+  display:flex; align-items:center;
+  padding:0 14px;
+  box-shadow:0 1px 0 var(--sep);
+}
+.tb-title{
+  position:absolute; left:0; right:0; text-align:center;
+  font-size:13px; font-weight:600; pointer-events:none;
+}
+.lights{display:flex; gap:8px}
+.l{width:12px; height:12px; border-radius:50%; display:flex; align-items:center; justify-content:center; box-shadow:inset 0 0 0 .5px rgba(0,0,0,.14)}
+.l svg{width:8px; height:8px; opacity:0; transition:opacity .12s}
+.titlebar:hover .l svg{opacity:.6}
+.l.red{background:#ff5f57}   .l.red svg{stroke:#7d0a05}
+.l.yellow{background:#febc2e}.l.yellow svg{stroke:#96590a}
+.l.green{background:#28c840} .l.green svg{stroke:#0b5d13}
+.pane{padding:24px 30px 28px}
+
+/* ---------- 表单 ---------- */
+.fld{display:block; margin-bottom:14px}
+.lbl{display:block; font-size:13px; font-weight:500; margin-bottom:6px}
+.lbl em{font-style:normal; font-weight:400; font-size:12px; color:var(--text-2)}
+input{
+  width:100%; height:36px; border-radius:7px;
+  border:1px solid var(--inp-border); background:var(--inp-bg); color:var(--text);
+  font-size:13px; font-family:inherit; padding:0 11px; outline:none;
+  transition:border-color .15s, box-shadow .15s;
+}
+input::placeholder{color:var(--text-2)}
+input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)}
+#token{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12px; letter-spacing:.02em; padding-right:38px}
+.inp-wrap{position:relative; display:block}
+.eye{
+  position:absolute; right:5px; top:50%; transform:translateY(-50%);
+  width:26px; height:26px; border:0; border-radius:6px;
+  background:transparent; color:var(--text-2); cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+}
+.eye:hover{background:var(--chip-bg)}
+.btn-primary{
+  width:100%; height:38px; margin-top:4px;
+  border:0; border-radius:8px;
+  background:var(--blue); color:#fff;
+  font-size:14px; font-weight:600; font-family:inherit;
+  cursor:pointer; transition:background .15s, transform .06s, opacity .15s;
+}
+.btn-primary:hover{background:#0071ec}
+.btn-primary:active{transform:scale(.985)}
+.btn-primary[disabled]{opacity:.45; cursor:default}
+.note{margin:12px 0 0; text-align:center; font-size:11.5px; color:var(--text-2)}
+.err{
+  margin-top:12px; border-radius:8px; padding:9px 12px;
+  background:var(--err-bg); color:var(--err-t);
+  font-size:12.5px; line-height:1.55;
+}
+.err a{color:inherit}
+
+/* ---------- 部署中 ---------- */
+#view-progress{padding:30px 6px 12px; text-align:center}
+.bar{height:5px; border-radius:3px; background:var(--chip-bg); overflow:hidden; position:relative}
+.bar-fill{
+  position:absolute; top:0; bottom:0; width:38%; border-radius:3px;
+  background:linear-gradient(90deg,#0a84ff,#5ac8fa);
+  animation:slide 1.15s ease-in-out infinite;
+}
+@keyframes slide{from{left:-40%}to{left:102%}}
+.step{margin:14px 0 0; font-size:13px}
+
+/* ---------- 完成 ---------- */
+#view-done{text-align:center; padding:6px 0 2px}
+.check{
+  width:46px; height:46px; border-radius:50%; background:#34c759;
+  margin:2px auto 10px; display:flex; align-items:center; justify-content:center;
+  box-shadow:0 6px 18px rgba(52,199,89,.35);
+}
+.done-title{margin:0 0 14px; font-size:17px; font-weight:600}
+.row{display:flex; align-items:center; gap:8px; margin:0 auto 8px; max-width:470px}
+.rl{flex:none; width:30px; text-align:right; font-size:12px; color:var(--text-2)}
+.chip{
+  flex:1; min-width:0; text-align:left;
+  background:var(--chip-bg); border-radius:6px; padding:7px 10px;
+  font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.copy{
+  flex:none; width:28px; height:28px; border:0; border-radius:6px;
+  background:transparent; color:var(--text-2); cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+}
+.copy:hover{background:var(--chip-bg)}
+.copy.ok{color:#34c759}
+#view-done .note{margin-top:12px}
+.btnrow{display:flex; gap:10px; justify-content:center; margin-top:16px}
+.btn-primary.sm{width:auto; height:32px; margin:0; padding:0 16px; font-size:13px; display:inline-flex; align-items:center; text-decoration:none}
+.btn-ghost{
+  height:32px; padding:0 16px; border:0; border-radius:8px;
+  background:var(--ghost-bg); color:var(--text);
+  font-size:13px; font-weight:500; font-family:inherit; cursor:pointer;
+  display:inline-flex; align-items:center;
+}
+.btn-ghost:hover{filter:brightness(.96)}
+
+/* ---------- R2 教程 ---------- */
+.rule{border:0; border-top:1px solid var(--sep); margin:22px 0 18px}
+.tut h2{margin:0 0 12px; font-size:14px; font-weight:600}
+.tut ol{margin:0; padding-left:20px; display:grid; gap:12px}
+.tut li{font-size:13px; line-height:1.55}
+.shot{margin-top:8px}
+.shot img{
+  width:100%; display:block; border-radius:8px;
+  border:1px solid var(--stroke);
+  box-shadow:0 2px 10px rgba(0,0,0,.14);
+}
+.shot.gone{display:none}
+
+@media (max-width:560px){
+  .window{margin:7vh auto 28px}
+  .pane{padding:20px 18px 22px}
+  .row{max-width:none}
+}
+</style>
+</head>
+<body>
+<div class="wall" aria-hidden="true"></div>
+
+<div class="clock" id="clock">—</div>
+
+<main class="window">
+  <div class="titlebar">
+    <div class="lights" aria-hidden="true">
+      <span class="l red"><svg viewBox="0 0 8 8" fill="none" stroke-width="1.2" stroke-linecap="round"><path d="M1.6 1.6l4.8 4.8M6.4 1.6L1.6 6.4"/></svg></span>
+      <span class="l yellow"><svg viewBox="0 0 8 8" fill="none" stroke-width="1.2" stroke-linecap="round"><path d="M1.2 4h5.6"/></svg></span>
+      <span class="l green"><svg viewBox="0 0 8 8" fill="none" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"><path d="M1.2 4.6L4.6 1.2M4.6 1.2H2.4M4.6 1.2v2.2M6.8 3.4L3.4 6.8m0 0h2.2M3.4 6.8V4.6"/></svg></span>
+    </div>
+    <div class="tb-title">RP-Hub 部署器</div>
+  </div>
+
+  <section class="pane">
+    <!-- 表单 -->
+    <div id="view-form">
+      <label class="fld">
+        <span class="lbl">访问令牌</span>
+        <span class="inp-wrap">
+          <input id="token" type="password" placeholder="Cloudflare API 令牌" autocomplete="off" spellcheck="false">
+          <button type="button" class="eye" id="eye" aria-label="显示或隐藏令牌">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/></svg>
+          </button>
+        </span>
+      </label>
+      <label class="fld">
+        <span class="lbl">访问密码</span>
+        <input id="password" type="password" placeholder="项目访问密码" autocomplete="new-password">
+      </label>
+      <label class="fld">
+        <span class="lbl">项目名 <em>（可选）</em></span>
+        <input id="projectName" type="text" placeholder="留空自动生成" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="deploy" class="btn-primary" type="button">部署</button>
+      <p class="note">令牌通过 zhao 的 Worker 转发部署。</p>
+      <div id="err" class="err" hidden></div>
+    </div>
+
+    <!-- 部署中 -->
+    <div id="view-progress" hidden>
+      <div class="bar"><div class="bar-fill"></div></div>
+      <p class="step" id="step" aria-live="polite">正在验证令牌…</p>
+    </div>
+
+    <!-- 完成 -->
+    <div id="view-done" hidden>
+      <div class="check" aria-hidden="true">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+      </div>
+      <p class="done-title">部署完成</p>
+      <div class="row"><span class="rl">网址</span><code class="chip" id="url"></code>
+        <button class="copy" data-copy="url" aria-label="拷贝网址"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg></button>
+      </div>
+      <div class="row"><span class="rl">密码</span><code class="chip" id="pwd"></code>
+        <button class="copy" data-copy="pwd" aria-label="拷贝密码"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg></button>
+      </div>
+      <p class="note">在 RP-Hub 同步设置中填入以上网址与密码。</p>
+      <div class="btnrow">
+        <a id="open" class="btn-primary sm" href="#" target="_blank" rel="noopener">打开站点</a>
+        <button id="again" class="btn-ghost" type="button">再部署一个</button>
+      </div>
+    </div>
+
+    <hr class="rule">
+
+    <!-- R2 激活教程 -->
+    <section class="tut" id="tut">
+      <h2>R2 激活（首次需要）</h2>
+      <ol>
+        <li>
+          控制台左侧进入 R2，点「Add R2 subscription to my account」激活：
+          <div class="shot"><img src="img/r2-activate.png" alt="R2 激活页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+        </li>
+        <li>
+          订阅 → 计费方法 → 添加：绑自己的卡，或用 Q 群精华里的卡。
+          <div class="shot"><img src="img/r2-card.png" alt="计费方法页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+        </li>
+        <li>激活时可能预存 $5（可抵扣用量）；免费额度 10GB 存储/月，不超不扣费。</li>
+      </ol>
+    </section>
+  </section>
+</main>
+
+<script>
+'use strict';
+// 部署你的 Worker 后，把地址填到这里，例如 'https://rp-deploy.xxx.workers.dev'
+// 也可以临时用 ?worker=https://... 覆盖（便于测试）
+const DEFAULT_WORKER = 'https://w.mhjx.cc.cd';
+const WORKER = (new URLSearchParams(location.search).get('worker') || DEFAULT_WORKER).replace(/\/+$/, '');
+
+const $ = id => document.getElementById(id);
+const views = { form: $('view-form'), progress: $('view-progress'), done: $('view-done') };
+function show(name){ for (const k in views) views[k].hidden = (k !== name); }
+
+/* 菜单栏时钟 */
+function tick(){
+  const d = new Date();
+  const date = d.toLocaleDateString('zh-CN', { month:'long', day:'numeric' });
+  const wk = d.toLocaleDateString('zh-CN', { weekday:'short' });
+  $('clock').textContent = date + ' ' + wk + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+tick(); setInterval(tick, 15000);
+
+/* 令牌可见性 */
+$('eye').addEventListener('click', () => {
+  const t = $('token');
+  t.type = (t.type === 'password') ? 'text' : 'password';
+});
+
+/* 部署中步骤动画 */
+const STEPS = ['正在验证令牌…','正在创建存储桶…','正在创建项目…','正在上传文件…','即将完成…'];
+let stepTimer = null;
+function startSteps(){
+  let i = 0; $('step').textContent = STEPS[0];
+  stepTimer = setInterval(() => { i = Math.min(i + 1, STEPS.length - 1); $('step').textContent = STEPS[i]; }, 1700);
+}
+function stopSteps(){ clearInterval(stepTimer); }
+
+/* 错误提示 */
+function showError(msg, code){
+  const e = $('err');
+  e.textContent = msg;
+  if (code === 'R2_NOT_ENABLED'){
+    const a = document.createElement('a');
+    a.href = '#tut'; a.textContent = '查看下方 R2 激活教程';
+    e.append(' ', a);
+  }
+  e.hidden = false;
+}
+
+/* 拷贝 */
+document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
+  const text = $(btn.dataset.copy).textContent;
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.append(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  btn.classList.add('ok'); setTimeout(() => btn.classList.remove('ok'), 1200);
+}));
+
+/* 部署 */
+$('deploy').addEventListener('click', async () => {
+  const token = $('token').value.trim();
+  const password = $('password').value;
+  const projectName = $('projectName').value.trim() || ('rp-' + Math.random().toString(36).slice(2, 6));
+  $('err').hidden = true;
+  if (!token || !password){ showError('请填写令牌和密码。'); return; }
+  if (!WORKER){ showError('部署服务未配置。'); return; }
+  show('progress'); startSteps();
+  try {
+    const r = await fetch(WORKER + '/api/deploy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, password, projectName })
+    });
+    const data = await r.json().catch(() => null);
+    if (r.ok && data && data.ok){
+      stopSteps();
+      $('url').textContent = data.url;
+      $('pwd').textContent = password;
+      $('open').href = data.url;
+      show('done');
+    } else {
+      stopSteps(); show('form');
+      showError((data && data.error) || ('部署失败（HTTP ' + r.status + '）'), data && data.code);
+    }
+  } catch {
+    stopSteps(); show('form');
+    showError('网络异常，稍后再试。');
+  }
+});
+
+$('again').addEventListener('click', () => show('form'));
+</script>
+</body>
+</html>

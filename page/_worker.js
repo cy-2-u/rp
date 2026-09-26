@@ -27,6 +27,82 @@ const ADAPTER_MAX_BYTES = 512 * 1024;
 const ADAPTER_CACHE_TTL_MS = 30 * 1000;
 const adapterCache = new Map();
 
+// ---- GitHub 多源容错：适配清单走竞速，作者页面走故障转移链（仅用于公开静态资源） ----
+const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good.json';
+const AUTHOR_REPO_RAW = 'https://raw.githubusercontent.com/sta1n156/RP-Hub/main/';
+const AUTHOR_FETCH_TIMEOUT_MS = 8 * 1000;
+const GITHUB_FALLBACK_TIMEOUT_MS = 10 * 1000;
+const AUTHOR_PRIMARY_COOLDOWN_MS = 60 * 1000;
+let authorPrimaryFailures = 0;
+let authorPrimaryCooldownUntil = 0;
+let adapterLastGoodPersisted = null;
+
+function githubMirrorUrls(rawUrl) {
+    const match = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(rawUrl);
+    if (!match) return [];
+    return [
+        `https://cdn.jsdelivr.net/gh/${match[1]}/${match[2]}@${match[3]}/${match[4]}`,
+        `https://github.cmliussss.com/${rawUrl}`,
+        `https://github.090227.xyz/${rawUrl}`,
+    ];
+}
+
+async function fetchGithubText(url, timeoutMs) {
+    const candidates = [url.href, ...githubMirrorUrls(url.href)];
+    const controllers = candidates.map(() => new AbortController());
+    const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, timeoutMs);
+    try {
+        return await Promise.any(candidates.map(async (candidate, index) => {
+            const response = await fetch(candidate, {
+                headers: { accept: 'application/json,text/plain' },
+                signal: controllers[index].signal,
+                redirect: 'follow'
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return String(await response.text()).replace(/^\uFEFF/, '');
+        }));
+    } finally {
+        clearTimeout(timer);
+        for (const c of controllers) c.abort();
+    }
+}
+
+async function fetchAuthorUpstream(path, init, search) {
+    const rel = String(path || '').replace(/^\/+/, '');
+    if (Date.now() >= authorPrimaryCooldownUntil) {
+        const primaryUrl = new URL(rel, AUTHOR_BASE);
+        if (search) primaryUrl.search = search;
+        try {
+            const response = await fetch(primaryUrl, { ...init, signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS) });
+            if (response.ok || response.status === 304 || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+                authorPrimaryFailures = 0;
+                return response;
+            }
+            authorPrimaryFailures += 1;
+        } catch (_) {
+            authorPrimaryFailures += 1;
+        }
+        if (authorPrimaryFailures >= 2) {
+            authorPrimaryFailures = 0;
+            authorPrimaryCooldownUntil = Date.now() + AUTHOR_PRIMARY_COOLDOWN_MS;
+        }
+    }
+    const candidates = githubMirrorUrls(AUTHOR_REPO_RAW + rel);
+    if (candidates.length === 0) throw new Error('作者站点不可用。');
+    const controllers = candidates.map(() => new AbortController());
+    const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, GITHUB_FALLBACK_TIMEOUT_MS);
+    try {
+        return await Promise.any(candidates.map(async (candidate, index) => {
+            const response = await fetch(candidate, { ...init, signal: controllers[index].signal, redirect: 'follow' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response;
+        }));
+    } finally {
+        clearTimeout(timer);
+        for (const c of controllers) c.abort();
+    }
+}
+
 function validateAdapter(adapter) {
     if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter)) {
         throw new Error('适配清单格式无效。');
@@ -93,11 +169,27 @@ async function loadAdapter(env) {
     const cached = adapterCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-    const response = await fetch(url, { headers: { accept: 'application/json,text/plain' } });
-    if (!response.ok) throw new Error(`适配清单读取失败：HTTP ${response.status}`);
-    const contentLength = Number(response.headers.get('content-length') || 0);
-    if (contentLength > ADAPTER_MAX_BYTES) throw new Error('适配清单超过大小上限。');
-    const source = String(await response.text()).replace(/^\uFEFF/, '');
+    let source = null;
+    let fromLastGood = false;
+    if (url.protocol === 'file:') {
+        const response = await fetch(url, { headers: { accept: 'application/json,text/plain' } });
+        if (!response.ok) throw new Error(`适配清单读取失败：HTTP ${response.status}`);
+        source = String(await response.text()).replace(/^\uFEFF/, '');
+    } else {
+        try {
+            source = await fetchGithubText(url, GITHUB_FALLBACK_TIMEOUT_MS);
+        } catch (_) {
+            source = null;
+        }
+        if (source === null) {
+            const lastGood = await env?.[R2_BINDING]?.get(ADAPTER_LASTGOOD_KEY);
+            if (lastGood) {
+                source = String(await lastGood.text()).replace(/^\uFEFF/, '');
+                fromLastGood = true;
+            }
+        }
+        if (source === null) throw new Error('适配清单读取失败：所有源均不可用。');
+    }
     if (textEncoder.encode(source).byteLength > ADAPTER_MAX_BYTES) {
         throw new Error('适配清单超过大小上限。');
     }
@@ -108,6 +200,12 @@ async function loadAdapter(env) {
         throw error instanceof Error ? error : new Error('适配清单解析失败。');
     }
     adapterCache.set(cacheKey, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
+    if (!fromLastGood && url.protocol !== 'file:' && source !== adapterLastGoodPersisted && env?.[R2_BINDING]) {
+        adapterLastGoodPersisted = source;
+        try {
+            await env[R2_BINDING].put(ADAPTER_LASTGOOD_KEY, source, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+        } catch (_) { /* 兜底缓存写入失败不影响服务 */ }
+    }
     return adapter;
 }
 
@@ -2097,7 +2195,7 @@ async function sourceCheckResults(adapter, knownContent = null, fetchUnknownPath
                 allPassed = false;
                 continue;
             }
-            const response = await fetch(new URL(check.path.replace(/^\/+/, ''), AUTHOR_BASE));
+            const response = await fetchAuthorUpstream(check.path);
             let passed = false;
             if (response.ok) {
                 const text = await response.text();
@@ -2197,8 +2295,6 @@ async function serveAuthor(request, env) {
     if (upstreamPath === '/character') upstreamPath = '/character/index.html';
     if (upstreamPath === '/novel') upstreamPath = '/novel/index.html';
 
-    const upstreamUrl = new URL(upstreamPath.replace(/^\/+/, ''), AUTHOR_BASE);
-    upstreamUrl.search = requestUrl.search;
     const upstreamHeaders = new Headers(request.headers);
     upstreamHeaders.delete('host');
     upstreamHeaders.delete('cookie');
@@ -2219,12 +2315,12 @@ async function serveAuthor(request, env) {
         upstreamHeaders.delete('if-none-match');
         upstreamHeaders.delete('if-modified-since');
     }
-    const response = await fetch(upstreamUrl, {
+    const response = await fetchAuthorUpstream(upstreamPath, {
         method: request.method,
         headers: upstreamHeaders,
         body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
         redirect: 'follow'
-    });
+    }, requestUrl.search);
     const contentType = response.headers.get('content-type') || '';
     if (request.method === 'HEAD' || response.status === 204) return response;
     if (isAppJs && response.status === 304) {
