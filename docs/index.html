@@ -22,23 +22,6 @@
   --glass-bg: rgba(255,255,255,.52);
   --glass-line: rgba(0,0,0,.08);
 }
-@media (prefers-color-scheme: dark){
-  :root{
-    --win-bg: rgba(40,40,46,.84);
-    --stroke: rgba(255,255,255,.14);
-    --sep: rgba(255,255,255,.1);
-    --text: #f5f5f7;
-    --text-2: #98989d;
-    --inp-bg: #1d1d21;
-    --inp-border: #45454b;
-    --chip-bg: rgba(120,120,128,.26);
-    --ghost-bg: rgba(120,120,128,.24);
-    --err-bg: rgba(255,69,58,.14);
-    --err-t: #ff6961;
-    --glass-bg: rgba(28,28,32,.5);
-    --glass-line: rgba(255,255,255,.08);
-  }
-}
 *{box-sizing:border-box}
 html,body{margin:0}
 body{
@@ -60,15 +43,6 @@ body{
   animation:drift 80s ease-in-out infinite alternate;
 }
 @keyframes drift{from{filter:hue-rotate(0deg) saturate(1)}to{filter:hue-rotate(16deg) saturate(1.1)}}
-@media (prefers-color-scheme: dark){
-  .wall{
-    background:
-      radial-gradient(90rem 60rem at 85% 115%, rgba(255,138,42,.34), transparent 60%),
-      radial-gradient(80rem 55rem at -10% 110%, rgba(214,57,102,.30), transparent 55%),
-      radial-gradient(120rem 80rem at 55% -20%, #1e2f66, transparent 65%),
-      linear-gradient(165deg, #0b0d1c 0%, #191436 48%, #3c2440 100%);
-  }
-}
 @media (prefers-reduced-motion: reduce){ .wall{animation:none} }
 
 /* ---------- 悬浮时钟 ---------- */
@@ -207,6 +181,15 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
   box-shadow:0 2px 10px rgba(0,0,0,.14);
 }
 .shot.gone{display:none}
+.tut a{color:var(--blue); text-decoration:none}
+.tut a:hover{text-decoration:underline}
+
+/* ---------- 教程分页 ---------- */
+.seg{display:inline-flex; background:var(--chip-bg); border-radius:9px; padding:2px; gap:2px; margin:0 0 16px}
+.seg button{border:0; background:transparent; border-radius:7px; padding:5px 18px; font-size:13px; font-family:inherit; color:var(--text-2); cursor:pointer; transition:color .15s}
+.seg button:hover{color:var(--text)}
+.seg button.on{background:var(--inp-bg); box-shadow:0 1px 3px rgba(0,0,0,.14); color:var(--text); font-weight:500}
+.mainnav{display:flex; justify-content:center; padding-top:16px}
 
 @media (max-width:560px){
   .window{margin:7vh auto 28px}
@@ -230,7 +213,16 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
     <div class="tb-title">RP-Hub 部署器</div>
   </div>
 
+  <div class="mainnav">
+    <nav class="seg" id="mainNav">
+      <button type="button" class="on" data-page="deploy">部署</button>
+      <button type="button" data-page="token">创建令牌</button>
+      <button type="button" data-page="r2">激活 R2</button>
+    </nav>
+  </div>
+
   <section class="pane">
+    <div id="page-deploy">
     <!-- 表单 -->
     <div id="view-form">
       <label class="fld">
@@ -280,23 +272,49 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
       </div>
     </div>
 
-    <hr class="rule">
+    </div>
 
-    <!-- R2 激活教程 -->
-    <section class="tut" id="tut">
-      <h2>R2 激活（首次需要）</h2>
+    <!-- 创建令牌教程 -->
+    <div id="page-token" class="tut" hidden>
       <ol>
-        <li>
-          控制台左侧进入 R2，点「Add R2 subscription to my account」激活：
-          <div class="shot"><img src="img/r2-activate.png" alt="R2 激活页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
-        </li>
-        <li>
-          订阅 → 计费方法 → 添加：绑自己的卡，或用 Q 群精华里的卡。
-          <div class="shot"><img src="img/r2-card.png" alt="计费方法页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
-        </li>
-        <li>激活时可能预存 $5（可抵扣用量）；免费额度 10GB 存储/月，不超不扣费。</li>
-      </ol>
-    </section>
+          <li>
+            打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">dash.cloudflare.com/profile/api-tokens</a>，点右上角「创建令牌」：
+            <div class="shot"><img src="img/step-token-1.png" alt="API 令牌页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>
+            模板里选「编辑 Cloudflare Workers」→ 使用模板：
+            <div class="shot"><img src="img/step-token-2.png" alt="选择模板" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>
+            帐户资源保持默认，往下滑 → 继续以显示摘要：
+            <div class="shot"><img src="img/step-token-3.png" alt="帐户资源配置" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>
+            创建令牌：
+            <div class="shot"><img src="img/step-token-4.png" alt="令牌摘要" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>
+            复制令牌，粘贴到上方「访问令牌」。部署完成后可删除该令牌：
+            <div class="shot"><img src="img/step-token-5.png" alt="复制令牌" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+        </ol>
+    </div>
+
+    <!-- 激活 R2 教程 -->
+    <div id="page-r2" class="tut" hidden>
+      <ol>
+          <li>
+            控制台左侧进入 R2，点「将 R2 订阅添加到我的帐户」激活：
+            <div class="shot"><img src="img/r2-activate.png" alt="R2 激活页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>
+            绑卡激活（Apple Pay / PayPal / 银行卡均可）：绑自己的卡，或用 Q 群精华里的卡；账单地址可用 <a href="https://addressgen.top/zh" target="_blank" rel="noopener">addressgen.top/zh</a> 生成。
+            <div class="shot"><img src="img/r2-card.png" alt="激活 R2 绑卡页" loading="lazy" onerror="this.parentNode.classList.add('gone')"></div>
+          </li>
+          <li>免费额度 10GB 存储/月，超出后每 1GB 约 0.1 元/月，不超不扣费。</li>
+        </ol>
+    </div>
+  </section>
   </section>
 </main>
 
@@ -326,6 +344,14 @@ $('eye').addEventListener('click', () => {
   t.type = (t.type === 'password') ? 'text' : 'password';
 });
 
+/* 页面切换：部署 / 创建令牌 / 激活 R2 */
+const pages = { deploy: $('page-deploy'), token: $('page-token'), r2: $('page-r2') };
+function switchPage(name) {
+  document.querySelectorAll('#mainNav button').forEach(b => b.classList.toggle('on', b.dataset.page === name));
+  for (const k in pages) pages[k].hidden = (k !== name);
+}
+document.querySelectorAll('#mainNav button').forEach(b => b.addEventListener('click', () => switchPage(b.dataset.page)));
+
 /* 部署中步骤动画 */
 const STEPS = ['正在验证令牌…','正在创建存储桶…','正在创建项目…','正在上传文件…','即将完成…'];
 let stepTimer = null;
@@ -341,7 +367,8 @@ function showError(msg, code){
   e.textContent = msg;
   if (code === 'R2_NOT_ENABLED'){
     const a = document.createElement('a');
-    a.href = '#tut'; a.textContent = '查看下方 R2 激活教程';
+    a.href = '#'; a.textContent = '查看「激活 R2」教程';
+    a.addEventListener('click', (ev) => { ev.preventDefault(); switchPage('r2'); });
     e.append(' ', a);
   }
   e.hidden = false;
