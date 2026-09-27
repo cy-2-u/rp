@@ -495,7 +495,13 @@ async function readBoundedImageBytes(message, maxBytes, label, signal) {
     try {
         const declaredLength = Number(message.headers.get('content-length') || 0);
         if (declaredLength > maxBytes) throw tooLarge(declaredLength);
-        const chunks = [];
+        // 上游和缩略图上传基本都带 content-length：按声明值一次分配、
+        // 各分片零拷贝写入，峰值内存从“分片列表+整体副本”的双倍降为
+        // 单倍（64MiB 上限图不再可能撞 128MiB isolate）；无声明或声明
+        // 不符时才退回倍增扩容。
+        let buffer = Number.isSafeInteger(declaredLength) && declaredLength >= 1
+            ? new Uint8Array(declaredLength)
+            : null;
         let total = 0;
         while (reader) {
             if (signal?.aborted) throw new Error('Image fetch timed out.');
@@ -504,15 +510,19 @@ async function readBoundedImageBytes(message, maxBytes, label, signal) {
             if (done) break;
             total += value.byteLength;
             if (total > maxBytes) throw tooLarge(total);
-            chunks.push(value);
+            if (!buffer || total > buffer.byteLength) {
+                const grown = new Uint8Array(Math.min(
+                    maxBytes,
+                    Math.max(total, (buffer?.byteLength || 0) * 2, 1024 * 1024)
+                ));
+                if (buffer) grown.set(buffer.subarray(0, total - value.byteLength));
+                buffer = grown;
+            }
+            buffer.set(value, total - value.byteLength);
         }
-        const bytes = new Uint8Array(total);
-        let offset = 0;
-        for (const chunk of chunks) {
-            bytes.set(chunk, offset);
-            offset += chunk.byteLength;
-        }
-        return bytes.buffer;
+        if (!buffer) return new ArrayBuffer(0);
+        if (total === buffer.byteLength) return buffer.buffer;
+        return buffer.slice(0, total).buffer;
     } catch (err) {
         cancel();
         throw err;
@@ -2130,13 +2140,14 @@ async function handleApi(request, env, url) {
 async function serveStatic(request, env) {
     if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') return null;
     const assetResponse = await env.ASSETS.fetch(request);
-    if (!assetResponse || assetResponse.status === 404) return assetResponse;
+    if (!assetResponse || assetResponse.status !== 200) return assetResponse;
     // 同步客户端的全部代码都在这四个部署文件里。409 版本门的
     // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
-    // 页面与 app.js 已是 no-store，这里把资产同样设为 no-store，
-    // 不给浏览器或边缘缓存任何回放旧客户端的机会。
+    // HTML 与 app.js 已是 no-store；这四个文件约 190KB 且每次部署
+    // etag 必然变化，no-cache 协商缓存让未变化请求直接 304，
+    // 部署后也不会回放旧客户端。
     const headers = new Headers(assetResponse.headers);
-    headers.set('cache-control', 'no-store');
+    headers.set('cache-control', 'no-cache');
     return new Response(assetResponse.body, {
         status: assetResponse.status,
         statusText: assetResponse.statusText,

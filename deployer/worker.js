@@ -315,10 +315,10 @@ async function handleDeploy(request, origin) {
     const chunks = [];
     const pushText = (s) => chunks.push(enc.encode(s));
     pushText(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n`);
-    pushText(JSON.stringify(Object.fromEntries(assetHashes)));
+    pushText(JSON.stringify(Object.fromEntries(assetHashes)) + '\r\n');
     pushText(`--${boundary}\r\nContent-Disposition: form-data; name="commit_dirty"\r\n\r\ntrue\r\n`);
-    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="_worker.bundle"; filename="_worker.bundle"\r\nContent-Type: application/octet-stream\r\n\r\n`);
     const innerBoundary = '----rphubbundle' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="_worker.bundle"; filename="_worker.bundle"\r\nContent-Type: multipart/form-data; boundary=${innerBoundary}\r\n\r\n`);
     pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n{"main_module":"_worker.js"}\r\n`);
     pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="_worker.js"; filename="_worker.js"\r\nContent-Type: application/javascript+module\r\n\r\n`);
     chunks.push(workerBytes);
@@ -366,7 +366,14 @@ async function handleDeploy(request, origin) {
 
   const r2Detect = await cfApi(token, `/accounts/${accountId}/r2/buckets/${R2_NAME}`);
   const r2Exists = r2Detect.ok;
-  const subdomain = (project.result && project.result.subdomain && project.result.subdomain.name) || projectNameFinal;
+  const deployDomain = (() => {
+    const r = project.result || {};
+    let s = r.subdomain;
+    if (s && typeof s === 'object' && typeof s.name === 'string') s = s.name;
+    if (typeof s === 'string' && s.includes('.pages.dev')) return s;
+    if (Array.isArray(r.domains) && r.domains.length) return r.domains[0];
+    return projectNameFinal + '.pages.dev';
+  })();
 
   if (r2Exists) {
 
@@ -375,7 +382,7 @@ async function handleDeploy(request, origin) {
     const dep = await uploadOnce();
     if (dep.error) return json({ ok: false, error: dep.error }, 200, origin);
     await poll(dep.id);
-    return json({ ok: true, url: `https://${subdomain}.pages.dev`, projectName: projectNameFinal, subdomain, mode: 'update' }, 200, origin);
+    return json({ ok: true, url: `https://${deployDomain}`, projectName: projectNameFinal, subdomain: deployDomain, mode: 'update' }, 200, origin);
   }
 
   const dep1 = await uploadOnce();
@@ -402,7 +409,7 @@ async function handleDeploy(request, origin) {
   if (dep2.error) return json({ ok: false, error: dep2.error }, 200, origin);
   const pollErr = await poll(dep2.id);
   if (pollErr) return json({ ok: false, error: pollErr }, 200, origin);
-  return json({ ok: true, url: `https://${subdomain}.pages.dev`, projectName: projectNameFinal, subdomain, mode: 'full' }, 200, origin);
+  return json({ ok: true, url: `https://${deployDomain}`, projectName: projectNameFinal, subdomain: deployDomain, mode: 'full' }, 200, origin);
 }
 
 export default {

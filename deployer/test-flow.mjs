@@ -100,6 +100,7 @@ globalThis.fetch = async (url, init = {}) => {
     const ct = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
     const bm = /boundary=([^;\s]+)/.exec(ct);
     const text = new TextDecoder('utf8').decode(init.body);
+    saved.deployRaw = text;
     const parts = text.split('--' + (bm ? bm[1] : '@@none@@'));
     const manifestPart = parts.find(p => p.includes('name="manifest"'));
     const branchPart = parts.find(p => p.includes('name="branch"'));
@@ -183,6 +184,7 @@ async function deploy(body, ip) {
   // 第一次 deployment 的 multipart 形状（手动构造体）
   const manifest = saved.deployManifests[0];
   ok(!!manifest, 'deployment multipart 含 manifest');
+  ok(saved.deployRaw.includes(JSON.stringify(manifest) + '\r\n--'), 'manifest 部件后有 CRLF（服务端 multipart 严格解析必需）');
   const keys = Object.keys(manifest).sort();
   ok(JSON.stringify(keys) === JSON.stringify(['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/DB/styles.css', '/magic-extension.js']), 'manifest 键（含前导斜杠、无 _worker.js）');
   ok(Object.values(manifest).every(h => /^[0-9a-f]{32}$/.test(h)), 'manifest 哈希格式');
