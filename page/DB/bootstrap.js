@@ -239,7 +239,6 @@
     const JOURNAL_STORE = '__rp_sync_journal_v2';
     const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
-    const BASELINE_KEY = 'rp_sync_baseline_v2';
     const CACHE_STATE_KEY = 'snapshot';
     const CACHE_FORMAT_VERSION = 7;
     const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
@@ -311,16 +310,6 @@
         return true;
     }
 
-    function readBaseline() {
-        const value = localStorage.getItem(BASELINE_KEY);
-        if (value === null) return null;
-        try {
-            const parsed = JSON.parse(value);
-            if (!Number.isSafeInteger(parsed.version) || typeof parsed.checksum !== 'string') throw new Error();
-            if (Number(parsed.schemaVersion) !== SNAPSHOT_SCHEMA_VERSION) return null;
-            return parsed;
-        } catch (_) { throw new Error('同步基线损坏，请先导出本地数据，再重新建立基线。'); }
-    }
 
     function createYieldController() {
         let lastYieldAt = performance.now();
@@ -1950,11 +1939,6 @@
                 epochs: (await readDirtyState()).epochs,
                 snapshot
             });
-            localStorage.setItem(BASELINE_KEY, JSON.stringify({
-                version: remote.version,
-                checksum: remote.checksum,
-                schemaVersion: SNAPSHOT_SCHEMA_VERSION
-            }));
             await window.RPH_SYNC_TRACKER.acknowledge(restoreWatermark);
         } catch (error) {
             restorer.abort();
@@ -2160,12 +2144,11 @@
         const cacheDb = await openLocalSyncCache();
         try {
             const dirty = await readDirtyState();
-            const baseline = readBaseline();
             let state = await cacheReadState(cacheDb);
             const rebuild = localStorage.getItem('rp_sync_rebuild_requested') === '1';
             const epoch = localStorage.getItem(TRACKING_EPOCH_KEY);
             const journalReset = state?.epochs && Object.entries(state.epochs).some(([name, value]) => dirty.epochs[name] !== value);
-            if (!rebuild && (baseline || state) && (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.epoch !== epoch || journalReset)) {
+            if (!rebuild && state && (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.epoch !== epoch || journalReset)) {
                 const error = new Error('本地同步索引缺失、过期或追踪已重置，需要完整重建索引后才能继续上传（只读本地数据，不会覆盖云端）。');
                 error.indexInvalid = true;
                 throw error;
@@ -2576,19 +2559,17 @@
         const statusResponse = await postSync({ action: 'prepare-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION }, {
             timeoutMs: CONFIG.commitTimeoutMs
         });
-        const baseline = readBaseline();
         let baseRemote = statusResponse.remote || null;
-        let baseVersion = Number(baseline?.version || 0);
-        let baseChecksum = baseline?.checksum || '';
+        let baseVersion = Number(baseRemote?.version || 0);
+        let baseChecksum = baseRemote?.checksum || '';
         let incremental;
         try {
             incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
         } catch (err) {
             if (!err?.indexInvalid) throw err;
             // 索引过期不再要求用户离开当前流程：一次确认后自动重建并继续
-            // 上传。重建只读本地数据；云端若被别端更新过，后续提交仍会被
-            // 基线比对拦下，这里不会造成静默覆盖。
-            if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据，不会覆盖云端；云端若被别端更新过，上传仍会被基线比对拦下。大库可能需要几分钟。继续吗？')) {
+            // 上传。重建只读本地数据；云端以上传开始时的状态为基准整体替换。
+            if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据。大库可能需要几分钟。继续吗？')) {
                 if (rebuildButton) rebuildButton.style.display = '';
                 throw err;
             }
@@ -2605,16 +2586,8 @@
             baseChecksum = '';
         }
         if (baseRemote?.checksum === snapshot.checksum) {
-            localStorage.setItem(BASELINE_KEY, JSON.stringify({
-                version: baseRemote.version,
-                checksum: snapshot.checksum,
-                schemaVersion: SNAPSHOT_SCHEMA_VERSION
-            }));
             await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
             return true;
-        }
-        if (Number(baseRemote?.version || 0) !== baseVersion || (baseRemote && baseRemote.checksum !== baseline?.checksum)) {
-            throw new Error('云端与此浏览器的已确认基线不同，已停止上传以防覆盖。请先导出本地数据，再恢复云端并合并本地修改。');
         }
 
         updateProgress(progress.uploadStart, '正在上传并分页校验…');
@@ -2627,11 +2600,6 @@
         if (committedRemote?.checksum !== snapshot.checksum) {
             throw new Error('服务器没有确认新快照。');
         }
-        localStorage.setItem(BASELINE_KEY, JSON.stringify({
-            version: committedRemote.version,
-            checksum: snapshot.checksum,
-            schemaVersion: SNAPSHOT_SCHEMA_VERSION
-        }));
         await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
         // 与快照相同校验和的基线已在上面提前返回 true；
         // 走到这里必然是一次全新提交。

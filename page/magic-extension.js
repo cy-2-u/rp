@@ -65,19 +65,7 @@
         descriptor.promptHash || hashText(descriptor.prompt || '')
     ].join(':');
 
-    const inferProvider = (url, token = '') => {
-        const requested = String(url.searchParams.get('provider') || '').trim().toLowerCase();
-        if (['rinko', 'sta1n', 'std'].includes(requested)) return requested;
-        const host = url.hostname.toLowerCase();
-        if (host.includes('nai.rinko.ai')) return 'rinko';
-        if (host.includes('nai.sta1n.cn')) return 'sta1n';
-        if (host.includes('std.loliyc.com')) return 'std';
-        const normalizedToken = String(token || '').trim().toUpperCase();
-        if (normalizedToken.startsWith('STA1N')) return 'sta1n';
-        if (normalizedToken.startsWith('STD')) return 'std';
-        return 'sta1n';
-    };
-
+    // 生图上游固定为 sta1n；provider 不再参与路由，只作为签名组成保持旧缓存 key。
     const normalizeRequestUrl = (value, characterName) => {
         const source = new URL(value, location.href);
         const target = new URL('/api/rp-image', location.origin);
@@ -85,7 +73,7 @@
             if (source.searchParams.has(key)) target.searchParams.set(key, source.searchParams.get(key));
         });
         const token = source.searchParams.get('token') || '';
-        target.searchParams.set('provider', inferProvider(source, token));
+        target.searchParams.set('provider', 'sta1n');
         if (source.searchParams.has('reroll_nonce')) target.searchParams.set('reroll_nonce', source.searchParams.get('reroll_nonce'));
         if (token) target.searchParams.set('token', token);
         target.searchParams.set('character_name', String(source.searchParams.get('character_name') || characterName || '未命名角色'));
@@ -279,7 +267,7 @@
     const snapshotFromUrl = (url, characterName, reroll = false) => {
         const snapshot = {};
         IMAGE_PARAM_KEYS.forEach(key => { snapshot[key] = String(url.searchParams.get(key) || ''); });
-        snapshot.provider = inferProvider(url, url.searchParams.get('token') || '');
+        snapshot.provider = 'sta1n';
         snapshot.nocache = reroll ? '1' : (snapshot.nocache || '0');
         snapshot.rerollNonce = reroll ? (crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`) : String(url.searchParams.get('reroll_nonce') || '');
         snapshot.characterName = String(url.searchParams.get('character_name') || characterName || '未命名角色');
@@ -519,7 +507,13 @@
         return task;
     };
 
-    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render }) => {
+    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render, startGeneratedImageTask }) => {
+        // 固定生图关闭：整条生图链路交还作者原版实现——请求 URL、令牌与展示
+        // 全部是作者自己的，图片不进 R2。作者的“自动生图”开关仍然生效；
+        // 旧适配清单未透传作者任务函数时，保持原有代理路径不变。
+        if (!isFixedImageEnabled() && autoImageGen !== false && typeof startGeneratedImageTask === 'function') {
+            return startGeneratedImageTask(requestUrl, fresh === true);
+        }
         const currentUrl = normalizeRequestUrl(requestUrl, characterName);
         const token = currentUrl.searchParams.get('token') || '';
         const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);

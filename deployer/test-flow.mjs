@@ -35,7 +35,8 @@ globalThis.fetch = async (url, init = {}) => {
   const method = init.method || 'GET';
   const auth = (init.headers && (init.headers.Authorization || init.headers.authorization)) || '';
   const short = u.startsWith(API_BASE) ? u.slice(API_BASE.length) : u;
-  calls.push({ short, method, auth });
+  const ctHeader = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
+  calls.push({ short, method, auth, ct: ctHeader });
 
   if (u.startsWith(RAW_PREFIX)) {
     const rel = decodeURIComponent(u.slice(RAW_PREFIX.length).split('?')[0]);
@@ -47,7 +48,7 @@ globalThis.fetch = async (url, init = {}) => {
     if (mock.accountsFail) return jsonResponse({ success: false, errors: [{ message: 'Invalid Token' }] }, 403);
     return jsonResponse({ success: true, result: [{ id: 'acc1', name: 'tester' }] });
   }
-  if (short === '/accounts/acc1/r2/buckets/rp' && method === 'GET') {
+  if (short === '/accounts/acc1/r2/buckets/rphub' && method === 'GET') {
     if (mock.r2Exists) return jsonResponse({ success: true, result: { name: 'rp' } });
     return jsonResponse({ success: false, errors: [{ code: 10006, message: 'bucket not found' }] }, 404);
   }
@@ -64,7 +65,7 @@ globalThis.fetch = async (url, init = {}) => {
     }
     if (mock.projectConflict) saved.secondName = body.name;
     saved.projectBody = body;
-    return jsonResponse({ success: true, result: { name: body.name } });
+    return jsonResponse({ success: true, result: { name: body.name, subdomain: { name: body.name } } });
   }
   if (/\/pages\/projects\/name1$/.test(short) && method === 'GET') {
     return jsonResponse({ success: false, errors: [{ code: 8000007, message: 'project not found' }] }, 404);
@@ -95,9 +96,37 @@ globalThis.fetch = async (url, init = {}) => {
   if (/\/pages\/projects\/[^/]+\/deployments$/.test(short) && method === 'POST') {
     saved.deployAuth = saved.deployAuth || [];
     saved.deployAuth.push(auth);
-    saved.deployForms = saved.deployForms || [];
-    saved.deployForms.push(init.body);
     saved.deployCalls = (saved.deployCalls || 0) + 1;
+    const ct = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
+    const bm = /boundary=([^;\s]+)/.exec(ct);
+    const text = new TextDecoder('utf8').decode(init.body);
+    const parts = text.split('--' + (bm ? bm[1] : '@@none@@'));
+    const manifestPart = parts.find(p => p.includes('name="manifest"'));
+    const branchPart = parts.find(p => p.includes('name="branch"'));
+    const workerPart = parts.find(p => p.includes('name="_worker.bundle"'));
+    saved.deployManifests = saved.deployManifests || [];
+    saved.deployCommitDirty = saved.deployCommitDirty || [];
+    saved.deployCommitDirty.push(parts.some(p => p.includes('name="commit_dirty"')) ? 'true' : null);
+    saved.deployBranches = saved.deployBranches || [];
+    saved.deployWorkers = saved.deployWorkers || [];
+    try {
+      saved.deployManifests.push(JSON.parse(manifestPart.split('\r\n\r\n')[1]));
+    } catch { saved.deployManifests.push(null); }
+    saved.deployBranches.push(branchPart ? branchPart.split('\r\n\r\n')[1].replace(/\r\n$/, '') : null);
+    if (workerPart) {
+      const seg = workerPart.split('\r\n\r\n');
+      const innerText = seg.slice(1).join('\r\n\r\n').replace(/\r\n$/, '');
+      const innerBoundary = /^--([^\r\n]+)/.exec(innerText);
+      saved.deployMeta = saved.deployMeta || [];
+      if (innerBoundary) {
+        const innerParts = innerText.split('--' + innerBoundary[1]);
+        const metaPart = innerParts.find(p => p.includes('name="metadata"'));
+        const workerInner = innerParts.find(p => p.includes('name="_worker.js"'));
+        try { saved.deployMeta.push(JSON.parse(metaPart.split('\r\n\r\n')[1])); } catch { saved.deployMeta.push(null); }
+        const wSeg = workerInner.split('\r\n\r\n');
+        saved.deployWorkers.push(wSeg.slice(1).join('\r\n\r\n').replace(/\r\n$/, ''));
+      } else { saved.deployMeta.push(null); saved.deployWorkers.push(innerText); }
+    } else { saved.deployMeta = saved.deployMeta || []; saved.deployWorkers.push(null); }
     return jsonResponse({ success: true, result: { id: 'dep' + saved.deployCalls, url: 'https://' + saved.projectBody.name + '.pages.dev' } });
   }
   if (/\/deployments\/dep\d+$/.test(short)) return jsonResponse({ success: true, result: { latest_stage: { name: 'deploy', status: 'success' } } });
@@ -131,16 +160,16 @@ async function deploy(body, ip) {
   const firstDep = depIdx.indexOf(1), secondDep = depIdx.lastIndexOf(1);
   ok(saved.deployCalls === 2, '完整模式部署两次', String(saved.deployCalls));
   ok(patchIdx > firstDep && patchIdx < secondDep, 'PATCH 位于两次部署之间');
-  ok(calls.some(c => c.short === '/accounts/acc1/r2/buckets/rp'), '先探测固定桶 rp');
+  ok(calls.some(c => c.short === '/accounts/acc1/r2/buckets/rphub'), '先探测固定桶 rphub');
 
   // 建桶固定名
-  ok(saved.bucketBody && saved.bucketBody.name === 'rp', '存储桶名固定为 rp', JSON.stringify(saved.bucketBody));
+  ok(saved.bucketBody && saved.bucketBody.name === 'rphub', '存储桶名固定为 rphub', JSON.stringify(saved.bucketBody));
 
   // PATCH 形状
   ok(saved.patches && saved.patches.length === 1, 'PATCH 一次');
   const pc = saved.patches[0].deployment_configs.production;
   ok(pc.env_vars.RP_SYNC_PASSWORD.value === PASSWORD && pc.env_vars.RP_SYNC_PASSWORD.type === 'plain_text', '文本密码变量');
-  ok(pc.r2_buckets.RP_SYNC_R2.bucket_id === 'rp', 'R2 绑定');
+  ok(pc.r2_buckets.RP_SYNC_R2.name === 'rphub', 'R2 绑定');
 
   // 上传增量：第二次部署不再上传资产
   ok(saved.uploadPayloads && saved.uploadPayloads.length === 1, '资产只上传一次（第二次增量跳过）', String(saved.uploadPayloads && saved.uploadPayloads.length));
@@ -151,15 +180,17 @@ async function deploy(body, ip) {
   ok(saved.deployAuth.every(a => a === 'Bearer ' + TOKEN), 'deployment 用 API 令牌');
   ok(!JSON.stringify(data).includes(TOKEN), '响应不回显令牌');
 
-  // 第一次 deployment 的 multipart 形状
-  const form = saved.deployForms[0];
-  ok(form instanceof FormData, 'deployment 是 multipart');
-  const manifest = JSON.parse(await form.get('manifest'));
+  // 第一次 deployment 的 multipart 形状（手动构造体）
+  const manifest = saved.deployManifests[0];
+  ok(!!manifest, 'deployment multipart 含 manifest');
   const keys = Object.keys(manifest).sort();
   ok(JSON.stringify(keys) === JSON.stringify(['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/DB/styles.css', '/magic-extension.js']), 'manifest 键（含前导斜杠、无 _worker.js）');
   ok(Object.values(manifest).every(h => /^[0-9a-f]{32}$/.test(h)), 'manifest 哈希格式');
-  const wb = form.get('_worker.bundle');
-  ok(wb !== null && (await wb.text()) === readFileSync(join(pageDir, '_worker.js'), 'utf8'), '_worker.bundle 与 page/_worker.js 一致');
+  ok(saved.deployBranches[0] === null, '不含 branch 字段（API 会拒绝）');
+  ok(saved.deployCommitDirty && saved.deployCommitDirty[0] === 'true', '含 commit_dirty=true');
+  ok(saved.deployMeta && saved.deployMeta[0] && saved.deployMeta[0].main_module === '_worker.js', '内层 metadata main_module');
+  ok(saved.deployWorkers[0] === readFileSync(join(pageDir, '_worker.js'), 'utf8'), '_worker.bundle 内层模块与 page/_worker.js 一致');
+  ok(calls.some(c => (c.ct || '').includes('multipart/form-data; boundary=')), 'deployment 带 multipart boundary');
   const byContent = saved.uploadPayloads[0].find(e => e.value === Buffer.from(readFileSync(join(pageDir, 'magic-extension.js'))).toString('base64'));
   ok(!!byContent, 'magic-extension.js 内容与仓库一致');
 }
@@ -183,7 +214,7 @@ async function deploy(body, ip) {
   ok(saved.deployCalls === 1, '更新模式只部署一次', String(saved.deployCalls));
   ok(!saved.bucketBody, '更新模式不创建存储桶');
   ok(saved.patches && saved.patches.length === 1, '更新模式仍同步密码变量');
-  ok(saved.patches[0].deployment_configs.production.r2_buckets.RP_SYNC_R2.bucket_id === 'rp', '更新模式 PATCH 绑定');
+  ok(saved.patches[0].deployment_configs.production.r2_buckets.RP_SYNC_R2.name === 'rphub', '更新模式 PATCH 绑定');
 }
 
 // ---------- 3. R2 未开通（完整模式建桶失败）----------

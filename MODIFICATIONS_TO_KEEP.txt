@@ -91,11 +91,11 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 6. `updateCachedSnapshot` 中每一个缓存 entry 写入或删除之前，都必须先持久化 `pendingBuckets`。这是崩溃安全不变量，`audit-regressions` 有结构断言。
 
-7. 索引缺失、缓存版本变化、追踪 epoch 重置时，只能经确认完整重建本地索引。重建只读本地；不得跳过远端基线保护。
+7. 索引缺失、缓存版本变化、追踪 epoch 重置时，只能经确认完整重建本地索引。重建只读本地。
 
-8. baseline 必须包含 schemaVersion 13。提交前继续执行本地 baseline 与远端 version/checksum 双比对；另一端更新后拒绝覆盖，不做自动合并。
+8. 上传/下载为整体替换语义（单用户产品决策，最后点击者生效）：上传以上传开始时的云端状态为 CAS 基准，用本机数据整体替换云端（本机为空则清空云端）；下载用云端整体替换本机。客户端不做跨设备基线比对与自动合并；服务器端根切换 etag CAS 与 mutation lock 保持不变（并发上传时后提交者会 CAS 失败报错）。
 
-9. 不同步：`rp_hub_presets`、同步密码、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、baseline 和恢复状态键。
+9. 不同步：`rp_hub_presets`、同步密码、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、恢复状态键。
 
 四、免费版资源边界
 

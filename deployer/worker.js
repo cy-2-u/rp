@@ -128,13 +128,13 @@ const REPO_REPO = 'rp';
 const REPO_BRANCH = 'main';
 const REPO_DIR = 'page';
 const ASSETS = [
-  { path: 'DB/bootstrap.js', ext: 'js', type: 'text/javascript' },
-  { path: 'DB/dirty-tracker.js', ext: 'js', type: 'text/javascript' },
+  { path: 'DB/bootstrap.js', ext: 'js', type: 'application/javascript' },
+  { path: 'DB/dirty-tracker.js', ext: 'js', type: 'application/javascript' },
   { path: 'DB/styles.css', ext: 'css', type: 'text/css' },
-  { path: 'magic-extension.js', ext: 'js', type: 'text/javascript' },
+  { path: 'magic-extension.js', ext: 'js', type: 'application/javascript' },
 ];
 const WORKER_FILE = '_worker.js';
-const R2_NAME = 'rp';
+const R2_NAME = 'rphub';
 const R2_BINDING = 'RP_SYNC_R2';
 const PASSWORD_VAR = 'RP_SYNC_PASSWORD';
 const API = 'https://api.cloudflare.com/client/v4';
@@ -170,7 +170,7 @@ async function cfApi(token, path, init) {
   try {
     r = await fetch(API + path, { ...init, headers: { Authorization: 'Bearer ' + token, ...(init.headers || {}) } });
   } catch (e) {
-    return { ok: false, status: 0, networkError: true, errors: [{ message: '网络异常' }] };
+    return { ok: false, status: 0, errors: [{ message: '网络异常' }] };
   }
   let data = null;
   try { data = await r.json(); } catch (e) {  }
@@ -310,11 +310,29 @@ async function handleDeploy(request, origin) {
       method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
       body: JSON.stringify({ hashes: [...assetHashes.values()] }),
     });
-    const fd = new FormData();
-    fd.append('manifest', JSON.stringify(Object.fromEntries(assetHashes)));
-    fd.append('_worker.bundle', new File([workerBytes], '_worker.bundle'));
+    const boundary = '----rphubdeploy' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const enc = new TextEncoder();
+    const chunks = [];
+    const pushText = (s) => chunks.push(enc.encode(s));
+    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n`);
+    pushText(JSON.stringify(Object.fromEntries(assetHashes)));
+    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="commit_dirty"\r\n\r\ntrue\r\n`);
+    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="_worker.bundle"; filename="_worker.bundle"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+    const innerBoundary = '----rphubbundle' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n{"main_module":"_worker.js"}\r\n`);
+    pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="_worker.js"; filename="_worker.js"\r\nContent-Type: application/javascript+module\r\n\r\n`);
+    chunks.push(workerBytes);
+    pushText(`\r\n--${innerBoundary}--\r\n`);
+    pushText(`--${boundary}--\r\n`);
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const body = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { body.set(c, off); off += c.byteLength; }
     const dep = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/deployments`, {
-      method: 'POST', body: fd,
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
+      body,
     });
     if (!dep.ok || !dep.result || !dep.result.id) return { error: '创建部署失败：' + cfErrorText(dep.errors) };
     return { id: dep.result.id };
@@ -333,32 +351,22 @@ async function handleDeploy(request, origin) {
   }
 
   async function applyConfig() {
-    const configBody = (r2Shape) => ({
+    const body = JSON.stringify({
       deployment_configs: {
         production: {
           env_vars: { [PASSWORD_VAR]: { type: 'plain_text', value: password } },
-          r2_buckets: { [R2_BINDING]: r2Shape },
+          r2_buckets: { [R2_BINDING]: { name: R2_NAME } },
         },
       },
     });
-    let patched = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(configBody({ bucket_id: R2_NAME })),
+    return cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body,
     });
-    if (!patched.ok) {
-      const msg = cfErrorText(patched.errors);
-      if (/r2|bucket/i.test(msg)) {
-        patched = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}`, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(configBody({ bucket_name: R2_NAME })),
-        });
-      }
-    }
-    return patched;
   }
 
   const r2Detect = await cfApi(token, `/accounts/${accountId}/r2/buckets/${R2_NAME}`);
   const r2Exists = r2Detect.ok;
+  const subdomain = (project.result && project.result.subdomain && project.result.subdomain.name) || projectNameFinal;
 
   if (r2Exists) {
 
@@ -367,7 +375,7 @@ async function handleDeploy(request, origin) {
     const dep = await uploadOnce();
     if (dep.error) return json({ ok: false, error: dep.error }, 200, origin);
     await poll(dep.id);
-    return json({ ok: true, url: `https://${projectNameFinal}.pages.dev`, projectName: projectNameFinal, mode: 'update' }, 200, origin);
+    return json({ ok: true, url: `https://${subdomain}.pages.dev`, projectName: projectNameFinal, subdomain, mode: 'update' }, 200, origin);
   }
 
   const dep1 = await uploadOnce();
@@ -394,7 +402,7 @@ async function handleDeploy(request, origin) {
   if (dep2.error) return json({ ok: false, error: dep2.error }, 200, origin);
   const pollErr = await poll(dep2.id);
   if (pollErr) return json({ ok: false, error: pollErr }, 200, origin);
-  return json({ ok: true, url: `https://${projectNameFinal}.pages.dev`, projectName: projectNameFinal, mode: 'full' }, 200, origin);
+  return json({ ok: true, url: `https://${subdomain}.pages.dev`, projectName: projectNameFinal, subdomain, mode: 'full' }, 200, origin);
 }
 
 export default {

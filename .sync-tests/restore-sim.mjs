@@ -1036,10 +1036,11 @@ const altered = { ...remoteBeforeConflict, version: remoteBeforeConflict.version
 await bucket.put(MANIFEST_KEY, JSON.stringify(altered));
 await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'stale-client');
 const conflictBatches = packRequestCount();
-modalA.querySelector('[data-action="push"]').click();
-await waitFor(() => modalA.classList.contains('is-error'), 60000, 'stale baseline conflict');
-assert.equal(packRequestCount(), conflictBatches, 'stale client must not upload packs');
-assert.equal((await readManifest(bucket)).checksum, remoteBeforeConflict.checksum, 'stale client must not replace remote');
+await push('stale baseline: push replaces remote with local data');
+const afterConflict = await readManifest(bucket);
+assert.equal(afterConflict.version, remoteBeforeConflict.version + 2, 'stale client push must replace remote (version advances past foreign write)');
+assert.notEqual(afterConflict.checksum, remoteBeforeConflict.checksum, 'stale client push must replace remote content');
+assert.ok(packRequestCount() > conflictBatches, 'stale client must upload its changed pack');
 // Uploads must seed missing packs from the baseline manifest instead of
 // enumerating every historical pack in R2 on each push.
 assert.ok(requestsA.some(entry => entry.action === 'prepare-upload'), 'action recording must observe uploads');

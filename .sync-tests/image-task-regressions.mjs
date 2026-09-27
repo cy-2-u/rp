@@ -20,10 +20,12 @@ const hashText = value => {
 function harness(
     fixed = false,
     adapterResponse = { ok: false, status: 503, json: async () => ({ ok: false }) },
-    database = new IDBFactory()
+    database = new IDBFactory(),
+    authorTaskFactory = null
 ) {
     const requests = [];
     let fixedEnabled = fixed;
+    const authorCalls = [];
     const window = {};
     const context = vm.createContext({
         window, URL, crypto: { randomUUID },
@@ -82,6 +84,12 @@ function harness(
         };
         // 'legacy' 模拟旧适配清单：不传 autoImageGen 字段。
         if (autoImageGen !== 'legacy') options.autoImageGen = autoImageGen;
+        if (authorTaskFactory) {
+            options.startGeneratedImageTask = (requestUrl, fresh) => {
+                authorCalls.push([requestUrl, fresh]);
+                return authorTaskFactory(requestUrl, fresh);
+            };
+        }
         const task = window.RPH_MAGIC_IMAGE_TASK(options);
         task.cards.add(card);
         task.testCard = card;
@@ -93,10 +101,10 @@ function harness(
         }
         assert.equal(requests.length, count, 'expected a real mocked POST, not a cached done task');
     }
-    const state = () => window.testState.imageStores.get('offline-character');
-    const evict = () => window.testState.imageSlotTasks.clear();
-    const setFixed = value => { fixedEnabled = value; };
-    return { start, requests, waitForRequests, state, evict, setFixed, window };
+const state = () => window.testState.imageStores.get('offline-character');
+const evict = () => window.testState.imageSlotTasks.clear();
+const setFixed = value => { fixedEnabled = value; };
+return { start, requests, waitForRequests, state, evict, setFixed, window, authorCalls };
 }
 
 for (const fixed of [false, true]) {
@@ -314,4 +322,45 @@ test('legacy adapter without autoImageGen still generates', async () => {
     h.requests[0].succeed();
     assert.equal((await task.promise).status, 'done');
     assert.equal(h.state().transientRecords.size, 1);
+});
+
+test('fixed-off delegates generation to the author task (no R2 path)', async () => {
+    let authorCalls = 0;
+    let authorUrl = '';
+    const h = harness(false, undefined, undefined, (requestUrl, fresh) => {
+        authorCalls += 1;
+        authorUrl = requestUrl;
+        return {
+            job: { status: 'done', imageUrl: 'https://author.example/img.png' },
+            cards: { add() {}, forEach() {} },
+            promise: Promise.resolve({ status: 'done', imageUrl: 'https://author.example/img.png' })
+        };
+    });
+    const task = h.start({ prompt: 'author native', fresh: true });
+    const job = await task.promise;
+    assert.equal(job.status, 'done');
+    assert.equal(job.imageUrl, 'https://author.example/img.png');
+    assert.equal(authorCalls, 1);
+    assert.equal(authorUrl, '/api/rp-image?tag=author%20native', '透传作者的原始请求 URL');
+    assert.equal(h.requests.length, 0, '固定生图关闭时不经过 /api/rp-image');
+    assert.equal(h.window.testState.imageStores.size, 0, '不创建本地图片记录库');
+});
+
+test('fixed-on keeps our proxy even when the author task is provided', async () => {
+    let authorCalls = 0;
+    const h = harness(true, undefined, undefined, () => { authorCalls += 1; return { job: { status: 'done' }, cards: { add() {}, forEach() {} }, promise: Promise.resolve({ status: 'done' }) }; });
+    const task = h.start({ prompt: 'ours' });
+    await h.waitForRequests(1);
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    assert.equal(authorCalls, 0, '固定生图开启时不委托作者任务');
+});
+
+test('fixed-off + author autoImageGen off still suppresses', async () => {
+    let authorCalls = 0;
+    const h = harness(false, undefined, undefined, () => { authorCalls += 1; return { job: { status: 'done' }, cards: { add() {}, forEach() {} }, promise: Promise.resolve({ status: 'done' }) }; });
+    const task = h.start({ autoImageGen: false });
+    assert.equal((await task.promise).status, 'done');
+    assert.equal(authorCalls, 0, '作者自动生图关闭时仍不生成');
+    assert.ok(task.testCard.testClasses.has('magic-image-suppressed'));
 });

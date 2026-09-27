@@ -33,22 +33,33 @@
         {
           "name": "图片任务接入",
           "find": "const task = startGeneratedImageTask(requestUrl, options.fresh === true);",
-          "replace": "const rphMagicMessage = chatHistory.value[Number(card.closest('[data-chat-index]')?.dataset.chatIndex ?? -1)];\nconst task = window.RPH_MAGIC_IMAGE_TASK({\ncard, requestUrl, fresh: options.fresh === true,\nmessage: rphMagicMessage,\nstoryScopeId: activeStoryBranchId.value || 'main',\ncharacterId: currentCharacter.value?.uuid || '',\ncharacterName: currentCharacter.value?.name || '',\nautoImageGen: typeof isAutoImageGenEnabled !== 'undefined' && typeof worldInfo !== 'undefined' && worldInfo.value?.length ? isAutoImageGenEnabled.value : undefined,\nrender: renderGeneratedImageJob\n});"
+          "replace": "const rphMagicMessage = chatHistory.value[Number(card.closest('[data-chat-index]')?.dataset.chatIndex ?? -1)];\nconst task = window.RPH_MAGIC_IMAGE_TASK({\ncard, requestUrl, fresh: options.fresh === true,\nmessage: rphMagicMessage,\nstoryScopeId: activeStoryBranchId.value || 'main',\ncharacterId: currentCharacter.value?.uuid || '',\ncharacterName: currentCharacter.value?.name || '',\nautoImageGen: typeof isAutoImageGenEnabled !== 'undefined' && typeof worldInfo !== 'undefined' && worldInfo.value?.length ? isAutoImageGenEnabled.value : undefined,\nstartGeneratedImageTask,\nrender: renderGeneratedImageJob\n});"
         }
       ]
     },
     "sourceChecks": [
       {
         "path": "/index.html",
-        "contains": ["<app-navigation", "chat-input-scrollbar", "input-island", "settings-toggle-row"]
+        "contains": [
+          "<app-navigation",
+          "chat-input-scrollbar",
+          "input-island",
+          "settings-toggle-row"
+        ]
       },
       {
         "path": "/assets/js/ui-components.js",
-        "contains": ["class=\"app-navigation-panel\"", "class=\"app-navigation-content"]
+        "contains": [
+          "class=\"app-navigation-panel\"",
+          "class=\"app-navigation-content"
+        ]
       },
       {
         "path": "/assets/js/app.js",
-        "contains": ["const startGeneratedImageTask", "const CHARACTER_SCOPED_STORAGE_NAMES"]
+        "contains": [
+          "const startGeneratedImageTask",
+          "const CHARACTER_SCOPED_STORAGE_NAMES"
+        ]
       }
     ]
   },

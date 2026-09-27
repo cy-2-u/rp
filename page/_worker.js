@@ -386,12 +386,9 @@ function sanitizeImageKeySegment(value, fallback = '未命名角色') {
     return normalized || fallback;
 }
 
-function applyImageParamDefaults(params, token, characterName) {
-    const requestedProvider = String(params.provider || '').trim().toLowerCase();
-    const normalizedToken = String(token || '').trim().toUpperCase();
-    params.provider = ['rinko', 'sta1n', 'std'].includes(requestedProvider)
-        ? requestedProvider
-        : normalizedToken.startsWith('STD') ? 'std' : 'sta1n';
+// 生图上游固定为 nai.sta1n.cn；provider 不再路由，只作为签名组成保持旧缓存 key。
+function applyImageParamDefaults(params, characterName) {
+    params.provider = 'sta1n';
     params.character_name = sanitizeImageKeySegment(characterName, '未命名角色');
     params.model = params.model || IMAGE_DEFAULT_MODEL;
     params.size = params.size || IMAGE_DEFAULT_SIZE;
@@ -404,13 +401,13 @@ function applyImageParamDefaults(params, token, characterName) {
     return params;
 }
 
-function buildImageParams(url, token) {
+function buildImageParams(url) {
     const params = {};
     for (const key of IMAGE_PARAM_KEYS) {
         params[key] = normalizeImageParam(url.searchParams.get(key));
     }
     params.reroll_nonce = normalizeImageParam(url.searchParams.get('reroll_nonce'), 120);
-    return applyImageParamDefaults(params, token, url.searchParams.get('character_name'));
+    return applyImageParamDefaults(params, url.searchParams.get('character_name'));
 }
 
 function buildImageSignature(params) {
@@ -592,7 +589,7 @@ async function handleImageRender(request, env) {
     const token = normalizeImageParam(url.searchParams.get('token'), 1000);
     const generateOnMiss = request.method === 'POST'
         || (request.method === 'GET' && url.searchParams.get('generate') === '1');
-    const params = buildImageParams(url, token);
+    const params = buildImageParams(url);
     const primary = await buildImageLookupCandidate(params);
     // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
     // 证明未删除；先查墓碑才能保证删除后的读取立即返回占位图。
