@@ -4,3 +4,4 @@
 *.tmp.mjs
 .zcode/
 page.zip
+node_modules/

@@ -12,6 +12,7 @@ function load(overrides = {}) {
     const context = vm.createContext({
         URL, Headers, Request, Response, ReadableStream, Uint8Array, ArrayBuffer,
         TextEncoder, TextDecoder, AbortController, DOMException, crypto: webcrypto,
+        atob, AbortSignal,
         fetch: () => { throw new Error('Unexpected network access'); },
         setTimeout(fn) { const id = ++nextTimer; timers.set(id, fn); return id; },
         clearTimeout(id) { timers.delete(id); },
@@ -180,4 +181,215 @@ test('author proxy strips local credentials and retains ordinary headers', async
     for (const name of ['cookie', 'authorization', 'x-rp-sync-password']) assert.equal(forwarded.get(name), null, name);
     assert.equal(forwarded.get('accept'), 'text/css');
     assert.equal(forwarded.get('if-none-match'), 'test-etag');
+});
+
+// --- ynai 第三方中转（占位 token + 本地 mock，永不接触真实上游） ---
+const YNAI_TOKEN = 'YNAI-placeholder-token';
+const YNAI_ADAPTER = JSON.stringify({
+    schema: 1,
+    id: 'rp-hub',
+    author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
+    image: {
+        ynai: {
+            base: 'https://nai.rinko.ai',
+            modelsPath: '/v1/models',
+            generatePath: '/v1/images/generations',
+            defaultModel: 'nai-diffusion-4-5-full'
+        }
+    }
+});
+test('ynai endpoints follow the cloud adapter config', async () => {
+    const adapterJson = JSON.stringify({
+        schema: 1,
+        id: 'rp-hub',
+        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
+        image: { ynai: { base: 'https://relay.example', modelsPath: '/v9/models', generatePath: '/v9/images/generations' } }
+    });
+    let captured;
+    const { context } = load({ fetch: async url => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(adapterJson, { headers: { 'content-type': 'application/json' } });
+        captured = { url: u };
+        return new Response(JSON.stringify({ object: 'list', data: [{ id: 'm1' }] }), { headers: { 'content-type': 'application/json' } });
+    } });
+    const env = { RP_SYNC_R2: bucket(), RPHUB_ADAPTER_URL: 'file:///adapter.json' };
+    const res = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
+    assert.deepEqual(await res.json(), { ok: true, data: [{ id: 'm1' }] });
+    assert.equal(captured.url, 'https://relay.example/v9/models', '云端 adapter 覆盖中转地址与模型路径');
+});
+test('ynai keys route generation to the relay with the OpenAI images shape', async () => {
+    let captured;
+    const { context, timers } = load({ fetch: async (url, options) => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        captured = { url: u, options };
+        return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('ynai-png-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
+    } });
+    const store = bucket(); store.get = async () => null;
+    const request = new Request(`https://offline.invalid/api/rp-image?token=${encodeURIComponent(YNAI_TOKEN)}&tag=test&model=relay-model&character_name=A..B`, { method: 'POST' });
+    const result = await context.handleImageRender(request, { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' });
+    assert.equal(result.status, 200);
+    assert.equal(captured.url, 'https://nai.rinko.ai/v1/images/generations');
+    assert.equal(captured.options.method, 'POST');
+    assert.equal(captured.options.headers.authorization, `Bearer ${YNAI_TOKEN}`);
+    const body = JSON.parse(captured.options.body);
+    assert.equal(body.model, 'relay-model');
+    assert.equal(body.prompt, 'test');
+    assert.equal(body.size, '832x1216', '竖图默认尺寸映射');
+    assert.equal(body.parameters.steps, 28, 'ynai 空 steps 默认 28');
+    assert.equal(body.response_format, 'b64_json');
+    assert.equal(body.parameters.sampler, 'k_dpmpp_2m_sde');
+    assert.equal(Buffer.from(store.writes[0][1]).toString(), 'ynai-png-bytes');
+    assert.equal(timers.size, 0);
+});
+test('ynai model list requires YNAI token and cloud config, proxies the relay list once', async () => {
+    let calls = 0, captured;
+    const { context } = load({ fetch: async (url, options) => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        if (!u.includes('nai.rinko.ai')) return new Response('not found', { status: 404 });
+        calls += 1; captured = { url: u, options };
+        return new Response(JSON.stringify({ object: 'list', data: [{ id: 'model-a' }, { id: 'model-b' }, { id: null }] }), { headers: { 'content-type': 'application/json' } });
+    } });
+    const denied = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': 'plain-token' } }), { RP_SYNC_R2: bucket() });
+    assert.equal(denied.status, 401);
+    assert.equal(calls, 0, '非 YNAI 密钥不触发任何外呼');
+    const noConfig = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), {});
+    assert.equal(noConfig.status, 503, '云端配置缺失时显式报错，不做代码兜底');
+    assert.equal(calls, 0, '配置缺失不触发外呼');
+    const env = { RP_SYNC_R2: bucket(), RPHUB_ADAPTER_URL: 'file:///adapter.json' };
+    const ok = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
+    assert.deepEqual(await ok.json(), { ok: true, data: [{ id: 'model-a' }, { id: 'model-b' }] });
+    assert.equal(captured.url, 'https://nai.rinko.ai/v1/models');
+    assert.equal(captured.options.headers.authorization, `Bearer ${YNAI_TOKEN}`);
+    const cached = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
+    assert.equal((await cached.json()).data.length, 2);
+    assert.equal(calls, 1, '30 秒内存缓存避免重复外呼');
+});
+test('provider-agnostic cache: tokenless reads share one key regardless of provider param', async () => {
+    const { context } = load();
+    const store = bucket();
+    store.get = async k => { store.reads.push(k); return null; };
+    await context.handleImageRender(new Request('https://offline.invalid/api/rp-image?provider=ynai&tag=test&character_name=A..B'), { RP_SYNC_R2: store });
+    await context.handleImageRender(new Request('https://offline.invalid/api/rp-image?tag=test&character_name=A..B'), { RP_SYNC_R2: store });
+    assert.equal(store.reads.length, 4, '每次读取查墓碑 + 原图两个键');
+    assert.equal(store.reads[1], store.reads[3], '同一内容不分来源，共用同一 R2 键');
+});
+test('key-switching lifecycle: sta1n → ynai → sta1n keeps every era image displaying', async () => {
+    // 全离线模拟三个时代：sta1n 生成 → 切 YNAI（旧图显示 + 中转新图生成/显示）→
+    // 切回 sta1n（两个时代的旧图都显示 + sta1n 新图生成）。R2 统一拉取，不分来源。
+    const relayCalls = [], sta1nCalls = [];
+    const { context } = load({ fetch: async (url, options) => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        if (u.includes('nai.rinko.ai')) {
+            relayCalls.push(u);
+            return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('relay-image-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
+        }
+        if (u.includes('nai.sta1n.cn')) {
+            sta1nCalls.push(u);
+            return new Response(Buffer.from('sta1n-image-bytes'), { headers: { 'content-type': 'image/png' } });
+        }
+        throw new Error('unexpected upstream: ' + u);
+    } });
+    const objects = new Map();
+    const store = {
+        writes: [],
+        async get(k) { const v = objects.get(k); return v ? { body: v, size: v.byteLength, httpMetadata: { contentType: 'image/png' } } : null; },
+        async put(k, v) { objects.set(k, v); this.writes.push([k, v]); },
+        async head() { return null; },
+        async list() { return { objects: [], truncated: false }; },
+        async delete() { }
+    };
+    const env = { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' };
+    const IMAGE_KEYS = ['model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
+    // 复刻魔改层 buildRecordUrl：快照参数原样回放（空值留给 worker 默认），无 token、无 provider
+    const replayUrl = record => {
+        const params = new URLSearchParams();
+        params.set('tag', record.prompt);
+        for (const key of IMAGE_KEYS) params.set(key, String(record.paramsSnapshot[key] || ''));
+        params.set('character_name', 'A..B');
+        return 'https://offline.invalid/api/rp-image?' + params.toString();
+    };
+    const generate = async (token, prompt, model) => {
+        // 复刻作者页面请求形状：全部参数显式携带（steps=40 等为作者模板硬编码值）
+        const params = new URLSearchParams({
+            token, tag: prompt, model, artist: '',
+            size: '竖图', steps: '40', scale: '6', cfg: '0',
+            sampler: 'k_dpmpp_2m_sde', negative: '', nocache: '0', noise_schedule: 'karras',
+            character_name: 'A..B'
+        });
+        return context.handleImageRender(new Request('https://offline.invalid/api/rp-image?' + params, { method: 'POST' }), env);
+    };
+    const bodyOf = async response => Buffer.from(await response.arrayBuffer()).toString();
+    const recordOf = (prompt, model) => ({ prompt, paramsSnapshot: {
+        model, artist: '', size: '竖图', steps: '40', scale: '6', cfg: '0',
+        sampler: 'k_dpmpp_2m_sde', negative: '', nocache: '0', noise_schedule: 'karras'
+    } });
+
+    // —— 时代 1：sta1n 密钥，生成第一张并写入固定记录 ——
+    const era1 = await generate('STA1N-placeholder', 'prompt-one', 'nai-diffusion-4-5-full');
+    assert.equal(era1.status, 200);
+    assert.equal(await bodyOf(era1), 'sta1n-image-bytes');
+    assert.equal(sta1nCalls.length, 1);
+    assert.equal(relayCalls.length, 0);
+    const record1 = recordOf('prompt-one', 'nai-diffusion-4-5-full');
+
+    // —— 时代 1：旧图显示（重放命中缓存，不重新生成）——
+    const view1 = await context.handleImageRender(new Request(replayUrl(record1)), env);
+    assert.equal(view1.status, 200);
+    assert.equal(await bodyOf(view1), 'sta1n-image-bytes');
+    assert.equal(sta1nCalls.length, 1);
+
+    // —— 时代 2：切 YNAI- 密钥。旧图仍正常显示 ——
+    const view1InYnai = await context.handleImageRender(new Request(replayUrl(record1)), env);
+    assert.equal(view1InYnai.status, 200);
+    assert.equal(await bodyOf(view1InYnai), 'sta1n-image-bytes');
+    assert.equal(sta1nCalls.length, 1);
+    assert.equal(relayCalls.length, 0);
+    // —— 时代 2：中转生成新图（用户在中转模型列表里选了 relay-model）——
+    const era2 = await generate('YNAI-placeholder', 'prompt-two', 'relay-model');
+    assert.equal(era2.status, 200);
+    assert.equal(await bodyOf(era2), 'relay-image-bytes');
+    assert.equal(relayCalls.length, 1);
+    assert.equal(sta1nCalls.length, 1, 'ynai 生成不经过 sta1n 上游');
+    const record2 = recordOf('prompt-two', 'relay-model');
+    // —— 时代 2：ynai 新图显示（重放命中，同一键不分来源）——
+    const view2 = await context.handleImageRender(new Request(replayUrl(record2)), env);
+    assert.equal(view2.status, 200);
+    assert.equal(await bodyOf(view2), 'relay-image-bytes');
+    assert.equal(relayCalls.length, 1);
+
+    // —— 时代 3：切回 sta1n。两个时代的旧图都正常显示 ——
+    const view1Back = await context.handleImageRender(new Request(replayUrl(record1)), env);
+    assert.equal(view1Back.status, 200);
+    assert.equal(await bodyOf(view1Back), 'sta1n-image-bytes');
+    const view2Back = await context.handleImageRender(new Request(replayUrl(record2)), env);
+    assert.equal(view2Back.status, 200);
+    assert.equal(await bodyOf(view2Back), 'relay-image-bytes', 'ynai 时期图片经 R2 统一拉取继续显示');
+    assert.equal(relayCalls.length, 1);
+    assert.equal(sta1nCalls.length, 1);
+    // —— 时代 3：sta1n 新图生成正常 ——
+    const era3 = await generate('STA1N-placeholder', 'prompt-three');
+    assert.equal(era3.status, 200);
+    assert.equal(await bodyOf(era3), 'sta1n-image-bytes');
+    assert.equal(sta1nCalls.length, 2);
+    assert.equal(store.writes.length, 3, '三个时代三张图，缓存不产生重复副本');
+});
+test('empty steps default splits by provider: ynai 28, sta1n 40', () => {
+    const { context } = load();
+    const sta1n = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=x&character_name=A..B'), 'fake-token');
+    assert.equal(sta1n.steps, '40', 'sta1n 维持原默认');
+    const ynai = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=x&character_name=A..B'), YNAI_TOKEN);
+    assert.equal(ynai.steps, '28', 'ynai 中转默认 28');
+    const explicit = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=x&steps=17&character_name=A..B'), '');
+    assert.equal(explicit.steps, '17', '显式步数不被默认覆盖');
+});
+test('legacy sta1n replay keys are stable with or without the provider param', () => {
+    const { context } = load();
+    const withParam = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?provider=sta1n&tag=t&character_name=A..B'), '');
+    const withoutParam = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=t&character_name=A..B'), '');
+    assert.equal(withParam.provider, 'sta1n');
+    assert.equal(withoutParam.provider, 'sta1n', '旧记录/旧页面无 provider 参数时同样落在 sta1n');
+    assert.equal(context.buildImageSignature(withParam), context.buildImageSignature(withoutParam), '签名逐字节一致 → 旧图同一 R2 键');
 });

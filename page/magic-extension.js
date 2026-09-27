@@ -3,6 +3,10 @@
 
     const FIXED_IMAGE_KEY = 'rp_hub_magic_fixed_image';
     const LEGACY_REGEX_MIGRATION_KEY = 'rp_hub_magic_regex_migration_v2';
+    const YNAI_MODEL_KEY = 'rp_hub_magic_ynai_model';
+    const YNAI_MODEL_LIST_KEY = 'rp_hub_magic_ynai_models';
+    // 密钥即路由：YNAI- 前缀密钥走第三方中转（worker 按 provider 转发），其余 sta1n。
+    const isYnaiToken = value => String(value || '').trim().toUpperCase().startsWith('YNAI-');
     const IMAGE_STORAGE_PREFIX = 'rp_hub_image_renders_';
     const IMAGE_RECORD_LIMIT = 256;
     const DEFAULT_STORY_SCOPE_ID = 'main';
@@ -65,7 +69,8 @@
         descriptor.promptHash || hashText(descriptor.prompt || '')
     ].join(':');
 
-    // 生图上游固定为 sta1n；provider 不再参与路由，只作为签名组成保持旧缓存 key。
+    // 生图提供商由密钥决定（worker 以 token 为准）；ynai 请求用用户在劫持下拉里
+    // 选的模型覆盖作者页面的模型参数，provider 不再写进 URL/快照（缓存不区分来源）。
     const normalizeRequestUrl = (value, characterName) => {
         const source = new URL(value, location.href);
         const target = new URL('/api/rp-image', location.origin);
@@ -73,7 +78,10 @@
             if (source.searchParams.has(key)) target.searchParams.set(key, source.searchParams.get(key));
         });
         const token = source.searchParams.get('token') || '';
-        target.searchParams.set('provider', 'sta1n');
+        if (isYnaiToken(token)) {
+            const chosen = String(localStorage.getItem(YNAI_MODEL_KEY) || '').trim();
+            if (chosen) target.searchParams.set('model', chosen);
+        }
         if (source.searchParams.has('reroll_nonce')) target.searchParams.set('reroll_nonce', source.searchParams.get('reroll_nonce'));
         if (token) target.searchParams.set('token', token);
         target.searchParams.set('character_name', String(source.searchParams.get('character_name') || characterName || '未命名角色'));
@@ -267,7 +275,6 @@
     const snapshotFromUrl = (url, characterName, reroll = false) => {
         const snapshot = {};
         IMAGE_PARAM_KEYS.forEach(key => { snapshot[key] = String(url.searchParams.get(key) || ''); });
-        snapshot.provider = 'sta1n';
         snapshot.nocache = reroll ? '1' : (snapshot.nocache || '0');
         snapshot.rerollNonce = reroll ? (crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`) : String(url.searchParams.get('reroll_nonce') || '');
         snapshot.characterName = String(url.searchParams.get('character_name') || characterName || '未命名角色');
@@ -278,6 +285,8 @@
         const url = new URL('/api/rp-image', location.origin);
         const snapshot = record.paramsSnapshot || {};
         IMAGE_PARAM_KEYS.forEach(key => url.searchParams.set(key, key === 'tag' ? record.prompt : String(snapshot[key] || '')));
+        // 历史快照可能残留 provider 字段：缓存不区分来源，重放 URL 一律不带
+        url.searchParams.delete('provider');
         if (snapshot.rerollNonce) url.searchParams.set('reroll_nonce', String(snapshot.rerollNonce));
         if (allowGeneration) {
             url.searchParams.set('generate', '1');
@@ -776,6 +785,9 @@
             '.magic-scroll-button.is-visible{display:flex}',
             '.magic-scroll-sentinel{width:1px;height:1px;pointer-events:none}',
             '.magic-image-suppressed{display:none!important}',
+            '.magic-ynai-model-row .magic-ynai-model-select{max-width:180px;height:32px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#111827;font-size:12px;padding:0 6px;outline:none}',
+            '.magic-ynai-model-row .magic-ynai-model-hint{margin-left:8px;font-size:11px;color:#6b7280;cursor:pointer;white-space:nowrap}',
+            '.magic-ynai-model-row .magic-ynai-model-hint:hover{color:#2563eb}',
             '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
             '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}'
@@ -864,7 +876,8 @@
         if (typeof window.RPHubAuthorSaveData !== 'function') return;
         const cfg = settingsConfig();
         const { grid, anchor } = findFixedImageAnchor();
-        if (!grid || grid.querySelector('.magic-fixed-image-toggle')) return;
+        // 安装判定看开关行特有的 input：模型行复用同一个行类，但不能被当成开关本体
+        if (!grid || grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return;
         const label = document.createElement('label');
         // 行样式类全部来自适配层 ui.settings：作者改设置行样式时只更新适配 JSON。
         // 兜底值跟随作者当前设置行语义类，适配键缺失也不渲染裸样式。
@@ -877,6 +890,122 @@
         grid.insertBefore(label, anchor
             ? (insertAfter ? anchor.nextSibling : anchor)
             : (insertAfter ? grid.children[0]?.nextSibling || null : null));
+    };
+
+    // YNAI 模型劫持：密钥为 YNAI- 时隐藏作者“生图版本”浮窗，原位放入同款样式的
+    // 下拉，选项来自中转站模型列表（经 worker /api/rp-image-models 拉取），默认
+    // 使用中转的 nai-diffusion-4-5-full；选择存本地并在构建请求时覆盖 model 参数。
+    // sta1n 密钥时移除劫持、还原作者浮窗。浮窗定位不写死 DOM 结构：按适配层
+    // ui.settings.modelLabel 文本找到设置标签，再找同容器里的 custom-select 渲染根。
+    const YNAI_SELECT_CLASS = 'magic-ynai-select';
+    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, models: null };
+
+    const readAuthorImageGenKey = async () => {
+        try {
+            const db = await openImageDatabase();
+            try {
+                const value = await new Promise((resolve, reject) => {
+                    const request = db.transaction(['store'], 'readonly').objectStore('store').get('rp_hub_settings');
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error || new Error('设置读取失败'));
+                });
+                return String(value?.imageGenKey || '');
+            } finally {
+                db.close();
+            }
+        } catch (_) {
+            return '';
+        }
+    };
+
+    const readStoredYnaiModels = () => {
+        try {
+            const value = JSON.parse(localStorage.getItem(YNAI_MODEL_LIST_KEY) || 'null');
+            return Array.isArray(value) ? value.filter(item => item?.id) : null;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    const ynaiDefaultModel = () => String(activeAdapter?.image?.ynai?.defaultModel || '');
+
+    const findImageModelControl = () => {
+        const labelText = String(settingsConfig().modelLabel || '生图版本');
+        const labels = [...document.querySelectorAll('label.settings-label')]
+            .filter(label => label.textContent.trim() === labelText);
+        for (const label of labels) {
+            const box = label.parentElement;
+            if (!box) continue;
+            const control = [...box.children].find(el => el !== label
+                && !el.classList.contains(YNAI_SELECT_CLASS)
+                && el.querySelector(':scope > button.settings-control'));
+            if (control) return { box, control };
+        }
+        return null;
+    };
+
+    const renderYnaiSelectOptions = (select, models) => {
+        select.textContent = '';
+        for (const model of models) {
+            const option = document.createElement('option');
+            option.value = String(model.id);
+            option.textContent = String(model.label || model.id);
+            select.appendChild(option);
+        }
+        const current = String(localStorage.getItem(YNAI_MODEL_KEY) || '');
+        const preferred = current && models.some(model => String(model.id) === current)
+            ? current
+            : (models.some(model => model.id === ynaiDefaultModel()) ? ynaiDefaultModel() : String(models[0].id));
+        select.value = preferred;
+        localStorage.setItem(YNAI_MODEL_KEY, preferred);
+    };
+
+    const applyYnaiModelHijack = async (box, control, select, force = false) => {
+        const now = Date.now();
+        if (!force && now - ynaiSelectState.checkedAt < 4000) return;
+        ynaiSelectState.checkedAt = now;
+        const key = await readAuthorImageGenKey();
+        const ynai = isYnaiToken(key);
+        select.style.display = ynai ? '' : 'none';
+        control.style.display = ynai ? 'none' : '';
+        if (!ynai) return;
+        if (ynaiSelectState.key !== key) {
+            ynaiSelectState.loaded = false;
+            ynaiSelectState.models = readStoredYnaiModels();
+        }
+        if (ynaiSelectState.models) renderYnaiSelectOptions(select, ynaiSelectState.models);
+        if (ynaiSelectState.loading || ynaiSelectState.loaded) return;
+        ynaiSelectState.key = key;
+        ynaiSelectState.loading = true;
+        try {
+            const response = await fetch('/api/rp-image-models', { headers: { 'x-rp-image-token': key.trim() } });
+            const payload = await response.json().catch(() => null);
+            const models = payload && Array.isArray(payload.data) ? payload.data.filter(item => item?.id) : [];
+            if (!response.ok || !models.length) throw new Error(payload?.error || `HTTP ${response.status}`);
+            ynaiSelectState.models = models;
+            ynaiSelectState.loaded = true;
+            try { localStorage.setItem(YNAI_MODEL_LIST_KEY, JSON.stringify(models)); } catch (_) { }
+            renderYnaiSelectOptions(select, models);
+        } finally {
+            ynaiSelectState.loading = false;
+        }
+    };
+
+    const installYnaiModelHijack = () => {
+        const found = findImageModelControl();
+        if (!found) return;
+        const { box, control } = found;
+        let select = box.querySelector(`.${YNAI_SELECT_CLASS}`);
+        if (!select) {
+            select = document.createElement('select');
+            select.className = `${YNAI_SELECT_CLASS} settings-control`;
+            select.style.display = 'none';
+            control.after(select);
+            select.addEventListener('change', () => {
+                localStorage.setItem(YNAI_MODEL_KEY, String(select.value || ''));
+            });
+        }
+        applyYnaiModelHijack(box, control, select);
     };
 
     let scrollContainer = null;
@@ -966,6 +1095,7 @@
         installSidebarActions();
         installImageNav();
         installFixedImageSetting();
+        installYnaiModelHijack();
         installScrollButton();
         observeUiTargets();
     }

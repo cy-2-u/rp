@@ -27,7 +27,7 @@ function ok(cond, name, extra) {
 }
 
 // 1) page/ 与根目录正本逐字节核对
-for (const [src, entry] of FILES) {
+for (const [src] of FILES) {
   const canonical = src === '_worker.js' ? '_worker.js' : src;
   const a = fs.readFileSync(path.join(root, canonical));
   const b = fs.readFileSync(path.join(pageDir, src));

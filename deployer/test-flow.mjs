@@ -14,7 +14,6 @@ const RAW_PREFIX = 'https://raw.githubusercontent.com/cy-2-u/rp/main/page/';
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const TOKEN = 'tok-abc-123';
 const PASSWORD = 'pw-123';
-const ASSET_PATHS = ['/pages/assets/check-missing', '/pages/assets/upload', '/pages/assets/upsert-hashes'];
 
 let pass = 0, fail = 0;
 function ok(cond, name, extra) {
@@ -97,6 +96,10 @@ globalThis.fetch = async (url, init = {}) => {
     saved.deployAuth = saved.deployAuth || [];
     saved.deployAuth.push(auth);
     saved.deployCalls = (saved.deployCalls || 0) + 1;
+    if (mock.deployTransientFails) {
+      mock.deployTransientFails -= 1;
+      return jsonResponse({ success: false, errors: [{ code: 8000000, message: 'transient deployment error' }] }, 500);
+    }
     const ct = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
     const bm = /boundary=([^;\s]+)/.exec(ct);
     const text = new TextDecoder('utf8').decode(init.body);
@@ -199,7 +202,7 @@ async function deploy(body, ip) {
 
 // ---------- 2. 更新模式（R2 桶已存在）----------
 {
-  const { data } = await deploy({ token: TOKEN, password: PASSWORD, projectName: 'test2' }, 'ip-update');
+  await deploy({ token: TOKEN, password: PASSWORD, projectName: 'test2' }, 'ip-update');
   // deploy() 重置 mock——重新注入 r2Exists 再来一次
 }
 {
@@ -285,6 +288,19 @@ async function deploy(body, ip) {
     if (res.status === 429) { hit429 = true; break; }
   }
   ok(hit429, '同 IP 限速 429');
+}
+
+// ---------- 9. 部署 POST 瞬态错误自动重试（对齐 wrangler 8000000 重试语义） ----------
+{
+  calls = []; saved = {}; mock = { r2Exists: true, deployTransientFails: 1 }; uploaded = new Set();
+  const req = new Request('http://deployer.local/api/deploy', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': 'ip-retry' },
+    body: JSON.stringify({ token: TOKEN, password: PASSWORD, projectName: 'test9' }),
+  });
+  const res = await worker.fetch(req);
+  const data = await res.json();
+  ok(data.ok === true, '瞬态 500/8000000 重试后部署成功', JSON.stringify(data));
+  ok(saved.deployCalls === 2, '部署 POST 共两次（1 失败 + 1 成功）', String(saved.deployCalls));
 }
 
 globalThis.fetch = realFetch;

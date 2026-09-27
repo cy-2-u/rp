@@ -280,7 +280,7 @@ async function testAdapterConfigEndpoint() {
     const env = { RPHUB_ADAPTER_URL: configuredAdapterUrl };
     const ok = await worker.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(ok.status, 200);
-    assert.deepEqual(await ok.json(), { schema: adapter.schema, id: adapter.id, ui: adapter.ui });
+    assert.deepEqual(await ok.json(), { schema: adapter.schema, id: adapter.id, ui: adapter.ui, image: adapter.image || {} });
     const head = await worker.fetch(new Request('https://local.test/__rphub/adapter.json', { method: 'HEAD' }), env, {});
     assert.equal(head.status, 200);
     assert.equal(await head.text(), '');

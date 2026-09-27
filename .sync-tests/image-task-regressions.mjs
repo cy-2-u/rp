@@ -27,11 +27,20 @@ function harness(
     let fixedEnabled = fixed;
     const authorCalls = [];
     const window = {};
+    const extraStorage = new Map();
+    const storage = {
+        getItem: key => key === 'rp_hub_magic_fixed_image'
+            ? (fixedEnabled ? '1' : '0')
+            : (extraStorage.has(String(key)) ? extraStorage.get(String(key)) : null),
+        setItem: (key, value) => extraStorage.set(String(key), String(value)),
+        removeItem: key => extraStorage.delete(String(key))
+    };
+    window.localStorage = storage;
     const context = vm.createContext({
         window, URL, crypto: { randomUUID },
         indexedDB: database, // Isolated in-memory DB; never accesses browser data.
         location: { pathname: '/', origin: 'https://offline.invalid', href: 'https://offline.invalid/' },
-        localStorage: { getItem: key => key === 'rp_hub_magic_fixed_image' ? (fixedEnabled ? '1' : '0') : '1' },
+        localStorage: storage,
         document: { readyState: 'loading', addEventListener() {} },
         MutationObserver: class { disconnect() {} observe() {} },
         fetch(url, options) {
@@ -61,7 +70,8 @@ function harness(
         messageId = 'message-1',
         messageContent = 'test message',
         characterId = 'offline-character',
-        autoImageGen = true
+        autoImageGen = true,
+        token = ''
     } = {}) {
         const testClasses = new Set();
         const card = {
@@ -77,7 +87,8 @@ function harness(
         card.testClasses = testClasses;
         const row = { dataset: { chatIndex: '0' }, querySelectorAll: () => [card] };
         const options = {
-            card, requestUrl: '/api/rp-image?tag=' + encodeURIComponent(prompt), fresh,
+            card, requestUrl: '/api/rp-image?tag=' + encodeURIComponent(prompt)
+                + (token ? '&token=' + encodeURIComponent(token) : ''), fresh,
             message: { id: messageId, content: messageContent },
             storyScopeId,
             characterId, characterName: 'Offline', render() {}
@@ -363,4 +374,46 @@ test('fixed-off + author autoImageGen off still suppresses', async () => {
     assert.equal((await task.promise).status, 'done');
     assert.equal(authorCalls, 0, '作者自动生图关闭时仍不生成');
     assert.ok(task.testCard.testClasses.has('magic-image-suppressed'));
+});
+
+test('ynai keys apply the local model override and persist it in the record', async () => {
+    const h = harness(true);
+    h.window.localStorage.setItem('rp_hub_magic_ynai_model', 'relay-model-x');
+    const task = h.start({ prompt: 'ynai prompt', token: 'YNAI-placeholder-123' });
+    await h.waitForRequests(1);
+    const url = new URL(h.requests[0].url, 'https://offline.invalid');
+    assert.equal(url.searchParams.get('model'), 'relay-model-x', '中转模型覆盖作者页面的模型参数');
+    assert.equal(url.searchParams.get('token'), 'YNAI-placeholder-123');
+    assert.equal(url.searchParams.has('provider'), false, 'provider 不写进 URL（缓存不区分来源）');
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    const record = h.state().records[0];
+    assert.equal(record.paramsSnapshot.model, 'relay-model-x');
+});
+
+test('sta1n keys ignore the ynai model override', async () => {
+    const h = harness(true);
+    h.window.localStorage.setItem('rp_hub_magic_ynai_model', 'relay-model-x');
+    const task = h.start({ prompt: 'sta1n prompt', token: 'STA1N-placeholder' });
+    await h.waitForRequests(1);
+    const url = new URL(h.requests[0].url, 'https://offline.invalid');
+    assert.notEqual(url.searchParams.get('model'), 'relay-model-x', '非 ynai 密钥不注入中转模型');
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+});
+
+test('ynai record replay keeps the snapshot model without the local override', async () => {
+    const h = harness(true);
+    h.window.localStorage.setItem('rp_hub_magic_ynai_model', 'relay-model-x');
+    const task = h.start({ prompt: 'ynai replay', token: 'YNAI-placeholder-123' });
+    await h.waitForRequests(1);
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    h.window.localStorage.setItem('rp_hub_magic_ynai_model', 'relay-model-new');
+    h.evict();
+    const replay = h.start({ prompt: 'ynai replay' });
+    assert.equal((await replay.promise).status, 'done');
+    assert.equal(h.requests.length, 1, '已存记录直接复用，不发新请求');
+    const record = h.state().records[0];
+    assert.equal(record.paramsSnapshot.model, 'relay-model-x', '固定记录重放用生成时的模型，不受后续选择影响');
 });

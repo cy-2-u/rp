@@ -329,11 +329,19 @@ async function handleDeploy(request, origin) {
     const body = new Uint8Array(total);
     let off = 0;
     for (const c of chunks) { body.set(c, off); off += c.byteLength; }
-    const dep = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/deployments`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
-      body,
-    });
+    let dep = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt) await new Promise(r => setTimeout(r, 2000));
+        dep = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/deployments`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
+            body,
+        });
+        if (dep.ok && dep.result && dep.result.id) break;
+        // 与 wrangler 一致：仅对瞬态错误重试（网络失败/5xx/8000000 UNKNOWN_ERROR）
+        const code = dep.errors && dep.errors[0] && dep.errors[0].code;
+        if (dep.status !== 0 && dep.status < 500 && code !== 8000000) break;
+    }
     if (!dep.ok || !dep.result || !dep.result.id) return { error: '创建部署失败：' + cfErrorText(dep.errors) };
     return { id: dep.result.id };
   }

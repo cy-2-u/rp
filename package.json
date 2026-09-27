@@ -1,0 +1,12 @@
+{
+  "name": "rp-hub-magic",
+  "private": true,
+  "type": "module",
+  "description": "RP Hub 魔改版根工作区：ESLint 死代码门禁（npm run lint）",
+  "scripts": {
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "eslint": "^10.11.0"
+  }
+}

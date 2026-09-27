@@ -553,7 +553,6 @@ async function testGcCursor(worker, committed) {
 async function testPasswordAndBinaryEndpoint(worker) {
     const bucket = createR2Mock();
     const api = makeApi(worker, bucket, 'secret');
-    const denied = makeApi(worker, bucket);
     const anonymousResponse = await worker.fetch(new Request('https://local.test/api/rp-sync', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

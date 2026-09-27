@@ -159,7 +159,8 @@ function adapterPublicView(adapter) {
     return {
         schema: Number(adapter.schema),
         id: String(adapter.id),
-        ui: adapter.ui || {}
+        ui: adapter.ui || {},
+        image: adapter.image || {}
     };
 }
 
@@ -276,11 +277,11 @@ const IMAGE_FETCH_TIMEOUT_MS = 120000;
 const IMAGE_DEFAULT_MODEL = 'nai-diffusion-4-5-full';
 const IMAGE_DEFAULT_SIZE = '竖图';
 const IMAGE_DEFAULT_STEPS = '40';
+const IMAGE_DEFAULT_STEPS_YNAI = '28';
 const IMAGE_DEFAULT_SCALE = '6';
 const IMAGE_DEFAULT_CFG = '0';
 const IMAGE_DEFAULT_SAMPLER = 'k_dpmpp_2m_sde';
 const IMAGE_DEFAULT_NOISE_SCHEDULE = 'karras';
-const IMAGE_UPSTREAM_BASE = 'https://nai.sta1n.cn';
 const IMAGE_PARAM_KEYS = [
     'provider',
     'tag',
@@ -295,6 +296,29 @@ const IMAGE_PARAM_KEYS = [
     'nocache',
     'noise_schedule'
 ];
+// 密钥即路由：YNAI- 前缀密钥走第三方中转（OpenAI images 形状），其余走 sta1n 原生。
+// 中转端点只来自云端适配清单（adapter.image.ynai），不做代码兜底；provider 虽进
+// 签名但值恒为 'sta1n'——两个提供商共享同一内容寻址缓存，历史键保持稳定。
+const IMAGE_UPSTREAM_STA1N = 'https://nai.sta1n.cn';
+const IMAGE_SIZE_PIXELS = { '竖图': '832x1216', '横图': '1216x832', '方图': '1024x1024' };
+const IMAGE_MODELS_PATH = '/api/rp-image-models';
+const IMAGE_MODELS_CACHE_TTL_MS = 30 * 1000;
+const imageModelsCache = new Map();
+
+// ynai 中转端点只认云端适配清单（adapter.image.ynai）：中转站换域名/路径时改
+// adapter JSON 即可生效；配置缺失或形状非法时返回 null，调用方显式报错。
+function resolveYnaiConfig(adapter) {
+    const cfg = adapter?.image?.ynai;
+    const base = typeof cfg?.base === 'string' && cfg.base.startsWith('https://')
+        ? cfg.base.replace(/\/+$/, '')
+        : null;
+    if (!base) return null;
+    const modelsPath = typeof cfg?.modelsPath === 'string' && cfg.modelsPath.startsWith('/') ? cfg.modelsPath : null;
+    const generatePath = typeof cfg?.generatePath === 'string' && cfg.generatePath.startsWith('/') ? cfg.generatePath : null;
+    if (!modelsPath || !generatePath) return null;
+    const defaultModel = typeof cfg?.defaultModel === 'string' && cfg.defaultModel ? cfg.defaultModel : null;
+    return { base, modelsPath, generatePath, defaultModel };
+}
 
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data), {
@@ -386,13 +410,19 @@ function sanitizeImageKeySegment(value, fallback = '未命名角色') {
     return normalized || fallback;
 }
 
-// 生图上游固定为 nai.sta1n.cn；provider 不再路由，只作为签名组成保持旧缓存 key。
-function applyImageParamDefaults(params, characterName) {
-    params.provider = 'sta1n';
+// 生图提供商由密钥决定：YNAI- 前缀 → ynai 中转，否则 sta1n；无 token 的读取
+// 请求退回 URL provider 参数（魔改层在读取与生成 URL 里都会带上）。
+function isYnaiImageToken(token) {
+    return String(token || '').trim().toUpperCase().startsWith('YNAI-');
+}
+
+function applyImageParamDefaults(params, token, characterName) {
+    params.provider = isYnaiImageToken(token) ? 'ynai' : 'sta1n';
     params.character_name = sanitizeImageKeySegment(characterName, '未命名角色');
     params.model = params.model || IMAGE_DEFAULT_MODEL;
     params.size = params.size || IMAGE_DEFAULT_SIZE;
-    params.steps = params.steps || IMAGE_DEFAULT_STEPS;
+    // 空 steps 默认按提供商区分：ynai 中转 28，sta1n 维持原 40。
+    params.steps = params.steps || (params.provider === 'ynai' ? IMAGE_DEFAULT_STEPS_YNAI : IMAGE_DEFAULT_STEPS);
     params.scale = params.scale || IMAGE_DEFAULT_SCALE;
     params.cfg = params.cfg || IMAGE_DEFAULT_CFG;
     params.sampler = params.sampler || IMAGE_DEFAULT_SAMPLER;
@@ -401,19 +431,21 @@ function applyImageParamDefaults(params, characterName) {
     return params;
 }
 
-function buildImageParams(url) {
+function buildImageParams(url, token) {
     const params = {};
     for (const key of IMAGE_PARAM_KEYS) {
         params[key] = normalizeImageParam(url.searchParams.get(key));
     }
     params.reroll_nonce = normalizeImageParam(url.searchParams.get('reroll_nonce'), 120);
-    return applyImageParamDefaults(params, url.searchParams.get('character_name'));
+    return applyImageParamDefaults(params, token, url.searchParams.get('character_name'));
 }
 
 function buildImageSignature(params) {
     const signature = {};
     for (const key of IMAGE_PARAM_KEYS) {
-        signature[key] = params[key] || '';
+        // 签名的 provider 字段恒为 'sta1n'：两个提供商共享同一内容寻址缓存，
+        // 旧图键由此保持稳定，切换密钥不会产生重复副本。
+        signature[key] = key === 'provider' ? 'sta1n' : (params[key] || '');
     }
     if (params.reroll_nonce) {
         signature.reroll_nonce = params.reroll_nonce;
@@ -471,7 +503,7 @@ function createImageThumbKeyFromImageKey(key) {
 
 // 前置校验（tag/token）已在 handleImageRender 完成，这里只负责拼上游地址。
 function buildImageUpstreamUrl(params, token) {
-    const upstream = new URL('/generate', IMAGE_UPSTREAM_BASE);
+    const upstream = new URL('/generate', IMAGE_UPSTREAM_STA1N);
     upstream.searchParams.set('tag', params.tag);
     upstream.searchParams.set('token', token);
     upstream.searchParams.set('model', params.model);
@@ -576,6 +608,90 @@ function imageResponse(body, contentType, extraHeaders = {}) {
     });
 }
 
+// ynai 中转是 OpenAI images 形状：POST JSON、b64_json 应答，解码成 PNG 字节后
+// 与 sta1n 路径共用同一套 R2 存储/墓碑/缩略图逻辑。
+async function fetchYnaiGeneratedImage(params, token, ynai) {
+    return fetchImageWithTimeout(ynai.base + ynai.generatePath, {
+        method: 'POST',
+        headers: {
+            accept: 'application/json',
+            authorization: `Bearer ${token}`,
+            'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: params.model,
+            prompt: [params.tag, params.artist].filter(Boolean).join(', '),
+            size: IMAGE_SIZE_PIXELS[params.size] || String(params.size || '832x1216'),
+            n: 1,
+            response_format: 'b64_json',
+            parameters: {
+                negative_prompt: params.negative || '',
+                steps: Number(params.steps) || Number(IMAGE_DEFAULT_STEPS_YNAI),
+                scale: Number(params.scale) || Number(IMAGE_DEFAULT_SCALE),
+                cfg_scale: Number(params.cfg) || Number(IMAGE_DEFAULT_CFG),
+                sampler: params.sampler,
+                noise_schedule: params.noise_schedule
+            }
+        })
+    }, async (upstreamResponse) => {
+        if (!upstreamResponse.ok) {
+            return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
+        }
+        const payload = await upstreamResponse.json().catch(() => null);
+        const encoded = payload?.data?.[0]?.b64_json;
+        if (!encoded) return error('\u751f\u56fe\u670d\u52a1\u6ca1\u6709\u8fd4\u56de\u56fe\u7247\u3002', 502);
+        let binary;
+        try {
+            binary = Uint8Array.from(atob(encoded), ch => ch.charCodeAt(0));
+        } catch (_) {
+            return error('\u751f\u56fe\u670d\u52a1\u56fe\u7247\u6570\u636e\u65e0\u6548\u3002', 502);
+        }
+        if (binary.byteLength > IMAGE_MAX_BYTES) {
+            return error(`\u56fe\u7247\u8fc7\u5927\uff1a${binary.byteLength}/${IMAGE_MAX_BYTES}`, 413);
+        }
+        return { bytes: binary, contentType: 'image/png' };
+    });
+}
+
+async function handleImageModels(request, env) {
+    if (request.method !== 'GET' && request.method !== 'POST') {
+        return error('Method not allowed.', 405);
+    }
+    const url = new URL(request.url);
+    const token = normalizeImageParam(request.headers.get('x-rp-image-token'), 1000)
+        || normalizeImageParam(url.searchParams.get('token'), 1000);
+    if (!isYnaiImageToken(token)) return error('\u7b2c\u4e09\u65b9\u751f\u56fe\u5bc6\u94a5\u65e0\u6548\u3002', 401);
+    const cacheKey = String(token).trim();
+    const cached = imageModelsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+        return json({ ok: true, data: cached.data });
+    }
+    const ynai = resolveYnaiConfig(await tryLoadAdapter(env));
+    if (!ynai) return error('中转生图配置未加载，请检查适配清单。', 503);
+    let response;
+    try {
+        response = await fetch(ynai.base + ynai.modelsPath, {
+            headers: { accept: 'application/json', authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15000)
+        });
+    } catch (_) {
+        return error('\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002', 503);
+    }
+    const text = await response.text();
+    if (!response.ok) {
+        return error(`\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff1aHTTP ${response.status}`, response.status);
+    }
+    let data;
+    try {
+        const parsed = JSON.parse(text);
+        data = Array.isArray(parsed?.data) ? parsed.data.filter(item => item?.id) : [];
+    } catch (_) {
+        return error('\u6a21\u578b\u5217\u8868\u683c\u5f0f\u65e0\u6548\u3002', 502);
+    }
+    imageModelsCache.set(cacheKey, { data, expiresAt: Date.now() + IMAGE_MODELS_CACHE_TTL_MS });
+    return json({ ok: true, data });
+}
+
 function deletedImagePlaceholder(characterName) {
     const safeName = String(characterName || 'character')
         .replace(/&/g, '&amp;')
@@ -599,7 +715,7 @@ async function handleImageRender(request, env) {
     const token = normalizeImageParam(url.searchParams.get('token'), 1000);
     const generateOnMiss = request.method === 'POST'
         || (request.method === 'GET' && url.searchParams.get('generate') === '1');
-    const params = buildImageParams(url);
+    const params = buildImageParams(url, token);
     const primary = await buildImageLookupCandidate(params);
     // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
     // 证明未删除；先查墓碑才能保证删除后的读取立即返回占位图。
@@ -627,7 +743,13 @@ async function handleImageRender(request, env) {
 
     if (!token) return error('缺少生图密钥。', 401);
     if (!primary.params.tag) return error('缺少生图提示词。', 400);
-    const result = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token), {}, async (upstreamResponse, signal) => {
+    let result;
+    if (primary.params.provider === 'ynai') {
+        const ynai = resolveYnaiConfig(await tryLoadAdapter(env));
+        if (!ynai) return error('中转生图配置未加载，请检查适配清单。', 503);
+        result = await fetchYnaiGeneratedImage(primary.params, token, ynai);
+    } else {
+        result = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token), {}, async (upstreamResponse, signal) => {
         if (!upstreamResponse.ok) {
             return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
         }
@@ -643,6 +765,7 @@ async function handleImageRender(request, env) {
             throw err;
         }
     });
+    }
     if (result instanceof Response) return result;
     const { bytes, contentType } = result;
 
@@ -2374,6 +2497,13 @@ export default {
         if (url.pathname === IMAGE_API_PATH) {
             try {
                 return await handleImageRender(request, env);
+            } catch (err) {
+                return error(err instanceof Error ? err.message : 'Unexpected server error.', 500);
+            }
+        }
+        if (url.pathname === IMAGE_MODELS_PATH) {
+            try {
+                return await handleImageModels(request, env);
             } catch (err) {
                 return error(err instanceof Error ? err.message : 'Unexpected server error.', 500);
             }

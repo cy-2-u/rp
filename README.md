@@ -58,7 +58,7 @@ https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json
 ### 2.2 发布步骤
 
 1. 在 `.sync-tests` 安装依赖并运行 `npm test`。
-2. 运行 `npm run scale-sim` 完成默认 300MB 规模测试。
+2. 运行 `npm run scale-sim` 完成默认 300MB 规模测试；根目录 `npm run lint` 过死代码门禁（首次先 `npm install`）。
 3. 把五个根目录正本同步到 `page/`，逐字节核对。
 4. 运行 `node deployer/make-page-zip.mjs` 重新生成 `page.zip`；工具会先核对 `page/` 与根目录正本逐字节一致，再以归档根级 + 正斜杠条目打包并回读校验。禁止用 PowerShell `Compress-Archive` 打包：它写出 `page\_worker.js` 这类反斜杠带前缀条目，Pages 导入后既没有根级 `_worker.js` 也没有 `DB/` 子目录，站点整体打不开。
 5. 部署 `page/`，或让 Pages Git 集成把构建输出目录设置为 `page`；构建命令留空。
@@ -73,6 +73,7 @@ schema 13 第一次上传只进行**非破坏式初始化**：写入 `rp-sync/ma
 - **图片管理**：按角色分组、搜索、查看和批量删除。前端每批 20 张，Worker 每请求最多处理 20 个目标；先写墓碑，再后台删除原图和缩略图。
 - **固定生图**：按 `storyScopeId`、消息和槽位持久化参数快照。刷新或换画风后旧图片仍能读取固定记录。
 - **生图门控**：跟随作者世界书的“自动生图”开关，开关状态由适配层在每次图片任务时实时传入，不依赖本地存储。关闭时不再为新消息生图：没有已存图片的消息槽位不发起任何生成请求、不落任何记录，卡片以 `.magic-image-suppressed` 整体隐藏，不渲染占位；已有图片的消息照常显示旧图，reroll 也只保留旧图不重新生成。重新打开开关后，此前被隐藏的消息按作者原生行为重新生成。旧版适配清单不传开关字段时保持始终生成的旧行为。
+- **YNAI 中转生图**：生图密钥以 `YNAI-` 开头时自动路由到第三方中转（OpenAI images 形状，b64_json 应答）；设置页“生图版本”下拉被劫持为中转模型列表（经 Worker 从中转站拉取，仅接受 YNAI- 密钥），默认取适配清单 `image.ynai.defaultModel`，选择后覆盖作者页面的模型参数。中转地址/路径/默认模型**只**云端化在适配清单 `image.ynai` 段（改 JSON 即生效，无代码兜底，配置缺失时 ynai 生图显式报错）。**缓存不区分来源**：ynai 与 sta1n 相同参数共享同一 R2 对象，历史图键稳定。固定记录重放使用生成时的模型。sta1n 密钥行为完全不变。
 - **适配失败**：替换规则或 `sourceChecks` 任一失配时，作者页面整体回退，不返回半份修改。
 
 不参与同步的数据包括：
@@ -166,6 +167,13 @@ Bloom filter 只用于安全保留：假阳性会多留垃圾，不会删除仍�
 cd .sync-tests
 npm ci
 npm test
+```
+
+死代码门禁（根目录，ESLint flat config：no-unused-vars / no-undef / no-redeclare / no-unreachable / no-dupe-keys）：
+
+```text
+npm install
+npm run lint
 ```
 
 `npm test` 包含：
