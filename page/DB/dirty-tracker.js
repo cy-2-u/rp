@@ -2,9 +2,16 @@
     if (window.__RPH_SYNC_DIRTY_TRACKING__) return;
     window.__RPH_SYNC_DIRTY_TRACKING__ = true;
 
+    // ---- 跨文件协议常量（人肉双写）----
+    // 本块与 DB/bootstrap.js 的同名常量是同一份协议的两份副本（纯静态
+    // 文件没有构建注入）。任何一侧改名必须双侧同步，否则脏追踪与同步面板
+    // 会静默失去共同语言（journal 对不上、恢复暂停标记失联）；
+    // audit-regressions.mjs 的静态断言会抓住两侧不一致。
     const JOURNAL = '__rp_sync_journal_v2';
     const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
+    // 恢复页判定与 bootstrap.js 的 RESTORE_PAGE 是同一判定的两份副本，
+    // 语义改动须双侧同步。
     const RESTORE_PAGE = Boolean(
         document.documentElement?.hasAttribute?.('data-rp-sync-restore')
         || location.pathname === '/sync-restore'
@@ -17,6 +24,8 @@
     let releaseWriterLease = null;
     const acquireWriterLease = () => {
         if (!navigator.locks?.request || restorePaused || RESTORE_PAGE) return;
+        // 锁名与 bootstrap.js withRestoreWriteLock 的排他锁互为副本
+        // （恢复期间被排他压制），改必须双侧同步。
         navigator.locks.request('rp-hub-app-writers-v1', { mode: 'shared' }, () => {
             if (restorePaused || localStorage.getItem(RESTORE_ACTIVE_KEY)) return;
             return new Promise(resolve => { releaseWriterLease = resolve; });
@@ -54,6 +63,8 @@
         const active = localStorage.getItem(RESTORE_ACTIVE_KEY);
         if (!active || !navigator.locks?.query) return;
         const locks = await navigator.locks.query();
+        // 裸字符串比较 bootstrap.js CONFIG.lockName 持有的同一把锁，
+        // 改必须与 bootstrap 双侧同步。
         if (localStorage.getItem(RESTORE_ACTIVE_KEY) !== active
             || locks.held.some(lock => lock.name === 'rp-hub-r2-sync-v1')) return;
         showRestorePause();
