@@ -126,7 +126,6 @@
     }
 
     global.RPH_SYNC_UPLOAD_ENGINE = Object.freeze({
-        createBatchReader,
         runBoundedUpload
     });
 })(globalThis);
@@ -182,6 +181,8 @@
         && document.documentElement?.hasAttribute?.('data-rp-sync-restore')
         || typeof location !== 'undefined' && location.pathname === '/sync-restore'
     );
+    // 恢复页判定与 dirty-tracker.js 头部的 RESTORE_PAGE 是同一判定的两份
+    // 副本（bootstrap 多了非浏览器环境的 typeof 守卫），语义改动须双侧同步。
     const PAGE_SCOPE = ['/', '/index.html', '/sync-restore'];
     if (!RESTORE_PAGE && !PAGE_SCOPE.includes(location.pathname)) {
         return;
@@ -191,6 +192,341 @@
         history.replaceState(null, '', '/');
     }
 
+    // 面板样式：原为独立注入的 /DB/styles.css（主页 <link> 第 4 个注入节点）。
+    // 为收敛作者页注入面，样式随 bootstrap 启动自注入，内容与原文件一致；
+    // 作者页注入因此只剩 dirty-tracker、magic-extension、bootstrap 三个节点。
+    const SYNC_STYLE_TEXT = `
+.rp-sync-modal *, .rp-sync-modal *::before, .rp-sync-modal *::after {
+    box-sizing: border-box;
+}
+
+.rp-sync-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: none;
+    color: #111827;
+}
+
+.rp-sync-modal.is-open {
+    display: block;
+}
+
+.rp-sync-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(17, 24, 39, 0.32);
+    backdrop-filter: blur(5px);
+}
+
+.rp-sync-modal__panel {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: min(92vw, 420px);
+    max-height: min(86vh, 640px);
+    overflow-y: auto;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 24px 70px -34px rgba(15, 23, 42, 0.55);
+    padding: 18px;
+}
+
+.rp-sync-modal__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.rp-sync-modal__eyebrow {
+    color: #2563eb;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.rp-sync-modal__title {
+    margin: 0;
+    color: #111827;
+    font-size: 20px;
+    line-height: 1.2;
+    font-weight: 800;
+}
+
+.rp-sync-modal__title-main {
+    display: block;
+    color: #111827;
+    font-size: 18px;
+    line-height: 1.1;
+    font-weight: 800;
+    letter-spacing: 0;
+}
+
+.rp-sync-modal__close {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 999px;
+    background: #fff;
+    color: #6b7280;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.rp-sync-modal__close:hover {
+    color: #111827;
+    border-color: rgba(156, 163, 175, 0.9);
+}
+
+.rp-sync-modal--restore .rp-sync-modal__panel {
+    width: min(88vw, 360px);
+    max-height: none;
+    overflow: visible;
+    border-radius: 8px;
+    padding: 20px;
+}
+
+.rp-sync-modal--restore .rp-sync-modal__title-main,
+.rp-sync-modal--restore .rp-sync-modal__status {
+    text-align: center;
+}
+
+.rp-sync-restore-actions {
+    display: none;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.rp-sync-modal--restore.is-error .rp-sync-restore-actions {
+    display: flex;
+}
+
+.rp-sync-modal.is-error .rp-sync-modal__status,
+.rp-sync-modal.is-error .rp-sync-progress__value {
+    color: #b91c1c;
+}
+
+.rp-sync-modal.is-error .rp-sync-progress__bar {
+    background: #dc2626;
+}
+
+.rp-sync-main-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.rp-sync-action-button {
+    min-width: 0;
+    height: 42px;
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 12px;
+    background: #fff;
+    color: #374151;
+    font-size: 15px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.rp-sync-action-button:hover {
+    border-color: rgba(59, 130, 246, 0.35);
+    background: #f8fafc;
+    color: #1d4ed8;
+}
+
+.rp-sync-action-button.is-primary {
+    border-color: rgba(37, 99, 235, 0.25);
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.rp-sync-action-button:disabled,
+.rp-sync-modal__button:disabled {
+    opacity: 0.62;
+    cursor: wait;
+}
+
+.rp-sync-modal__status {
+    min-height: 22px;
+    margin: 14px 0 10px;
+    color: #4b5563;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.rp-sync-progress {
+    width: 100%;
+    height: 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e5e7eb;
+}
+
+.rp-sync-progress__bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: #2563eb;
+    transition: width 0.28s ease;
+}
+
+.rp-sync-progress__value {
+    margin-top: 6px;
+    text-align: right;
+    color: #2563eb;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.rp-sync-modal__intro {
+    margin: 0 0 10px;
+    color: #64748b;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.rp-sync-password-field {
+    display: grid;
+    gap: 7px;
+    margin-top: 14px;
+    color: #475569;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.rp-sync-modal__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.rp-sync-modal__button {
+    min-width: 78px;
+    border: 1px solid rgba(209, 213, 219, 0.95);
+    border-radius: 999px;
+    background: #fff;
+    color: #374151;
+    font-size: 13px;
+    font-weight: 800;
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+.rp-sync-modal__button:hover {
+    border-color: rgba(59, 130, 246, 0.35);
+    color: #1d4ed8;
+}
+
+.rp-sync-modal__button.is-primary {
+    border-color: rgba(37, 99, 235, 0.25);
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.rp-sync-password-field input {
+    width: 100%;
+    border: 1px solid rgba(209, 213, 219, 0.95);
+    border-radius: 12px;
+    background: #fff;
+    color: #111827;
+    font-size: 15px;
+    line-height: 1.4;
+    padding: 11px 12px;
+    outline: none;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.rp-sync-password-field input:focus {
+    border-color: rgba(37, 99, 235, 0.52);
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.11);
+}
+
+.rp-sync-password-status {
+    min-height: 20px;
+    margin: 10px 0 0;
+    color: #475569;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+    .rp-sync-modal__backdrop {
+        background: rgba(17, 24, 39, 0.36);
+    }
+
+    .rp-sync-modal__panel {
+        left: 0;
+        right: 0;
+        bottom: 0;
+        top: auto;
+        width: 100%;
+        max-height: min(82vh, 620px);
+        transform: none;
+        border-right: 0;
+        border-bottom: 0;
+        border-left: 0;
+        border-radius: 20px 20px 0 0;
+        padding: 16px 16px max(16px, env(safe-area-inset-bottom));
+    }
+
+    .rp-sync-modal__header {
+        margin-bottom: 12px;
+    }
+
+    .rp-sync-modal__title {
+        font-size: 18px;
+    }
+
+    .rp-sync-modal__title-main {
+        font-size: 17px;
+    }
+
+    .rp-sync-main-actions {
+        gap: 8px;
+    }
+
+    .rp-sync-action-button {
+        height: 42px;
+        font-size: 14px;
+        border-radius: 12px;
+    }
+
+    .rp-sync-modal--restore .rp-sync-modal__panel {
+        left: 50%;
+        right: auto;
+        bottom: auto;
+        top: 50%;
+        width: min(88vw, 360px);
+        transform: translate(-50%, -50%);
+        border: 1px solid rgba(229, 231, 235, 0.95);
+        border-radius: 8px;
+        padding: 20px;
+    }
+
+}
+
+`;
+    let syncStyleInstalled = false;
+    function ensureSyncStyle() {
+        if (syncStyleInstalled) return;
+        syncStyleInstalled = true;
+        const style = document.createElement('style');
+        style.textContent = SYNC_STYLE_TEXT;
+        (document.head || document.documentElement).appendChild(style);
+    }
+    ensureSyncStyle();
+
     // TextEncoder.encode 无内部状态，整个同步模块共享一个实例；
     // 序列化/校验和是每条记录级别的热路径，不再逐次分配编码器。
     const textEncoder = new TextEncoder();
@@ -198,6 +534,8 @@
     const CONFIG = {
         apiEndpoint: '/api/rp-sync',
         passwordStorageKey: 'rp_hub_sync_password_v1',
+        // 跨 tab 同步互斥锁名：dirty-tracker.js 的 checkInterruptedRestore
+        // 以裸字符串比较同一把锁，改必须双侧同步。
         lockName: 'rp-hub-r2-sync-v1',
         knownDatabases: [
             { name: 'RPHubDB', stores: ['store'] },
@@ -231,6 +569,13 @@
         yieldIntervalMs: 12
     };
 
+    // ---- 跨文件协议常量（人肉双写）----
+    // 下面 JOURNAL_STORE / STORAGE_INTENT_PREFIX / TRACKING_EPOCH_KEY /
+    // RESTORE_ACTIVE_KEY / RESTORE_EPOCH_KEY 与 DB/dirty-tracker.js 头部的
+    // 同名常量是同一份协议的两份副本（纯静态文件没有构建注入）。任何一侧
+    // 改名必须双侧同步，否则脏追踪与同步面板会静默失去共同语言（journal
+    // 对不上、跨 tab 互斥失效）；audit-regressions.mjs 的静态断言会抓住
+    // 两侧不一致。
     const LOCAL_CACHE_DB = 'RPHubSyncCache';
     const LOCAL_CACHE_DB_VERSION = 3;
     const LOCAL_CACHE_ENTRY_STORE = 'entries';
@@ -330,6 +675,8 @@
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000);
         try {
+            // 锁名与 dirty-tracker.js acquireWriterLease 的 shared 模式锁
+            // 互为副本（恢复期间排他压过业务页共享租约），改必须双侧同步。
             return await navigator.locks.request('rp-hub-app-writers-v1', {
                 mode: 'exclusive', signal: controller.signal
             }, async () => {
@@ -2038,8 +2385,6 @@
                 clearTimeout(timeoutId);
             }
         }
-
-        throw lastError || new Error('同步请求失败。');
     }
 
     function throwSyncHttpError(response, data, keepPasswordOnAuthError) {
@@ -2316,10 +2661,11 @@
         await proxy.manualSave();
     }
 
-    async function getAuthStatus(password = getStoredSyncPassword()) {
+    async function getAuthStatus(password = getStoredSyncPassword(), options = {}) {
         return postSync({ action: 'auth-status' }, {
             password,
-            keepPasswordOnAuthError: true
+            keepPasswordOnAuthError: true,
+            ...options
         });
     }
 
@@ -2377,6 +2723,224 @@
         passwordSubmitButton.disabled = false;
         passwordModalRoot.classList.add('is-open');
         setTimeout(() => passwordInput.focus(), 0);
+    }
+
+    // ------------------------------------------------------------ 访问门禁 ----
+    // 站点打开时先做一次同步密码校验：已保存密码（rp_hub_sync_password_v1）
+    // 走完全静默的自动验证，通过则不出现任何登录 UI、照常进入站点；只有云端
+    // 要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录
+    // 锁页。验证通过的密码保留在 localStorage，同步与图片管理页照常复用，
+    // 正常使用中不再弹出密码框。云端不可达（断网/Worker 无响应，8 秒单次
+    // 预算）直接放行：门禁只是体验层，真正的数据防护始终由 Worker 端 401
+    // 承担，不能因网络故障把整站锁死。
+
+    const LOCK_STYLE_TEXT = `
+.rp-sync-lock{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;overflow:hidden;background:linear-gradient(180deg,#f8fafc 0%,#eef2ff 52%,#faf5ff 100%);opacity:1;transition:opacity .24s ease}
+.rp-sync-lock::before,.rp-sync-lock::after{content:"";position:absolute;inset:-24%;pointer-events:none}
+.rp-sync-lock::before{background:radial-gradient(36% 44% at 24% 30%,rgba(96,165,250,.5),transparent 70%),radial-gradient(32% 40% at 78% 20%,rgba(167,139,250,.42),transparent 70%),radial-gradient(38% 46% at 80% 76%,rgba(103,232,249,.4),transparent 70%);animation:rp-lock-drift-a 26s ease-in-out infinite alternate}
+.rp-sync-lock::after{background:radial-gradient(34% 44% at 72% 72%,rgba(244,114,182,.32),transparent 70%),radial-gradient(36% 46% at 16% 78%,rgba(129,140,248,.38),transparent 70%);animation:rp-lock-drift-b 32s ease-in-out infinite alternate}
+@keyframes rp-lock-drift-a{from{transform:translate3d(-2.5%,-2%,0) scale(1)}to{transform:translate3d(2.5%,2.5%,0) scale(1.07)}}
+@keyframes rp-lock-drift-b{from{transform:translate3d(2%,2.5%,0) scale(1.05)}to{transform:translate3d(-2.5%,-2%,0) scale(1)}}
+.rp-sync-lock.is-leaving{opacity:0;pointer-events:none}
+.rp-sync-lock__card{position:relative;z-index:1;width:min(100%,380px);border:1px solid rgba(255,255,255,.85);border-radius:22px;background:rgba(255,255,255,.82);backdrop-filter:blur(16px) saturate(1.5);-webkit-backdrop-filter:blur(16px) saturate(1.5);box-shadow:0 24px 70px -30px rgba(79,70,229,.38),0 4px 16px rgba(15,23,42,.07);padding:28px 26px 24px;color:#0f172a;animation:rp-sync-lock-in .34s cubic-bezier(.2,.8,.3,1)}
+.rp-sync-lock.is-leaving .rp-sync-lock__card{transform:translateY(6px) scale(.985);transition:transform .24s ease}
+@keyframes rp-sync-lock-in{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+.rp-sync-lock.is-error .rp-sync-lock__card{animation:rp-sync-lock-shake .36s ease}
+@keyframes rp-sync-lock-shake{0%,100%{transform:translateX(0)}20%{transform:translateX(-7px)}40%{transform:translateX(6px)}60%{transform:translateX(-4px)}80%{transform:translateX(3px)}}
+.rp-sync-lock__card,.rp-sync-lock__card *{box-sizing:border-box}
+.rp-sync-lock__badge{width:44px;height:44px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;border-radius:14px;background:linear-gradient(135deg,#60a5fa,#4f46e5);box-shadow:0 12px 26px -10px rgba(79,70,229,.55)}
+.rp-sync-lock__badge svg{width:22px;height:22px;display:block}
+.rp-sync-lock__title{margin:0 0 8px;text-align:center;color:#0f172a;font-size:21px;line-height:1.2;font-weight:800}
+.rp-sync-lock__intro{margin:0 0 18px;text-align:center;color:#64748b;font-size:13px;line-height:1.6}
+.rp-sync-lock__field{position:relative;display:block}
+.rp-sync-lock__field input{width:100%;border:1px solid rgba(203,213,225,.9);border-radius:14px;background:rgba(255,255,255,.92);color:#0f172a;font-size:15px;line-height:1.4;padding:13px 46px 13px 14px;outline:none;transition:border-color .16s ease,box-shadow .16s ease,background .16s ease}
+.rp-sync-lock__field input:focus{border-color:rgba(99,102,241,.55);background:#fff;box-shadow:0 0 0 4px rgba(99,102,241,.13)}
+.rp-sync-lock__field input::placeholder{color:#94a3b8}
+.rp-sync-lock__toggle{position:absolute;top:50%;right:8px;transform:translateY(-50%);width:32px;height:32px;display:flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:transparent;color:#94a3b8;cursor:pointer;transition:color .16s ease,background .16s ease}
+.rp-sync-lock__toggle:hover{color:#4f46e5;background:rgba(99,102,241,.09)}
+.rp-sync-lock__toggle:focus-visible{outline:2px solid rgba(99,102,241,.55);outline-offset:1px}
+.rp-sync-lock__toggle svg{width:18px;height:18px}
+.rp-sync-lock__error{min-height:18px;margin:8px 2px 0;color:#b91c1c;font-size:12.5px;line-height:1.5}
+.rp-sync-lock__submit{width:100%;margin-top:12px;display:flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:14px;background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;font-size:15px;font-weight:800;padding:12px 16px;cursor:pointer;box-shadow:0 14px 30px -14px rgba(79,70,229,.6);transition:filter .16s ease,transform .16s ease,box-shadow .16s ease}
+.rp-sync-lock__submit:hover{filter:brightness(1.07)}
+.rp-sync-lock__submit:active{transform:translateY(1px)}
+.rp-sync-lock__submit:focus-visible{outline:2px solid rgba(67,56,202,.7);outline-offset:2px}
+.rp-sync-lock__submit:disabled{opacity:.72;cursor:wait;box-shadow:none;transform:none}
+.rp-sync-lock__spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:rp-sync-lock-spin .7s linear infinite;display:none}
+.rp-sync-lock__submit.is-busy .rp-sync-lock__spinner{display:block}
+@keyframes rp-sync-lock-spin{to{transform:rotate(360deg)}}
+@media (max-width:480px){.rp-sync-lock__card{padding:24px 20px 20px;border-radius:18px}}
+@media (prefers-reduced-motion:reduce){.rp-sync-lock{transition:none}.rp-sync-lock::before,.rp-sync-lock::after{animation:none}.rp-sync-lock__card{animation:none}.rp-sync-lock.is-leaving .rp-sync-lock__card{transition:none}.rp-sync-lock__spinner{animation-duration:1.2s}}
+`;
+
+    const LOCK_EYE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const LOCK_EYE_OFF_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+    const LOCK_BADGE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+
+    let lockStyleInstalled = false;
+    let lockOverlay = null;
+    let lockIntro = null;
+    let lockError = null;
+    let lockForm = null;
+    let lockFormInput = null;
+    let lockFormToggle = null;
+    let lockFormSubmit = null;
+    let lockSubmitLabel = null;
+    let lockBody = null;
+    let lockBodyOverflow = null;
+    let lockVerifying = false;
+    let resolveAccessGate = null;
+    const accessGateDone = new Promise((resolve) => { resolveAccessGate = resolve; });
+
+    function ensureLockStyle() {
+        if (lockStyleInstalled) return;
+        lockStyleInstalled = true;
+        const style = document.createElement('style');
+        style.textContent = LOCK_STYLE_TEXT;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function openAccessGate(introText) {
+        if (lockOverlay) {
+            if (lockIntro) lockIntro.textContent = introText;
+            return;
+        }
+        ensureLockStyle();
+        const overlay = document.createElement('div');
+        overlay.className = 'rp-sync-lock';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-modal', 'true');
+        overlay.setAttribute('aria-label', '访问验证');
+        overlay.innerHTML = `
+            <div class="rp-sync-lock__card">
+                <div class="rp-sync-lock__badge">${LOCK_BADGE_SVG}</div>
+                <h1 class="rp-sync-lock__title">访问验证</h1>
+                <p class="rp-sync-lock__intro"></p>
+                <form class="rp-sync-lock__form">
+                    <label class="rp-sync-lock__field">
+                        <input type="password" autocomplete="current-password" aria-label="访问密码" placeholder="请输入访问密码">
+                        <button type="button" class="rp-sync-lock__toggle" aria-label="显示密码"></button>
+                    </label>
+                    <p class="rp-sync-lock__error" aria-live="polite"></p>
+                    <button type="submit" class="rp-sync-lock__submit"><span class="rp-sync-lock__submit-label">解锁并进入</span><span class="rp-sync-lock__spinner"></span></button>
+                </form>
+            </div>
+        `;
+        lockIntro = overlay.querySelector('.rp-sync-lock__intro');
+        lockError = overlay.querySelector('.rp-sync-lock__error');
+        lockForm = overlay.querySelector('.rp-sync-lock__form');
+        lockFormInput = overlay.querySelector('.rp-sync-lock__field input');
+        lockFormToggle = overlay.querySelector('.rp-sync-lock__toggle');
+        lockFormSubmit = overlay.querySelector('.rp-sync-lock__submit');
+        lockSubmitLabel = overlay.querySelector('.rp-sync-lock__submit-label');
+        if (lockIntro) lockIntro.textContent = introText;
+        if (lockFormToggle) {
+            lockFormToggle.innerHTML = LOCK_EYE_SVG;
+            lockFormToggle.addEventListener('click', () => {
+                const reveal = lockFormInput.type === 'password';
+                lockFormInput.type = reveal ? 'text' : 'password';
+                lockFormToggle.innerHTML = reveal ? LOCK_EYE_OFF_SVG : LOCK_EYE_SVG;
+                lockFormToggle.setAttribute('aria-label', reveal ? '隐藏密码' : '显示密码');
+                lockFormInput.focus();
+            });
+        }
+        if (lockForm) {
+            lockForm.addEventListener('submit', (event) => {
+                event.preventDefault?.();
+                submitLockPassword().catch(() => { });
+            });
+        }
+        (document.body || document.documentElement).appendChild(overlay);
+        lockOverlay = overlay;
+        lockBody = document.body || null;
+        if (lockBody) {
+            lockBodyOverflow = lockBody.style.overflow || '';
+            lockBody.style.overflow = 'hidden';
+        }
+        setTimeout(() => {
+            try { lockFormInput?.focus(); } catch (_) { }
+        }, 0);
+    }
+
+    function closeAccessGate() {
+        const overlay = lockOverlay;
+        lockOverlay = null;
+        if (overlay) {
+            overlay.classList.add('is-leaving');
+            setTimeout(() => {
+                overlay.remove();
+                if (lockBody) lockBody.style.overflow = lockBodyOverflow || '';
+            }, 240);
+        } else if (lockBody) {
+            lockBody.style.overflow = lockBodyOverflow || '';
+        }
+        resolveAccessGate();
+    }
+
+    function showLockError(text) {
+        if (!lockError) return;
+        lockError.textContent = text;
+        if (lockOverlay) {
+            lockOverlay.classList.remove('is-error');
+            void lockOverlay.offsetWidth;
+            lockOverlay.classList.add('is-error');
+        }
+    }
+
+    function setLockBusy(busy) {
+        if (!lockFormSubmit) return;
+        lockFormSubmit.disabled = Boolean(busy);
+        lockFormSubmit.classList.toggle('is-busy', Boolean(busy));
+        if (lockSubmitLabel) lockSubmitLabel.textContent = busy ? '验证中…' : '解锁并进入';
+    }
+
+    async function submitLockPassword() {
+        if (!lockOverlay || lockVerifying) return;
+        const password = lockFormInput.value;
+        if (!password) {
+            showLockError('请输入访问密码。');
+            lockFormInput.focus();
+            return;
+        }
+        lockVerifying = true;
+        setLockBusy(true);
+        try {
+            const auth = await getAuthStatus(password, { retryCount: 0, timeoutMs: 10000 });
+            if (auth?.authRequired && !auth.authenticated) {
+                showLockError('密码不正确，请重新输入。');
+                lockFormInput.select();
+                return;
+            }
+            if (auth?.authRequired) saveStoredSyncPassword(password);
+            else clearStoredSyncPassword();
+            closeAccessGate();
+        } catch (error) {
+            showLockError(error?.message || '密码验证失败，请稍后再试。');
+        } finally {
+            lockVerifying = false;
+            setLockBusy(false);
+        }
+    }
+
+    function startAccessGate() {
+        if (typeof fetch !== 'function' || typeof localStorage === 'undefined') {
+            resolveAccessGate();
+            return accessGateDone;
+        }
+        const stored = getStoredSyncPassword();
+        getAuthStatus(stored, { retryCount: 0, timeoutMs: 8000 }).then((auth) => {
+            if (!auth?.authRequired || auth.authenticated) {
+                resolveAccessGate();
+                return;
+            }
+            clearStoredSyncPassword();
+            openAccessGate(stored
+                ? '已保存的密码已失效，请重新输入。'
+                : '此站点受同步密码保护，请输入访问密码继续。');
+        }).catch(() => {
+            resolveAccessGate();
+        });
+        return accessGateDone;
     }
 
     function openSyncPanel() {
@@ -2694,17 +3258,18 @@
         handleSyncButtonClick().catch(() => { });
     };
 
+    const accessGateReady = startAccessGate();
+
     if (RESTORE_PAGE) {
         const beginRestore = () => {
             ensureModal();
             openModal();
             pullFromServer().catch(() => { });
         };
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', beginRestore, { once: true });
-        } else {
-            beginRestore();
-        }
+        const domReady = document.readyState === 'loading'
+            ? new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }))
+            : Promise.resolve();
+        Promise.all([domReady, accessGateReady]).then(beginRestore);
     } else if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', () => {
             ensureModal();

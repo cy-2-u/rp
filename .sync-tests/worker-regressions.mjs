@@ -106,24 +106,48 @@ for (const length of [null, '1']) {
         assert.equal(timers.size, 0);
     });
 }
-test('image timeout remains active after headers and aborts stalled body', async () => {
+test('image timeout covers body consumption and aborts a stalled body', async () => {
     let signal, cancelled = false;
-    const { context, timers } = load({ fetch: async (_url, options) => {
+    const { context } = load({ fetch: async (_url, options) => {
         signal = options.signal;
         return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-type': 'image/png' } });
     } });
-    const store = bucket(); store.get = async () => null;
-    const pending = context.handleImageRender(new Request('https://offline.invalid/api/rp-image?token=fake&tag=test', { method: 'POST' }), { RP_SYNC_R2: store });
-    const settled = pending.then(() => 'resolved', () => 'rejected');
-    for (let i = 0; i < 30 && !signal; i++) await new Promise(resolve => setTimeout(resolve, 5));
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(timers.size, 1, 'deadline was cleared at headers');
-    [...timers.values()][0]();
-    assert.equal(await Promise.race([settled, new Promise(resolve => setTimeout(() => resolve('hung'), 200))]), 'rejected');
+    const consume = async (response, sig) => {
+        // 与真实消费者 readBoundedImageBytes 同构：监听 abort 主动取消读取，
+        // 取消让挂起的 read 返回后再检查 aborted 抛出。
+        const reader = response.body.getReader();
+        const abort = () => { void reader.cancel().catch(() => { }); };
+        sig.addEventListener('abort', abort, { once: true });
+        try {
+            for (;;) {
+                if (sig.aborted) throw new Error('Image fetch timed out.');
+                const { done } = await reader.read();
+                if (sig.aborted) throw new Error('Image fetch timed out.');
+                if (done) return;
+            }
+        } finally {
+            sig.removeEventListener('abort', abort);
+            reader.releaseLock();
+            await response.body.cancel().catch(() => { });
+        }
+    };
+    // 截止时间覆盖响应头之后的正文消费：注入 30ms 短超时，挂起的正文读取
+    // 必须被中止并归一为固定错误文案。
+    await assert.rejects(
+        context.fetchImageWithTimeout('https://offline.invalid/x', {}, consume, 30),
+        /Image fetch timed out\./
+    );
     assert.equal(signal.aborted, true);
     assert.equal(cancelled, true);
-    assert.equal(timers.size, 0);
-    assert.equal(store.writes.length, 0);
+});
+test('image timeout aborts a hung fetch before headers arrive', async () => {
+    const { context } = load({ fetch: (_url, options) => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'TimeoutError')));
+    }) });
+    await assert.rejects(
+        context.fetchImageWithTimeout('https://offline.invalid/x', {}, async () => { }, 25),
+        /Image fetch timed out\./
+    );
 });
 test('thumbnail accepts exactly 2 MiB and rejects empty bodies', async () => {
     const { context } = load();
@@ -266,6 +290,30 @@ test('ynai model list requires YNAI token and cloud config, proxies the relay li
     assert.equal((await cached.json()).data.length, 2);
     assert.equal(calls, 1, '30 秒内存缓存避免重复外呼');
 });
+test('ynai invalid cloud config shape reports 503 without contacting the relay', async () => {
+    // 配置存在但形状非法（缺 generatePath）与配置缺失同等对待：显式 503，
+    // 不做代码兜底、不触发任何中转外呼。
+    const brokenAdapter = JSON.stringify({
+        schema: 1,
+        id: 'rp-hub',
+        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
+        image: { ynai: { base: 'https://nai.rinko.ai', modelsPath: '/v1/models' } }
+    });
+    let relayCalls = 0;
+    const { context } = load({ fetch: async url => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(brokenAdapter, { headers: { 'content-type': 'application/json' } });
+        if (u.includes('nai.rinko.ai')) relayCalls += 1;
+        return new Response('{}');
+    } });
+    const store = bucket(); store.get = async () => null;
+    const env = { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' };
+    const models = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
+    assert.equal(models.status, 503);
+    const render = await context.handleImageRender(new Request(`https://offline.invalid/api/rp-image?token=${encodeURIComponent(YNAI_TOKEN)}&tag=test&character_name=A..B`, { method: 'POST' }), env);
+    assert.equal(render.status, 503);
+    assert.equal(relayCalls, 0, '形状非法的配置不触发中转外呼');
+});
 test('provider-agnostic cache: tokenless reads share one key regardless of provider param', async () => {
     const { context } = load();
     const store = bucket();
@@ -384,6 +432,51 @@ test('empty steps default splits by provider: ynai 28, sta1n 40', () => {
     assert.equal(ynai.steps, '28', 'ynai 中转默认 28');
     const explicit = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=x&steps=17&character_name=A..B'), '');
     assert.equal(explicit.steps, '17', '显式步数不被默认覆盖');
+});
+test('ynai model default follows the cloud adapter while sta1n keeps the builtin', () => {
+    const { context } = load();
+    const url = 'https://offline.invalid/api/rp-image?tag=x&character_name=A..B';
+    assert.equal(context.buildImageParams(new URL(url), YNAI_TOKEN, 'cloud-model-a').model, 'cloud-model-a',
+        'ynai 未显式带 model 时使用云端 defaultModel');
+    assert.equal(context.buildImageParams(new URL(url), YNAI_TOKEN, null).model, 'nai-diffusion-4-5-full',
+        '云端配置缺失时回退内置默认');
+    assert.equal(context.buildImageParams(new URL(url), 'fake-token', 'cloud-model-a').model, 'nai-diffusion-4-5-full',
+        'sta1n 忽略云端 defaultModel');
+    assert.equal(context.buildImageParams(new URL(url + '&model=mine'), YNAI_TOKEN, 'cloud-model-a').model, 'mine',
+        '显式 model 优先于云端默认');
+});
+test('ynai generation without an explicit model uses the cloud defaultModel end to end', async () => {
+    const adapterJson = JSON.stringify({
+        schema: 1,
+        id: 'rp-hub',
+        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
+        image: { ynai: { base: 'https://nai.rinko.ai', modelsPath: '/v1/models', generatePath: '/v1/images/generations', defaultModel: 'relay-default-9' } }
+    });
+    let captured;
+    const { context } = load({ fetch: async (url, options) => {
+        const u = String(url);
+        if (u.startsWith('file:')) return new Response(adapterJson, { headers: { 'content-type': 'application/json' } });
+        captured = { url: u, options };
+        return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('png-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
+    } });
+    const store = bucket(); store.get = async () => null;
+    const request = new Request(`https://offline.invalid/api/rp-image?token=${encodeURIComponent(YNAI_TOKEN)}&tag=test&character_name=A..B`, { method: 'POST' });
+    const result = await context.handleImageRender(request, { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' });
+    assert.equal(result.status, 200);
+    assert.equal(JSON.parse(captured.options.body).model, 'relay-default-9', '生成请求使用云端默认模型');
+});
+test('validateAdapter keeps the author script path inside the rewritable candidate set', () => {
+    const { context } = load();
+    const base = { schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } };
+    assert.doesNotThrow(() => context.validateAdapter(base), '缺省 path 合法');
+    assert.doesNotThrow(() => context.validateAdapter({
+        ...base,
+        author: { script: { path: '/assets/js/app.js', replacements: base.author.script.replacements } }
+    }));
+    assert.throws(
+        () => context.validateAdapter({ ...base, author: { script: { path: '/other/app.js', replacements: base.author.script.replacements } } }),
+        /适配清单脚本路径无效/
+    );
 });
 test('legacy sta1n replay keys are stable with or without the provider param', () => {
     const { context } = load();

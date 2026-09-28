@@ -130,7 +130,6 @@ const REPO_DIR = 'page';
 const ASSETS = [
   { path: 'DB/bootstrap.js', ext: 'js', type: 'application/javascript' },
   { path: 'DB/dirty-tracker.js', ext: 'js', type: 'application/javascript' },
-  { path: 'DB/styles.css', ext: 'css', type: 'text/css' },
   { path: 'magic-extension.js', ext: 'js', type: 'application/javascript' },
 ];
 const WORKER_FILE = '_worker.js';

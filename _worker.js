@@ -26,6 +26,9 @@ const ADAPTER_PATH = '/__rphub/adapter.json';
 const ADAPTER_MAX_BYTES = 512 * 1024;
 const ADAPTER_CACHE_TTL_MS = 30 * 1000;
 const adapterCache = new Map();
+// 成功清单缓存 30 秒；失败也短暂缓存（仅网络源），适配源抖动时不让
+// 每个作者资源请求都重付整条竞速链的超时。
+const ADAPTER_FAILURE_TTL_MS = 5 * 1000;
 
 // ---- GitHub 多源容错：适配清单走竞速，作者页面走故障转移链（仅用于公开静态资源） ----
 const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good.json';
@@ -47,24 +50,31 @@ function githubMirrorUrls(rawUrl) {
     ];
 }
 
-async function fetchGithubText(url, timeoutMs) {
-    const candidates = [url.href, ...githubMirrorUrls(url.href)];
+// 竞速一组镜像 URL：任一返回 2xx 即胜出，整体超时后放弃全部候选。
+// 失败候选的响应体不消费，交由运行时回收（与原实现一致）。
+async function raceFirstOk(candidates, buildInit, timeoutMs) {
     const controllers = candidates.map(() => new AbortController());
     const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, timeoutMs);
     try {
         return await Promise.any(candidates.map(async (candidate, index) => {
-            const response = await fetch(candidate, {
-                headers: { accept: 'application/json,text/plain' },
-                signal: controllers[index].signal,
-                redirect: 'follow'
-            });
+            const response = await fetch(candidate, buildInit(candidate, controllers[index].signal));
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return String(await response.text()).replace(/^\uFEFF/, '');
+            return response;
         }));
     } finally {
         clearTimeout(timer);
         for (const c of controllers) c.abort();
     }
+}
+
+async function fetchGithubText(url, timeoutMs) {
+    const candidates = [url.href, ...githubMirrorUrls(url.href)];
+    const response = await raceFirstOk(
+        candidates,
+        (_candidate, signal) => ({ headers: { accept: 'application/json,text/plain' }, signal, redirect: 'follow' }),
+        timeoutMs
+    );
+    return String(await response.text()).replace(/^\uFEFF/, '');
 }
 
 async function fetchAuthorUpstream(path, init, search) {
@@ -89,18 +99,11 @@ async function fetchAuthorUpstream(path, init, search) {
     }
     const candidates = githubMirrorUrls(AUTHOR_REPO_RAW + rel);
     if (candidates.length === 0) throw new Error('作者站点不可用。');
-    const controllers = candidates.map(() => new AbortController());
-    const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, GITHUB_FALLBACK_TIMEOUT_MS);
-    try {
-        return await Promise.any(candidates.map(async (candidate, index) => {
-            const response = await fetch(candidate, { ...init, signal: controllers[index].signal, redirect: 'follow' });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response;
-        }));
-    } finally {
-        clearTimeout(timer);
-        for (const c of controllers) c.abort();
-    }
+    return raceFirstOk(
+        candidates,
+        (_candidate, signal) => ({ ...init, signal, redirect: 'follow' }),
+        GITHUB_FALLBACK_TIMEOUT_MS
+    );
 }
 
 function validateAdapter(adapter) {
@@ -113,6 +116,12 @@ function validateAdapter(adapter) {
     const replacements = adapter.author?.script?.replacements;
     if (!Array.isArray(replacements) || replacements.length === 0) {
         throw new Error('适配清单缺少脚本替换规则。');
+    }
+    // author.script.path 是云端可改的作者主脚本路径（serveAuthor 据此判定
+    // 改写目标），形状必须落在候选集内，否则静默不生效。
+    const scriptPath = adapter.author?.script?.path;
+    if (scriptPath !== undefined && !/^\/assets\/js\/[^/]+\.js$/.test(scriptPath)) {
+        throw new Error('适配清单脚本路径无效。');
     }
     replacements.forEach((item, index) => {
         if (!item || typeof item.name !== 'string' || typeof item.find !== 'string'
@@ -166,10 +175,26 @@ function adapterPublicView(adapter) {
 
 async function loadAdapter(env) {
     const url = resolveAdapterUrl(env);
-    const cacheKey = url.href;
-    const cached = adapterCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const cached = adapterCache.get(url.href);
+    if (cached && cached.expiresAt > Date.now()) {
+        // value 为 null 表示近期加载失败：短暂短路而不是每请求重试整条链。
+        if (!cached.value) throw new Error('适配清单读取失败：所有源均不可用。');
+        return cached.value;
+    }
+    try {
+        const adapter = await loadAdapterFresh(env, url);
+        adapterCache.set(url.href, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
+        return adapter;
+    } catch (err) {
+        // file:// 仅供本地测试（失败确定性高，不缓存）。
+        if (url.protocol !== 'file:') {
+            adapterCache.set(url.href, { value: null, expiresAt: Date.now() + ADAPTER_FAILURE_TTL_MS });
+        }
+        throw err;
+    }
+}
 
+async function loadAdapterFresh(env, url) {
     let source = null;
     let fromLastGood = false;
     if (url.protocol === 'file:') {
@@ -200,7 +225,6 @@ async function loadAdapter(env) {
     } catch (error) {
         throw error instanceof Error ? error : new Error('适配清单解析失败。');
     }
-    adapterCache.set(cacheKey, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
     if (!fromLastGood && url.protocol !== 'file:' && source !== adapterLastGoodPersisted && env?.[R2_BINDING]) {
         adapterLastGoodPersisted = source;
         try {
@@ -416,10 +440,13 @@ function isYnaiImageToken(token) {
     return String(token || '').trim().toUpperCase().startsWith('YNAI-');
 }
 
-function applyImageParamDefaults(params, token, characterName) {
+function applyImageParamDefaults(params, token, characterName, ynaiDefaultModel = null) {
     params.provider = isYnaiImageToken(token) ? 'ynai' : 'sta1n';
     params.character_name = sanitizeImageKeySegment(characterName, '未命名角色');
-    params.model = params.model || IMAGE_DEFAULT_MODEL;
+    // 模型默认：sta1n 恒用内置默认；ynai 请求未显式带 model 时优先云端
+    // 适配清单的 image.ynai.defaultModel（配置缺失时回退内置默认）。
+    params.model = params.model
+        || (params.provider === 'ynai' ? (ynaiDefaultModel || IMAGE_DEFAULT_MODEL) : IMAGE_DEFAULT_MODEL);
     params.size = params.size || IMAGE_DEFAULT_SIZE;
     // 空 steps 默认按提供商区分：ynai 中转 28，sta1n 维持原 40。
     params.steps = params.steps || (params.provider === 'ynai' ? IMAGE_DEFAULT_STEPS_YNAI : IMAGE_DEFAULT_STEPS);
@@ -431,13 +458,13 @@ function applyImageParamDefaults(params, token, characterName) {
     return params;
 }
 
-function buildImageParams(url, token) {
+function buildImageParams(url, token, ynaiDefaultModel = null) {
     const params = {};
     for (const key of IMAGE_PARAM_KEYS) {
         params[key] = normalizeImageParam(url.searchParams.get(key));
     }
     params.reroll_nonce = normalizeImageParam(url.searchParams.get('reroll_nonce'), 120);
-    return applyImageParamDefaults(params, token, url.searchParams.get('character_name'));
+    return applyImageParamDefaults(params, token, url.searchParams.get('character_name'), ynaiDefaultModel);
 }
 
 function buildImageSignature(params) {
@@ -565,35 +592,28 @@ async function readBoundedImageBytes(message, maxBytes, label, signal) {
 }
 
 // The deadline covers both response headers and the bounded body consumer.
-async function fetchImageWithTimeout(url, options, consume) {
-    const controller = new AbortController();
+// AbortSignal.timeout 的计时由运行时持有，不占用请求的 setTimeout 配额；
+// 测试通过 timeoutMs 注入更短的截止时间。
+async function fetchImageWithTimeout(url, options, consume, timeoutMs = IMAGE_FETCH_TIMEOUT_MS) {
+    const signal = AbortSignal.timeout(timeoutMs);
     let response;
-    let timeout;
-    const deadline = new Promise((_, reject) => {
-        timeout = setTimeout(() => {
-            controller.abort();
-            reject(new Error('Image fetch timed out.'));
-        }, IMAGE_FETCH_TIMEOUT_MS);
-    });
     try {
-        return await Promise.race([deadline, (async () => {
-            response = await fetch(url, {
-                ...options,
-                headers: {
-                    accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                    'user-agent': 'RPH-R2-Image-Cache',
-                    ...(options.headers || {})
-                },
-                signal: controller.signal
-            });
-            if (controller.signal.aborted) {
-                void response.body?.cancel().catch(() => {});
-                throw new Error('Image fetch timed out.');
-            }
-            return await consume(response, controller.signal);
-        })()]);
+        response = await fetch(url, {
+            ...options,
+            headers: {
+                accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                'user-agent': 'RPH-R2-Image-Cache',
+                ...(options.headers || {})
+            },
+            signal
+        });
+        return await consume(response, signal);
+    } catch (err) {
+        if (signal.aborted && (err?.name === 'TimeoutError' || err?.name === 'AbortError')) {
+            throw new Error('Image fetch timed out.');
+        }
+        throw err;
     } finally {
-        clearTimeout(timeout);
         if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
     }
 }
@@ -688,7 +708,13 @@ async function handleImageModels(request, env) {
     } catch (_) {
         return error('\u6a21\u578b\u5217\u8868\u683c\u5f0f\u65e0\u6548\u3002', 502);
     }
-    imageModelsCache.set(cacheKey, { data, expiresAt: Date.now() + IMAGE_MODELS_CACHE_TTL_MS });
+    // 写入前顺手淘汰过期条目：缓存键是逐密钥的，长寿命 isolate 里
+    // 不同密钥可能积累大量列表，不做清理就是无上限增长。
+    const now = Date.now();
+    for (const [staleKey, entry] of imageModelsCache) {
+        if (entry.expiresAt <= now) imageModelsCache.delete(staleKey);
+    }
+    imageModelsCache.set(cacheKey, { data, expiresAt: now + IMAGE_MODELS_CACHE_TTL_MS });
     return json({ ok: true, data });
 }
 
@@ -715,19 +741,28 @@ async function handleImageRender(request, env) {
     const token = normalizeImageParam(url.searchParams.get('token'), 1000);
     const generateOnMiss = request.method === 'POST'
         || (request.method === 'GET' && url.searchParams.get('generate') === '1');
-    const params = buildImageParams(url, token);
+    // ynai 请求提前解析一次云端配置：defaultModel 要在签名计算前参与
+    // 模型默认值（缓存键必须与实际使用的模型一致），生成阶段直接复用，
+    // 不再二次加载。
+    const ynaiConfig = isYnaiImageToken(token) ? resolveYnaiConfig(await tryLoadAdapter(env)) : null;
+    const params = buildImageParams(url, token, ynaiConfig?.defaultModel || null);
     const primary = await buildImageLookupCandidate(params);
     // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
-    // 证明未删除；先查墓碑才能保证删除后的读取立即返回占位图。
-    const deleted = await bucket.get(primary.deletedKey);
+    // 证明未删除。两个 get 并行发出（浏览热路径少一个 R2 往返），命中
+    // 判定仍按墓碑优先。
+    const [deleted, cached] = await Promise.all([
+        bucket.get(primary.deletedKey),
+        bucket.get(primary.key)
+    ]);
     if (deleted) {
+        // 走占位图时原图流不再使用，主动取消释放。
+        try { await cached?.body?.cancel?.(); } catch (_) { }
         return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
             'cache-control': 'public, max-age=3600'
         });
     }
     // 非删除路径：命中原图（最常见的浏览路径）只花 2 个 R2 get（原图 +
     // 墓碑），未命中的生图请求也需要墓碑来排除“已删除”。
-    const cached = await bucket.get(primary.key);
     if (cached) {
         return imageResponse(request.method === 'HEAD' ? null : cached.body, cached.httpMetadata?.contentType, {
             'content-length': String(cached.size || 0)
@@ -745,9 +780,8 @@ async function handleImageRender(request, env) {
     if (!primary.params.tag) return error('缺少生图提示词。', 400);
     let result;
     if (primary.params.provider === 'ynai') {
-        const ynai = resolveYnaiConfig(await tryLoadAdapter(env));
-        if (!ynai) return error('中转生图配置未加载，请检查适配清单。', 503);
-        result = await fetchYnaiGeneratedImage(primary.params, token, ynai);
+        if (!ynaiConfig) return error('中转生图配置未加载，请检查适配清单。', 503);
+        result = await fetchYnaiGeneratedImage(primary.params, token, ynaiConfig);
     } else {
         result = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token), {}, async (upstreamResponse, signal) => {
         if (!upstreamResponse.ok) {
@@ -1217,10 +1251,11 @@ async function handleImageAdmin(request, env, url, ctx) {
         return imageAdminHtml();
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/auth-status`) {
-        const authRequired = Boolean(getSyncPassword(env));
+        const password = getSyncPassword(env);
+        const authRequired = Boolean(password);
         const authenticated = !authRequired || await isImageAdminAuthorized(request, env);
         const headers = authRequired && authenticated
-            ? { 'set-cookie': imageAdminSessionCookie(await imageAdminSessionToken(getSyncPassword(env))) }
+            ? { 'set-cookie': imageAdminSessionCookie(await imageAdminSessionToken(password)) }
             : {};
         return json({ ok: true, authRequired, authenticated }, 200, headers);
     }
@@ -2264,9 +2299,9 @@ async function serveStatic(request, env) {
     if (!env?.ASSETS || typeof env.ASSETS.fetch !== 'function') return null;
     const assetResponse = await env.ASSETS.fetch(request);
     if (!assetResponse || assetResponse.status !== 200) return assetResponse;
-    // 同步客户端的全部代码都在这四个部署文件里。409 版本门的
+    // 同步客户端的全部代码都在这三个部署文件里。409 版本门的
     // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
-    // HTML 与 app.js 已是 no-store；这四个文件约 190KB 且每次部署
+    // HTML 与 app.js 已是 no-store；这三个文件约 190KB 且每次部署
     // etag 必然变化，no-cache 协商缓存让未变化请求直接 304，
     // 部署后也不会回放旧客户端。
     const headers = new Headers(assetResponse.headers);
@@ -2279,7 +2314,7 @@ async function serveStatic(request, env) {
 }
 
 function serveSyncRestorePage() {
-    return new Response(`<!doctype html><html lang="zh-CN" data-rp-sync-restore><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RP Hub</title><script>history.replaceState(null,'','/')</script><link rel="stylesheet" href="/DB/styles.css"></head><body><script src="/DB/dirty-tracker.js"></script><script src="/DB/bootstrap.js"></script></body></html>`, {
+    return new Response(`<!doctype html><html lang="zh-CN" data-rp-sync-restore><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RP Hub</title><script>history.replaceState(null,'','/')</script></head><body><script src="/DB/dirty-tracker.js"></script><script src="/DB/bootstrap.js"></script></body></html>`, {
         headers: {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-store'
@@ -2299,7 +2334,7 @@ function normalizeSourceCheckPath(value) {
     return path === '/' ? '/index.html' : path;
 }
 
-async function sourceCheckResults(adapter, knownContent = null, fetchUnknownPaths = true) {
+async function sourceCheckResults(adapter, knownContent = null) {
     const checks = adapter?.author?.sourceChecks;
     if (!Array.isArray(checks) || checks.length === 0) return true;
     try {
@@ -2320,10 +2355,6 @@ async function sourceCheckResults(adapter, knownContent = null, fetchUnknownPath
             }
             if (cache.has(path)) {
                 if (!cache.get(path)) allPassed = false;
-                continue;
-            }
-            if (!fetchUnknownPaths) {
-                allPassed = false;
                 continue;
             }
             const response = await fetchAuthorUpstream(check.path);
@@ -2351,13 +2382,14 @@ async function tryLoadAdapter(env) {
 
 function rewriteAuthorHtml(response, pathname, adapterReady = false) {
     const isMain = pathname === '/' || pathname === '/index.html';
-    // 注入面保持最小：主页 4 节点（styles.css、dirty-tracker、magic-extension、bootstrap），
-    // 其他作者 HTML 页只有 dirty-tracker。适配配置不再内联进页面——
-    // magic-extension 自行拉取 /__rphub/adapter.json（该路径已是扩展测试
-    // 的既有供给方式），页面响应因此少一个脚本节点与整份适配 JSON。
+    // 注入面保持最小：主页 3 节点（dirty-tracker、magic-extension、bootstrap），
+    // 其他作者 HTML 页只有 dirty-tracker。面板样式由 bootstrap 启动时自行
+    // 注入 <style>（与锁页样式同一来源），不再单独注入 styles.css 节点。
+    // 适配配置不内联进页面——magic-extension 自行拉取 /__rphub/adapter.json
+    // （该路径已是扩展测试的既有供给方式），页面响应因此少一个脚本节点与
+    // 整份适配 JSON。
     if (!adapterReady) return response;
-    const injection = (isMain ? `<link rel="stylesheet" href="/DB/styles.css">` : '')
-        + `<script src="/DB/dirty-tracker.js"></script>`
+    const injection = `<script src="/DB/dirty-tracker.js"></script>`
         + (isMain ? `<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
@@ -2432,12 +2464,19 @@ async function serveAuthor(request, env) {
     upstreamHeaders.delete('authorization');
     upstreamHeaders.delete(SYNC_PASSWORD_HEADER);
 
-    const isAppJs = requestUrl.pathname === '/assets/js/app.js';
+    // 作者主脚本路径来自云端适配清单（author.script.path，缺省回退内置值）。
+    // 只有 /assets/js/*.js 候选请求才加载清单（30 秒缓存 + 失败短路），
+    // 其余请求不为此付出子请求。
     let adapter = null;
     let cachedRewrite = null;
-    if (isAppJs) {
+    let isAppJs = false;
+    if (/^\/assets\/js\/[^/]+\.js$/i.test(requestUrl.pathname)) {
         adapter = await tryLoadAdapter(env);
-        cachedRewrite = adapter ? rewriteCaches.get(adapter) || null : null;
+        const scriptPath = String(adapter?.author?.script?.path || '/assets/js/app.js');
+        if (requestUrl.pathname === scriptPath) {
+            isAppJs = true;
+            cachedRewrite = adapter ? rewriteCaches.get(adapter) || null : null;
+        }
     }
     if (isAppJs && cachedRewrite?.etag) {
         upstreamHeaders.set('if-none-match', cachedRewrite.etag);
@@ -2477,7 +2516,7 @@ async function serveAuthor(request, env) {
         const pageText = await response.text();
         const pageAdapter = await tryLoadAdapter(env);
         const adapterReady = Boolean(pageAdapter)
-            && await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText }, true);
+            && await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText });
         const pageResponse = new Response(pageText, {
             status: response.status,
             statusText: response.statusText,

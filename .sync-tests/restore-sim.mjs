@@ -159,7 +159,12 @@ function createDomElement(tag) {
         removeEventListener() { },
         setAttribute() { },
         getAttribute() { return null; },
-        remove() { },
+        dispatch(type, event) { for (const handler of listeners[type] || []) handler(event); },
+        remove() {
+            const parent = element.parentElement;
+            if (parent) parent.children = parent.children.filter(child => child !== element);
+            element.parentElement = null;
+        },
         focus() { },
         select() { },
         querySelector(selector) {
@@ -183,6 +188,12 @@ function createDocumentStub() {
         addEventListener() { },
         removeEventListener() { }
     };
+}
+
+// 开屏访问门禁的锁页节点可能还挂在 body 上（异步解锁移除前），按类名定位
+// 同步面板而不是依赖 children[0] 的顺序。
+function findSyncModal(documentStub) {
+    return documentStub.body.children.find(child => String(child.className || '').includes('rp-sync-modal')) || null;
 }
 
 // ----------------------------------------------------------- prototypes ----
@@ -434,7 +445,7 @@ installBrowserGlobals({
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
 globalThis.RPHubAuthorSaveData = async () => { };
 
-const modalA = documentA.body.children[0];
+const modalA = findSyncModal(documentA);
 assert.ok(modalA, 'sync modal should be created on load');
 modalA.querySelector('[data-action="push"]').click();
 await waitForUploadDone(modalA, 'browser A initial upload');
@@ -558,8 +569,10 @@ installBrowserGlobals({
 });
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
 
-const modalB = documentB.body.children[0];
+let modalB = null;
 await waitFor(() => {
+    modalB ||= findSyncModal(documentB);
+    if (!modalB) return null;
     const text = modalB.querySelector('.rp-sync-modal__status').textContent;
     if (modalB.classList.contains('is-error')) throw new Error(`restore failed: ${text}`);
     return locationB.replaced ? 'reloaded' : null;
@@ -701,8 +714,10 @@ installBrowserGlobals({
     locks: locksB
 });
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-const modalD = documentD.body.children[0];
-await waitFor(() => modalD.classList.contains('is-error'), 60000, 'corrupt restore rejection');
+await waitFor(() => {
+    const modalD = findSyncModal(documentD);
+    return modalD ? modalD.classList.contains('is-error') : false;
+}, 60000, 'corrupt restore rejection');
 assert.equal(localStorageD.getItem(corruptKey), 'local-value',
     'late malformed JSON must be rejected before any valid entry overwrites local data');
 assert.equal(localStorageD.getItem('rp_sync_restore_active'), null,
@@ -744,8 +759,10 @@ installBrowserGlobals({
     locks: blockedLocks
 });
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-const modalE = documentE.body.children[0];
-await waitFor(() => modalE.classList.contains('is-error'), 60000, 'blocked restore lock');
+await waitFor(() => {
+    const modalE = findSyncModal(documentE);
+    return modalE ? modalE.classList.contains('is-error') : false;
+}, 60000, 'blocked restore lock');
 assert.equal((await idbGetAll(factoryE, 'RPHubDB', 'store')).get('chat1'), 'lock-blocked-local',
     'failure before the writer lock must not alter business data');
 assert.equal(localStorageE.getItem('rp_sync_restore_active'), 'older-interrupted-restore',
@@ -785,8 +802,10 @@ FDBObjectStore.prototype.put = function (...args) {
     }
     return trackedPutBeforeFailure.apply(this, args);
 };
-const modalF = documentF.body.children[0];
-await waitFor(() => modalF.classList.contains('is-error'), 60000, 'restore write failure');
+await waitFor(() => {
+    const modalF = findSyncModal(documentF);
+    return modalF ? modalF.classList.contains('is-error') : false;
+}, 60000, 'restore write failure');
 assert.ok(injectedWriteFailure, 'the failure must be injected after the exclusive writer lock starts');
 assert.ok(localStorageF.getItem('rp_sync_restore_active'),
     'a failure after restore writes begin must keep the active marker');
@@ -1109,8 +1128,9 @@ installBrowserGlobals({
 });
 restorePrototypes(savedPrototypes);
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-const modalC = documentC.body.children[0];
 await waitFor(() => {
+    const modalC = findSyncModal(documentC);
+    if (!modalC) return null;
     const text = modalC.querySelector('.rp-sync-modal__status').textContent;
     if (modalC.classList.contains('is-error')) throw new Error(`empty restore failed: ${text}`);
     return locationC.replaced ? 'reloaded' : null;
@@ -1124,6 +1144,115 @@ assert.equal(localStorageC.getItem('rp_hub_local_only'), null, 'empty restore mu
 assert.equal(localStorageC.getItem('rp_hub_sync_password_v1'), 'keep-password', 'sync password must survive empty restore');
 assert.equal(localStorageC.getItem('unrelated'), 'keep-unrelated', 'unrelated localStorage must survive empty restore');
 console.log('phase 5 (empty snapshot restore): ok');
+
+// ------------------------------------------------- phase 6: access gate ----
+
+// 云端配置了密码（RP_SYNC_PASSWORD）时：已存密码错误 → 静默自动验证失败后
+// 清空并显示登录锁页；表单提交正确密码 → 解锁并保存，供同步与图片管理页继续复用。
+const factoryG = new FDBFactory();
+const StorageG = makeStorageClass();
+const localStorageG = new StorageG();
+const envLocked = { RP_SYNC_R2: bucket, RP_SYNC_PASSWORD: 'gate-pass' };
+localStorageG.setItem('rp_hub_sync_password_v1', 'wrong-pass');
+const documentG = createDocumentStub();
+const locationG = {
+    pathname: '/', replaced: null, assigned: null,
+    replace(url) { this.replaced = url; },
+    assign(url) { this.assigned = url; }
+};
+installBrowserGlobals({
+    storageClass: StorageG,
+    localStorage: localStorageG,
+    factory: factoryG,
+    document: documentG,
+    location: locationG,
+    fetchShim: makeFetchShim('browser G', envLocked),
+    locks: null
+});
+await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+let lockOverlayG = null;
+await waitFor(() => {
+    lockOverlayG ||= documentG.body.children.find(child => String(child.className || '').includes('rp-sync-lock'));
+    return lockOverlayG ? 'lock-shown' : null;
+}, 5000, 'lock page reveal on invalid stored password');
+assert.equal(localStorageG.getItem('rp_hub_sync_password_v1'), null, 'an invalid stored password must be cleared before re-prompting');
+assert.equal(lockOverlayG.querySelector('.rp-sync-lock__intro').textContent, '已保存的密码已失效，请重新输入。',
+    'the lock page must explain that the saved password expired');
+const lockInputG = lockOverlayG.querySelector('.rp-sync-lock__field input');
+const lockErrorG = lockOverlayG.querySelector('.rp-sync-lock__error');
+// 先提交错误密码：错误行出现、锁页保持、密码不保存。
+lockInputG.value = 'still-wrong';
+lockOverlayG.querySelector('.rp-sync-lock__form').dispatch('submit', { preventDefault() { } });
+await waitFor(() => (lockErrorG.textContent === '密码不正确，请重新输入。' ? 'error-shown' : null), 5000, 'wrong password error line');
+assert.equal(localStorageG.getItem('rp_hub_sync_password_v1'), null, 'a rejected password must not be stored');
+// 再提交正确密码：解锁并保存。
+lockInputG.value = 'gate-pass';
+lockOverlayG.querySelector('.rp-sync-lock__form').dispatch('submit', { preventDefault() { } });
+await waitFor(() => (!documentG.body.children.includes(lockOverlayG) ? 'unlocked' : null), 5000, 'gate unlock after correct password');
+assert.equal(localStorageG.getItem('rp_hub_sync_password_v1'), 'gate-pass', 'the verified password must be stored for sync and image admin reuse');
+console.log('phase 6 (access gate: invalid stored password shows the lock page, correct submit unlocks): ok');
+
+// 已保存的正确密码必须全程静默：不出现任何登录 UI，门禁放行后恢复页直接
+// 开始拉取（restore 完成、页面重载即证明门禁已通过）。
+const factoryH = new FDBFactory();
+const StorageH = makeStorageClass();
+const localStorageH = new StorageH();
+localStorageH.setItem('rp_hub_sync_password_v1', 'gate-pass');
+const documentH = createDocumentStub();
+const locationH = {
+    pathname: '/sync-restore', replaced: null, assigned: null,
+    replace(url) { this.replaced = url; },
+    assign(url) { this.assigned = url; }
+};
+installBrowserGlobals({
+    storageClass: StorageH,
+    localStorage: localStorageH,
+    factory: factoryH,
+    document: documentH,
+    location: locationH,
+    fetchShim: makeFetchShim('browser H', envLocked),
+    locks: locksB
+});
+await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+await waitFor(() => {
+    const modalH = findSyncModal(documentH);
+    if (modalH && modalH.classList.contains('is-error')) {
+        throw new Error(`restore failed: ${modalH.querySelector('.rp-sync-modal__status').textContent}`);
+    }
+    return locationH.replaced ? 'restored' : null;
+}, 60000, 'silent auto-unlock restore');
+const overlayH = documentH.body.children.find(child => String(child.className || '').includes('rp-sync-lock'));
+assert.ok(!overlayH, 'a valid stored password must unlock silently without any login UI');
+assert.equal(localStorageH.getItem('rp_hub_sync_password_v1'), 'gate-pass', 'a valid stored password must be kept');
+console.log('phase 7 (access gate: valid stored password auto-unlocks silently): ok');
+
+// 云端不可达时门禁必须放行（fail-open）：锁页不得出现、已存密码不清除，
+// 数据防护由 Worker 端 401 承担，不因网络故障锁死整站。
+const factoryI = new FDBFactory();
+const StorageI = makeStorageClass();
+const localStorageI = new StorageI();
+localStorageI.setItem('rp_hub_sync_password_v1', 'gate-pass');
+const documentI = createDocumentStub();
+const locationI = {
+    pathname: '/', replaced: null, assigned: null,
+    replace(url) { this.replaced = url; },
+    assign(url) { this.assigned = url; }
+};
+installBrowserGlobals({
+    storageClass: StorageI,
+    localStorage: localStorageI,
+    factory: factoryI,
+    document: documentI,
+    location: locationI,
+    fetchShim: async () => { throw new Error('network unreachable'); },
+    locks: null
+});
+await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+await new Promise(resolve => setTimeout(resolve, 300));
+const overlayI = documentI.body.children.find(child => String(child.className || '').includes('rp-sync-lock'));
+assert.ok(!overlayI, 'an unreachable cloud must fail open without any lock page');
+assert.equal(localStorageI.getItem('rp_hub_sync_password_v1'), 'gate-pass', 'fail-open must not clear the stored password');
+console.log('phase 8 (access gate: unreachable cloud fails open): ok');
 
 FDBObjectStore.prototype.openCursor = nativeReadCursor;
 FDBObjectStore.prototype.get = nativeReadGet;

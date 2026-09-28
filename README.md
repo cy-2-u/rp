@@ -4,7 +4,7 @@
 
 当前同步协议为 **schema 13 / `rp-sync-paged-jsonl-v4`**。它针对 Cloudflare Workers Free 的单请求 CPU、50 个子请求、6 个同时出站连接和 128MiB isolate 内存限制设计：每个 HTTP 请求只上传一个内容寻址分片，Worker 将 `request.body` 直接交给 R2；清单分页验证；最终只用常数大小的根清单切换版本；垃圾回收由独立、可续跑的 `gc-step` 请求完成。
 
-最后更新：2026-09-27。
+最后更新：2026-09-28。
 
 ## 1. 项目结构
 
@@ -12,14 +12,15 @@
 |---|---|
 | `_worker.js` | 唯一的 Pages Worker：作者站代理与适配、同步 API、图片 API 和图库页面 |
 | `magic-extension.js` | 图片任务、固定生图、图片管理/同步入口及下滑按钮 |
-| `DB/bootstrap.js` | 同步快照缓存、严格增量、分片上传、隔离恢复执行和同步面板 |
+| `DB/bootstrap.js` | 同步快照缓存、严格增量、分片上传、隔离恢复执行、同步面板与面板样式（启动时自注入 `<style>`） |
 | `DB/dirty-tracker.js` | IndexedDB/localStorage 事务级变更日志与恢复期间写暂停 |
-| `DB/styles.css` | 同步面板和恢复进度样式 |
 | `adapter/rp-hub.json` | 外置适配清单，生产 Worker 从 GitHub Raw 读取 |
+| `deployer/` | 一键部署器：`worker.js` 是部署页的后端源码，`make-page-zip.mjs` 重建 `page.zip`，其余为部署流程与 BLAKE3 测试 |
+| `docs/` | 一键部署页（GitHub Pages 托管的前端）与部署教程截图 |
 | `.sync-tests/` | 离线协议、运行时、恢复、性能和回归测试 |
 | `MODIFICATIONS_TO_KEEP.txt` | 修改代码时必须保留的架构不变量 |
-| `page/` | 可直接部署的五个文件 |
-| `page.zip` | `page/` 的发布归档 |
+| `page/` | 可直接部署的四个文件 |
+| `page.zip` | `page/` 的发布归档（本地构建产物，`.gitignore` 排除、不入仓库；用 `node deployer/make-page-zip.mjs` 重新生成） |
 
 `page/` 必须保持以下结构：
 
@@ -29,11 +30,12 @@ page/
 ├── magic-extension.js
 └── DB/
     ├── bootstrap.js
-    ├── dirty-tracker.js
-    └── styles.css
+    └── dirty-tracker.js
 ```
 
 根目录文件是维护正本，`page/` 是部署副本。适配清单由 Worker 在线读取，不放进部署目录。
+
+部署有两条等价路线：**一键部署**（打开 `docs/` 的部署页，填 Cloudflare API 令牌后由 `deployer/worker.js` 后端自动建桶、上传 `page/` 资产并创建 Pages 项目）与**手动部署**（第 2.1/2.2 节）。
 
 ## 2. 部署
 
@@ -46,6 +48,7 @@ page/
 可选配置：
 
 - 环境变量 `RP_SYNC_PASSWORD`：同步和图库共用密码；不设置则免密。
+  设置后站点打开时先显示**访问验证锁页**：已保存的密码静默自动验证通过后直接进入站点；无保存或密码已失效时输入一次，之后同步与图片管理均复用该密码，正常使用中不再弹出密码框。云端不可达时锁页直接放行（数据防护由 Worker 端 401 承担），不会因网络故障锁死站点。
 
 适配清单地址已在 `_worker.js` 的 `DEFAULT_ADAPTER_URL` 中固定为：
 
@@ -59,7 +62,7 @@ https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json
 
 1. 在 `.sync-tests` 安装依赖并运行 `npm test`。
 2. 运行 `npm run scale-sim` 完成默认 300MB 规模测试；根目录 `npm run lint` 过死代码门禁（首次先 `npm install`）。
-3. 把五个根目录正本同步到 `page/`，逐字节核对。
+3. 把四个根目录正本同步到 `page/`，逐字节核对。
 4. 运行 `node deployer/make-page-zip.mjs` 重新生成 `page.zip`；工具会先核对 `page/` 与根目录正本逐字节一致，再以归档根级 + 正斜杠条目打包并回读校验。禁止用 PowerShell `Compress-Archive` 打包：它写出 `page\_worker.js` 这类反斜杠带前缀条目，Pages 导入后既没有根级 `_worker.js` 也没有 `DB/` 子目录，站点整体打不开。
 5. 部署 `page/`，或让 Pages Git 集成把构建输出目录设置为 `page`；构建命令留空。
 6. 部署后执行第 7 节自检并观察 Cloudflare CPU 指标。
@@ -234,12 +237,11 @@ npm run scale-sim
 
 适配清单与作者页面均走 GitHub 多源容错：适配清单在 raw 之外并发竞速 jsdelivr 与加速反代（10 秒总预算），最近有效版本缓存到 R2（所有源不可用时兜底）；作者页面主源失败后自动切换 raw/镜像，连续失败熔断 60 秒，sourceChecks 走同一条容错链。
 
-正常主页只注入 4 个节点：
+正常主页只注入 3 个节点：
 
-1. `/DB/styles.css`
-2. `/DB/dirty-tracker.js`
-3. `/magic-extension.js`
-4. `/DB/bootstrap.js`
+1. `/DB/dirty-tracker.js`
+2. `/magic-extension.js`
+3. `/DB/bootstrap.js`（同步面板与锁页样式由它在启动时自注入 `<style>`，不再有独立样式表节点）
 
 其他通过适配检查的作者 HTML 页只注入 dirty tracker。未注册路径全部回源作者站，作者新增页面无需维护路由表。
 

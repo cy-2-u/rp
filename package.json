@@ -4,7 +4,9 @@
   "type": "module",
   "description": "RP Hub 魔改版根工作区：ESLint 死代码门禁（npm run lint）",
   "scripts": {
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test:deployer-flow": "node deployer/test-flow.mjs",
+    "test:deployer-blake3": "node deployer/test-blake3.mjs"
   },
   "devDependencies": {
     "eslint": "^10.11.0"

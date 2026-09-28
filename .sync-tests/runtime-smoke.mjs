@@ -10,14 +10,13 @@ const read = relative => fs.readFile(path.join(root, relative), 'utf8');
 const defaultAdapterUrl = pathToFileURL(path.join(root, 'adapter', 'rp-hub.json')).href;
 const configuredAdapterUrl = process.env.RPHUB_ADAPTER_URL?.trim() || defaultAdapterUrl;
 // 作者原版源码定位：环境变量优先，其次仓库同级的 RP-Hub-main 目录
-// （clone 作者仓库到本仓库旁边即可跑测试），最后回退到本机旧路径。
-const upstreamCandidates = [
-    path.join(path.dirname(root), 'RP-Hub-main'),
-    'C:\\Users\\my\\Downloads\\RP-Hub-main'
-];
+// （clone 作者仓库到本仓库旁边即可跑测试）。不再回退任何本机私有路径，
+// 两者都缺失时直接报清晰错误——公开仓库的测试必须可移植。
 const upstreamRoot = process.env.RPHUB_UPSTREAM_DIR?.trim()
-    || upstreamCandidates.find(candidate => existsSync(candidate))
-    || upstreamCandidates[upstreamCandidates.length - 1];
+    || [path.join(path.dirname(root), 'RP-Hub-main')].find(candidate => existsSync(candidate));
+if (!upstreamRoot) {
+    throw new Error('无法定位作者原版源码：请设置环境变量 RPHUB_UPSTREAM_DIR 指向 RP-Hub 仓库目录，或将 RP-Hub-main 克隆到本仓库旁。');
+}
 
 function localAdapterPath() {
     const url = new URL(configuredAdapterUrl);
@@ -574,7 +573,7 @@ async function testImageRenderApi() {
     assert.equal(deletedRead.status, 200, 'a tombstoned image must render the placeholder');
     assert.match(deletedRead.headers.get('content-type') || '', /svg/);
     assert.match(await deletedRead.text(), /图片已清理/);
-    assert.equal(counters.r2Get, 1, 'tombstone-first lookup lets a deleted read return after the tombstone hit');
+    assert.equal(counters.r2Get, 2, 'tombstone and image lookups issue two gets (parallel hot path)');
     assert.equal(counters.upstream, 2, 'reads of deleted images must not regenerate them');
 
     const deletedGenerate = await worker.fetch(new Request(targetUrl, { method: 'POST' }), env, {});
@@ -653,7 +652,7 @@ async function testCatchAllProxy() {
         }
         return new Response('missing', { status: 404 });
     });
-    const localAssets = ['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/DB/styles.css', '/magic-extension.js'];
+    const localAssets = ['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/magic-extension.js'];
     const env = {
         RPHUB_ADAPTER_URL: configuredAdapterUrl,
         ASSETS: {
@@ -681,9 +680,9 @@ async function testCatchAllProxy() {
     const restoreHtml = await restorePage.text();
     assert.equal(restorePage.status, 200);
     assert.match(restoreHtml, /<html[^>]*data-rp-sync-restore/, 'restore mode must use an explicit internal document marker');
-    assert.ok(restoreHtml.includes('<link rel="stylesheet" href="/DB/styles.css">'));
     assert.ok(restoreHtml.includes('<script src="/DB/dirty-tracker.js"></script>'));
     assert.ok(restoreHtml.includes('<script src="/DB/bootstrap.js"></script>'));
+    assert.ok(!restoreHtml.includes('/DB/styles.css'), 'panel styles ship inside bootstrap, no separate stylesheet node');
     assert.doesNotMatch(restoreHtml, /magic-extension|assets\/js\/app\.js|上传到云端|重建本地索引/,
         'the isolated restore document must not load the author app or normal sync actions');
     assert.equal(upstreamCalls.length, 0, 'the internal restore document must never reach the author upstream');
@@ -704,7 +703,6 @@ async function testCatchAllProxy() {
     const homeText = await home.text();
     assert.equal(upstreamCalls.length, 5, 'the main page adds one author HTML request after checks');
     const injectionMarkers = [
-        '<link rel="stylesheet" href="/DB/styles.css">',
         '<script src="/DB/dirty-tracker.js"></script>',
         '<script src="/magic-extension.js"></script>',
         '<script src="/DB/bootstrap.js"></script>'
@@ -712,7 +710,8 @@ async function testCatchAllProxy() {
     const positions = injectionMarkers.map(marker => homeText.indexOf(marker));
     positions.forEach((position, index) => assert.ok(position >= 0, `main page must inject: ${injectionMarkers[index]}`));
     assert.ok(positions.every((position, index) => index === 0 || position > positions[index - 1]),
-        'the four injected nodes must appear in order');
+        'the three injected nodes must appear in order');
+    assert.ok(!homeText.includes('/DB/styles.css'), 'panel styles must ship inside bootstrap instead of a stylesheet node');
     // 适配配置不再内联：扩展自行拉取 /__rphub/adapter.json，页面保持干净。
     assert.doesNotMatch(homeText, /RPHUB_MAGIC_ADAPTER/, 'the adapter config must not be inlined into author pages');
     assert.doesNotMatch(homeText, /upload-engine\.js|persistence-bridge\.js/, 'merged files must not be referenced again');

@@ -177,7 +177,7 @@ async function deploy(body, ip) {
 
   // 上传增量：第二次部署不再上传资产
   ok(saved.uploadPayloads && saved.uploadPayloads.length === 1, '资产只上传一次（第二次增量跳过）', String(saved.uploadPayloads && saved.uploadPayloads.length));
-  ok(saved.uploadPayloads[0].length === 4, '4 个资产文件');
+  ok(saved.uploadPayloads[0].length === 3, '3 个资产文件');
 
   // 鉴权分离
   ok(saved.checkAuth.every(a => a === 'Bearer jwt-123') && saved.uploadAuth.every(a => a === 'Bearer jwt-123'), '资产端点用 upload JWT');
@@ -189,7 +189,7 @@ async function deploy(body, ip) {
   ok(!!manifest, 'deployment multipart 含 manifest');
   ok(saved.deployRaw.includes(JSON.stringify(manifest) + '\r\n--'), 'manifest 部件后有 CRLF（服务端 multipart 严格解析必需）');
   const keys = Object.keys(manifest).sort();
-  ok(JSON.stringify(keys) === JSON.stringify(['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/DB/styles.css', '/magic-extension.js']), 'manifest 键（含前导斜杠、无 _worker.js）');
+  ok(JSON.stringify(keys) === JSON.stringify(['/DB/bootstrap.js', '/DB/dirty-tracker.js', '/magic-extension.js']), 'manifest 键（含前导斜杠、无 _worker.js）');
   ok(Object.values(manifest).every(h => /^[0-9a-f]{32}$/.test(h)), 'manifest 哈希格式');
   ok(saved.deployBranches[0] === null, '不含 branch 字段（API 会拒绝）');
   ok(saved.deployCommitDirty && saved.deployCommitDirty[0] === 'true', '含 commit_dirty=true');

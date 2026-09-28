@@ -1,10 +1,11 @@
 RP Hub 魔改版：修改时必须保留的当前实现
-更新时间：2026-09-27
+更新时间：2026-09-28
 
 一、部署与文件边界
 
-1. 根目录 `_worker.js`、`magic-extension.js`、`DB/bootstrap.js`、`DB/dirty-tracker.js`、`DB/styles.css` 是正本。
-   `page/` 中同路径文件是部署副本，发布前必须逐字节一致；`page.zip` 只包含这五个文件。
+1. 根目录 `_worker.js`、`magic-extension.js`、`DB/bootstrap.js`、`DB/dirty-tracker.js` 是正本。
+   `page/` 中同路径文件是部署副本，发布前必须逐字节一致；`page.zip` 只包含这四个文件。
+   面板/锁页样式不再有独立 styles.css 文件：由 bootstrap.js 启动时自注入 `<style>`（`SYNC_STYLE_TEXT` 与 `LOCK_STYLE_TEXT`）。
 
 2. Worker 保持单文件、无构建步骤。不要加入 import、顶层 await 或运行时依赖。
 
@@ -15,11 +16,16 @@ RP Hub 魔改版：修改时必须保留的当前实现
 4. 未注册路径继续回源作者站。适配规则、source checks、UI 选择器和注入行样式类（固定生图 rowClass/textClass/toggleWrapClass/toggleClass，跟随作者 `settings-toggle-row` 语义类）继续放在 `adapter/rp-hub.json`，不要重新硬编码进 Worker 或 magic-extension。
 
 5. 作者页面适配必须全有或全无：任一 source check 或替换命中失败，返回作者原内容，不运行半份修改。
-   正常主页注入保持 4 个节点：styles.css、dirty-tracker、magic-extension、bootstrap；其他作者 HTML 页只注入 dirty-tracker。
+   正常主页注入保持 3 个节点：dirty-tracker、magic-extension、bootstrap；其他作者 HTML 页只注入 dirty-tracker；样式不占注入节点。
+   作者主脚本路径来自适配清单 `author.script.path`（serveAuthor 对 `/assets/js/*.js` 候选请求判定，缺省回退 `/assets/js/app.js`）；validateAdapter 校验其形状必须为 `/assets/js/*.js`。
 
-6. GitHub 多源容错仅用于公开静态资源（适配清单与作者页面），不得让任何用户数据经过第三方镜像：适配清单 raw 失败后并发竞速 jsdelivr/加速反代（10 秒总预算），最近有效版本写 R2 `rp-adapter/last-good.json` 兜底；作者页面主源失败后走 raw/镜像，连续失败熔断 60 秒，sourceChecks 走同一条链；`tryLoadAdapter` 失败降级为纯代理的语义保持不变。
+6. GitHub 多源容错仅用于公开静态资源（适配清单与作者页面），不得让任何用户数据经过第三方镜像：适配清单 raw 失败后并发竞速 jsdelivr/加速反代（10 秒总预算），最近有效版本写 R2 `rp-adapter/last-good.json` 兜底；作者页面主源失败后走 raw/镜像，连续失败熔断 60 秒，sourceChecks 走同一条链；`tryLoadAdapter` 失败降级为纯代理的语义保持不变；适配清单加载失败（连 last-good 也没有）时按 5 秒失败短路缓存，避免适配源抖动期间每个作者资源请求重付整条竞速链超时（file:// 本地源不缓存失败）。
 
-7. 四个注入静态文件（styles.css、dirty-tracker、magic-extension、bootstrap）的资产缓存固定为 no-cache 协商缓存：每次部署 etag 必然变化，刷新必然拿到当前部署副本（409 版本门语义），未变化请求 304，不重复下载约 190KB；不得退回 no-store。
+7. 三个注入静态文件（dirty-tracker、magic-extension、bootstrap）的资产缓存固定为 no-cache 协商缓存：每次部署 etag 必然变化，刷新必然拿到当前部署副本（409 版本门语义），未变化请求 304，不重复下载约 210KB；不得退回 no-store。
+
+8. 开屏访问门禁：主页与恢复页由 bootstrap.js 在站点打开时先静默做一次同步密码校验（`auth-status` 单次请求，`retryCount: 0`、8 秒超时）。**已保存密码（`rp_hub_sync_password_v1`）验证通过时全程不出现任何登录 UI**，照常进入站点；只有云端要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录锁页（z-index 10000，面板与锁页样式均由 bootstrap 自注入，不依赖外部样式表加载时序；body 为 null 时挂到 documentElement；浅色纯 CSS 极光背景 + 玻璃卡片，徽标 + 眼睛明文切换 + 抖动错误 + spinner + `prefers-reduced-motion` 降级）。锁页表单提交正确密码后保存到该 key，同步弹窗与图片管理页照常复用（图片管理页本就自动用该 key 登录），正常使用中不再弹出密码框（原 401 兜底密码弹窗保留，用于会话中途改密）。云端不可达直接放行（首屏静默路径网络失败即放行；锁页表单态的提交失败显示错误并可重试，刷新页面同样回到静默放行路径）：门禁只是体验层，真正的数据防护始终由 Worker 端 401 承担，不得因网络故障把整站锁死。恢复页在门禁放行（静默或表单解锁）后才开始拉取；测试与代码不得依赖 body children 顺序定位同步面板。
+
+9. bootstrap.js 与 dirty-tracker.js 的协议常量（journal/intent/epoch/restore 标记、RESTORE_PAGE 判定、`rp-hub-r2-sync-v1` 与 `rp-hub-app-writers-v1` 两把 Web Locks 锁名）是人肉双写副本，两侧均有互指注释；audit-regressions.mjs 的静态断言逐字比较两侧声明，任何一侧改名必须双侧同步。
 
 二、同步协议硬约束
 
@@ -143,12 +149,13 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 7. 适配层传入 `autoImageGen` 时必须前置 `worldInfo.value?.length` 守卫并用 `typeof` 保护标识符：世界书未加载或作者改名时传 undefined，魔改层按作者原生行为放行，防止启动窗口误判；旧适配清单不传该字段时同样放行。“固定生图”开关保持纯持久化语义（只决定生成结果是否落盘为固定记录），不参与生成门控；其设置行样式仍来自适配层 ui.settings。
 
-8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生 `GET /generate`。空 steps 默认按提供商区分：ynai 28、sta1n 40。**中转端点只认云端适配清单 `image.ynai` 段（base/modelsPath/generatePath），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此新增适配替换规则。
+8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生 `GET /generate`。空 steps 默认按提供商区分：ynai 28、sta1n 40；未显式带 `model` 的 ynai 请求默认值取云端 `image.ynai.defaultModel`（配置缺失回退内置 `nai-diffusion-4-5-full`，sta1n 恒用内置默认），默认值在签名计算前解析，缓存键与实际模型一致。**中转端点只认云端适配清单 `image.ynai` 段（base/modelsPath/generatePath/defaultModel），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存，写入前淘汰过期条目）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此新增适配替换规则。
 
 六、验证与发布
 
 1. 默认回归：
    `npm --prefix .sync-tests test`
+   部署器回归：`npm run test:deployer-flow`、`npm run test:deployer-blake3`（根目录 scripts）
 
 2. 规模回归：
    `npm --prefix .sync-tests run scale-sim`
@@ -159,9 +166,11 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - `runtime-smoke.mjs`
    - `restore-sim.mjs`
    - `scale-sim.mjs`
-   - `audit-regressions.mjs`
+   - `audit-regressions.mjs`（含 bootstrap/dirty-tracker 协议常量一致性静态断言）
    - `worker-regressions.mjs`
    - `image-task-regressions.mjs`
+   - `deployer/test-flow.mjs`
+   - `deployer/test-blake3.mjs`
 
 4. 改协议时测试至少覆盖：空快照、缺包重试、持久会话恢复、清单页 CAS、并发 finalize、finalize/GC 锁、根 CAS、page hash、pack membership、Bloom 缺项/损坏、GC 游标、密码、丢失提交响应和远端版本冲突。
 
@@ -169,7 +178,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - 对所有 JS/MJS 做语法检查；
    - `npm run lint` 死代码门禁通过（根目录 ESLint flat config：no-unused-vars/no-undef/no-redeclare/no-unreachable/no-dupe-keys；node_modules 已 gitignore）；
    - 默认回归和 300MB 规模测试通过；
-   - 五个正本与 `page/` SHA-256 一致；
+   - 四个正本与 `page/` SHA-256 一致；
    - `page.zip` 重新生成并检查结构；
    - 不包含 node_modules、日志、临时补丁、计划文件或测试输出；
    - 未经明确要求不 commit、不 push、不访问真实用户 R2 数据。

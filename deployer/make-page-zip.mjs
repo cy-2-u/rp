@@ -17,7 +17,6 @@ const FILES = [
   ['magic-extension.js', 'magic-extension.js'],
   ['DB/bootstrap.js', 'DB/bootstrap.js'],
   ['DB/dirty-tracker.js', 'DB/dirty-tracker.js'],
-  ['DB/styles.css', 'DB/styles.css'],
 ];
 
 let failed = 0;
@@ -108,9 +107,9 @@ for (let i = 0; i < zip.length - 4; i++) {
     });
   }
 }
-ok(centralEntries.length === FILES.length, 'zip 条目数 = 5', String(centralEntries.length));
+ok(centralEntries.length === FILES.length, 'zip 条目数 = 4', String(centralEntries.length));
 const names = centralEntries.map(e => e.name).sort();
-ok(JSON.stringify(names) === JSON.stringify(['DB/bootstrap.js', 'DB/dirty-tracker.js', 'DB/styles.css', '_worker.js', 'magic-extension.js']),
+ok(JSON.stringify(names) === JSON.stringify(['DB/bootstrap.js', 'DB/dirty-tracker.js', '_worker.js', 'magic-extension.js']),
   '条目名全部为正斜杠且在归档根级', JSON.stringify(names));
 for (const e of centralEntries) {
   const src = FILES.find(f => f[1] === e.name)[0];

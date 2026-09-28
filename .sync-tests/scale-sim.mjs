@@ -541,7 +541,9 @@ installBrowserGlobals({
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
 globalThis.RPHubAuthorSaveData = async () => { };
 
-const modal = documentStub.body.children[0];
+// 开屏门禁的锁页可能先于同步面板挂在 body 上，按类名定位面板，
+// 不依赖 children 顺序（MODS 一.8）。
+const modal = documentStub.body.children.find(child => String(child.className || '').includes('rp-sync-modal')) || null;
 assert.ok(modal, 'sync modal should be created on load');
 
 const waitForUploadDone = (label, timeoutMs = 20 * 60_000) => new Promise((resolve, reject) => {
@@ -867,10 +869,14 @@ installBrowserGlobals({
 delete globalThis.RPH_SYNC_UPLOAD_ENGINE;
 delete globalThis.RPH_SYNC_PERSISTENCE;
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-const restoreModal = restoreDocument.body.children[0];
+const findRestoreModal = () => restoreDocument.body.children
+    .find(child => String(child.className || '').includes('rp-sync-modal')) || null;
 const restoreStartedAt = Date.now();
 await new Promise((resolve, reject) => {
     const timer = setInterval(() => {
+        // 恢复页的面板在门禁放行后才创建，轮询中按类名懒查找。
+        const restoreModal = findRestoreModal();
+        if (!restoreModal) return;
         const status = restoreModal.querySelector('.rp-sync-modal__status').textContent;
         if (restoreModal.classList.contains('is-error')) {
             clearInterval(timer);

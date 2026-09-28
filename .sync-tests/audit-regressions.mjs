@@ -113,3 +113,25 @@ for (const stage of ['dirty', 'state']) {
         'remote migration must wait for successful local snapshot preparation');
     console.log('PASS local snapshot failure preserves remote migration state');
 }
+
+// 跨文件协议常量互为副本（纯静态文件没有构建注入，bootstrap 与
+// dirty-tracker 头部各自持有一份字面量）。这里逐字比较两侧声明，
+// 任一侧单方面改名立即在此失败，而不是等到运行时静默失效。
+{
+    const trackerSource = fs.readFileSync(new URL('../DB/dirty-tracker.js', import.meta.url), 'utf8');
+    const sharedLiterals = [
+        '__rp_sync_journal_v2',
+        'rp_sync_intent_v2:',
+        'rp_sync_tracking_epoch_v2',
+        'rp_sync_restore_active',
+        'rp_sync_restore_epoch',
+        'rp-hub-r2-sync-v1',
+        'rp-hub-app-writers-v1'
+    ];
+    const declares = (text, literal) => text.includes(`'${literal}'`) || text.includes(`"${literal}"`);
+    for (const literal of sharedLiterals) {
+        assert.ok(declares(source, literal), `bootstrap.js must declare ${literal}`);
+        assert.ok(declares(trackerSource, literal), `dirty-tracker.js must declare ${literal}`);
+    }
+    console.log('PASS cross-file protocol constants stay in lockstep');
+}

@@ -516,6 +516,17 @@
         return task;
     };
 
+    // 用既有记录恢复已完成任务的两条路径（非 fresh 命中、开关关闭时的重掷）
+    // 共用同一份装配逻辑。
+    const resumeRecordedImageTask = (record, descriptor, slotKey, token, render, state) => {
+        const readUrl = buildRecordUrl(record);
+        const task = createCompletedImageTask(buildRecordUrl(record, token, true), readUrl, render);
+        Object.assign(task, { record, state, sourcePromptHash: descriptor.promptHash });
+        imageSlotTasks.set(slotKey, task);
+        pruneSlotTasks();
+        return task;
+    };
+
     const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render, startGeneratedImageTask }) => {
         // 固定生图关闭：整条生图链路交还作者原版实现——请求 URL、令牌与展示
         // 全部是作者自己的，图片不进 R2。作者的“自动生图”开关仍然生效；
@@ -566,12 +577,7 @@
         const generationAllowed = autoImageGen !== false;
 
         if (fresh !== true && previous) {
-            const readUrl = buildRecordUrl(previous);
-            const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
-            Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
-            imageSlotTasks.set(slotKey, task);
-            pruneSlotTasks();
-            return task;
+            return resumeRecordedImageTask(previous, descriptor, slotKey, token, render, state);
         }
 
         if (!previous && !generationAllowed) {
@@ -583,12 +589,7 @@
         if (fresh === true) {
             if (previous && !generationAllowed) {
                 // 作者“自动生图”开关关闭时的重掷：保留已显示的旧图，不再生成。
-                const readUrl = buildRecordUrl(previous);
-                const task = createCompletedImageTask(buildRecordUrl(previous, token, true), readUrl, render);
-                Object.assign(task, { record: previous, state, sourcePromptHash: descriptor.promptHash });
-                imageSlotTasks.set(slotKey, task);
-                pruneSlotTasks();
-                return task;
+                return resumeRecordedImageTask(previous, descriptor, slotKey, token, render, state);
             }
             const record = normalizeRecord({
                 ...descriptor,
