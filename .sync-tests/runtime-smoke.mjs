@@ -671,7 +671,7 @@ async function testCatchAllProxy() {
         assert.equal(await response.text(), `local:${pathname}`);
         // 注入的同步客户端文件用 no-cache 协商缓存：每次部署 etag 必然
         // 变化，409 版本门的“请刷新页面后重试”仍然必然拿到当前部署
-        // 副本；未变化请求 304，不再每次进站重复下载约 190KB。
+        // 副本；未变化请求 304，不再每次进站重复下载约 215KB。
         assert.equal(response.headers.get('cache-control'), 'no-cache');
     }
     assert.equal(upstreamCalls.length, 0, 'local assets must be served without an upstream request');

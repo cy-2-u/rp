@@ -895,7 +895,8 @@
 
     // YNAI 模型劫持：密钥为 YNAI- 时隐藏作者“生图版本”浮窗，原位放入同款样式的
     // 下拉，选项来自中转站模型列表（经 worker /api/rp-image-models 拉取），默认
-    // 使用中转的 nai-diffusion-4-5-full；选择存本地并在构建请求时覆盖 model 参数。
+    // 取云端 defaultModel（缺失回退 nai-diffusion-4-5-full）；选择存本地并在构建
+    // 请求时覆盖 model 参数。
     // sta1n 密钥时移除劫持、还原作者浮窗。浮窗定位不写死 DOM 结构：按适配层
     // ui.settings.modelLabel 文本找到设置标签，再找同容器里的 custom-select 渲染根。
     const YNAI_SELECT_CLASS = 'magic-ynai-select';

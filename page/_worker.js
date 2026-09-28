@@ -2301,7 +2301,7 @@ async function serveStatic(request, env) {
     if (!assetResponse || assetResponse.status !== 200) return assetResponse;
     // 同步客户端的全部代码都在这三个部署文件里。409 版本门的
     // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
-    // HTML 与 app.js 已是 no-store；这三个文件约 190KB 且每次部署
+    // HTML 与 app.js 已是 no-store；这三个文件约 215KB 且每次部署
     // etag 必然变化，no-cache 协商缓存让未变化请求直接 304，
     // 部署后也不会回放旧客户端。
     const headers = new Headers(assetResponse.headers);
