@@ -19,7 +19,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    正常主页注入保持 3 个节点：dirty-tracker、magic-extension、bootstrap；其他作者 HTML 页只注入 dirty-tracker；样式不占注入节点。
    作者主脚本路径来自适配清单 `author.script.path`（serveAuthor 对 `/assets/js/*.js` 候选请求判定，缺省回退 `/assets/js/app.js`）；validateAdapter 校验其形状必须为 `/assets/js/*.js`。
 
-6. GitHub 多源容错仅用于公开静态资源（适配清单与作者页面），不得让任何用户数据经过第三方镜像：适配清单 raw 失败后并发竞速 jsdelivr/加速反代（10 秒总预算，候选响应体必须通过 JSON 校验——镜像在限流/故障时可能返回 200 + HTML 错误页，非 JSON 候选不参与竞速），最近有效版本写 R2 `rp-adapter/last-good.json` 兜底；作者页面主源失败后走 raw/镜像，连续失败熔断 60 秒，sourceChecks 走同一条链；`tryLoadAdapter` 失败降级为纯代理的语义保持不变；适配清单加载失败（连 last-good 也没有）时按 5 秒失败短路缓存，避免适配源抖动期间每个作者资源请求重付整条竞速链超时（file:// 本地源不缓存失败）；magic-extension 侧适配拉取失败后每 6 秒自动重试（对齐失败短路过期点），首屏注入缺失自动恢复、无需手动刷新。
+6. GitHub 多源容错仅用于公开静态资源（适配清单与作者页面），不得让任何用户数据经过第三方镜像：适配清单 raw 失败后并发竞速 jsdelivr/加速反代（10 秒总预算，候选响应体必须通过 JSON 校验——镜像在限流/故障时可能返回 200 + HTML 错误页，非 JSON 候选不参与竞速），最近有效版本写 R2 `rp-adapter/last-good.json` 兜底；作者页面主源失败后走 raw/镜像，连续失败熔断 60 秒，sourceChecks 走同一条链；`tryLoadAdapter` 失败降级为纯代理的语义保持不变；适配清单加载失败（连 last-good 也没有）时按 5 秒失败短路缓存，避免适配源抖动期间每个作者资源请求重付整条竞速链超时（file:// 本地源不缓存失败）；magic-extension 侧适配拉取失败后每 6 秒自动重试（对齐失败短路过期点），首屏注入缺失自动恢复、无需手动刷新。已知边界：jsDelivr 对 `@main` 分支引用缓存 12 小时（低命中条目可能提前失效），推送后其镜像可能滞后——滞后内容若形状合法仍可能赢下竞速，彻底消除需版本信号比对（暂缓）；运维手段为逐路径 purge：`https://purge.jsdelivr.net/gh/cy-2-u/rp@main/<path>`。
 
 7. 三个注入静态文件（dirty-tracker、magic-extension、bootstrap）的资产缓存固定为 no-cache 协商缓存：每次部署 etag 必然变化，刷新必然拿到当前部署副本（409 版本门语义），未变化请求 304，不重复下载约 215KB；不得退回 no-store。
 
