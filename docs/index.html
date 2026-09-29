@@ -321,7 +321,7 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
 'use strict';
 // 部署你的 Worker 后，把地址填到这里，例如 'https://rp-deploy.xxx.workers.dev'
 // 也可以临时用 ?worker=https://... 覆盖（便于测试）
-const DEFAULT_WORKER = 'https://w.mhjx.cc.cd';
+const DEFAULT_WORKER = 'https://429.x-0bd.workers.dev';
 const WORKER = (new URLSearchParams(location.search).get('worker') || DEFAULT_WORKER).replace(/\/+$/, '');
 
 const $ = id => document.getElementById(id);
