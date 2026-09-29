@@ -196,6 +196,18 @@ test('fetch rejection clears deadline', async () => {
     await assert.rejects(context.fetchImageWithTimeout('https://offline.invalid/', {}, () => {}), /offline failure/);
     assert.equal(timers.size, 0);
 });
+test('author mirror fallback returns a real response when the primary fails', async () => {
+    // 主源 5xx 时镜像回退必须返回真实 Response（回归防护：raceFirstOk 改为
+    // runner 形态后，调用点若残留 init-builder 形态会返回普通对象并 500）。
+    const { context } = load({ fetch: async url => {
+        const u = String(url);
+        if (u.includes('sta1n156.github.io')) return new Response('upstream down', { status: 503 });
+        return new Response('mirror-body', { headers: { 'content-type': 'text/css' } });
+    } });
+    const response = await context.fetchAuthorUpstream('assets/style.css', { method: 'GET', headers: new Headers() }, '');
+    assert.equal(response.ok, true, '镜像回退必须返回真实 Response 而不是候选描述对象');
+    assert.equal(await response.text(), 'mirror-body');
+});
 test('author proxy strips local credentials and retains ordinary headers', async () => {
     let forwarded;
     const { context } = load({ fetch: async (_url, options) => { forwarded = options.headers; return new Response('body', { headers: { 'content-type': 'text/css' } }); } });
@@ -464,6 +476,23 @@ test('ynai generation without an explicit model uses the cloud defaultModel end 
     const result = await context.handleImageRender(request, { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' });
     assert.equal(result.status, 200);
     assert.equal(JSON.parse(captured.options.body).model, 'relay-default-9', '生成请求使用云端默认模型');
+});
+test('adapter race discards non-JSON mirror responses instead of adopting them', async () => {
+    const mirror = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
+    const { context, timers } = load({ fetch: async url => {
+        const u = String(url);
+        // 主源最快但返回 200 限流页：必须被淘汰，由合法镜像补位
+        if (u.startsWith('https://raw.githubusercontent.com')) return new Response('<html>rate limited</html>', { status: 200 });
+        return new Response(mirror, { headers: { 'content-type': 'application/json' } });
+    } });
+    const adapter = await context.loadAdapter({});
+    assert.equal(adapter.id, 'rp-hub', '合法镜像内容在垃圾 200 之后被采用');
+    assert.equal(timers.size, 0, '竞速超时器已清理');
+});
+test('adapter race fails cleanly when every candidate returns non-JSON', async () => {
+    const { context, timers } = load({ fetch: async () => new Response('<html>err</html>', { status: 200 }) });
+    assert.equal(await context.tryLoadAdapter({}), null, '全部候选非 JSON 时适配加载失败且不抛出');
+    assert.equal(timers.size, 0);
 });
 test('validateAdapter keeps the author script path inside the rewritable candidate set', () => {
     const { context } = load();

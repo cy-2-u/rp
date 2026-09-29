@@ -35,6 +35,24 @@
             .catch(() => {
                 activeAdapter = null;
                 return null;
+            })
+            .then(value => {
+                if (!value) {
+                    // 适配拉取失败（镜像全部慢/失败，或返回限流页等 200 非 JSON）：
+                    // 清空失败句柄并安排延迟重试，首屏没有同步按钮时数秒内自动
+                    // 恢复，不必手动刷新。6 秒对齐 Worker 端 5 秒失败短路过期点。
+                    adapterLoadPromise = null;
+                    if (typeof setTimeout === 'function') {
+                        setTimeout(() => {
+                            loadUiAdapter().then((adapter) => {
+                                if (!adapter) return;
+                                reconcileUi();
+                                migrateLegacyImageRegex().then(changed => { if (changed) location.reload(); });
+                            }).catch(() => { });
+                        }, 6000);
+                    }
+                }
+                return value;
             });
         return adapterLoadPromise;
     };

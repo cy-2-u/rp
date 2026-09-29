@@ -50,17 +50,14 @@ function githubMirrorUrls(rawUrl) {
     ];
 }
 
-// 竞速一组镜像 URL：任一返回 2xx 即胜出，整体超时后放弃全部候选。
-// 失败候选的响应体不消费，交由运行时回收（与原实现一致）。
-async function raceFirstOk(candidates, buildInit, timeoutMs) {
+// 竞速一组镜像 URL：任一候选成功即胜出，整体超时后放弃全部候选。
+// run(candidate, signal) 负责单个候选的拉取与内容校验，抛错即该候选出局，
+// 由下一个最快成功者补位；失败候选的响应体交由运行时回收。
+async function raceFirstOk(candidates, run, timeoutMs) {
     const controllers = candidates.map(() => new AbortController());
     const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, timeoutMs);
     try {
-        return await Promise.any(candidates.map(async (candidate, index) => {
-            const response = await fetch(candidate, buildInit(candidate, controllers[index].signal));
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response;
-        }));
+        return await Promise.any(candidates.map((candidate, index) => run(candidate, controllers[index].signal)));
     } finally {
         clearTimeout(timer);
         for (const c of controllers) c.abort();
@@ -69,12 +66,20 @@ async function raceFirstOk(candidates, buildInit, timeoutMs) {
 
 async function fetchGithubText(url, timeoutMs) {
     const candidates = [url.href, ...githubMirrorUrls(url.href)];
-    const response = await raceFirstOk(
+    // 只采纳 JSON 合法的候选：镜像在限流/故障时可能返回 200 + HTML 错误页，
+    // 无校验时它会赢下竞速并拖垮整个适配（线上症状：站点打开没有同步按钮
+    // 与密码页，刷新后恢复）。非法候选出局，由下一个最快成功者补位。
+    return raceFirstOk(
         candidates,
-        (_candidate, signal) => ({ headers: { accept: 'application/json,text/plain' }, signal, redirect: 'follow' }),
+        async (candidate, signal) => {
+            const response = await fetch(candidate, { headers: { accept: 'application/json,text/plain' }, signal, redirect: 'follow' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const text = String(await response.text()).replace(/^\uFEFF/, '');
+            JSON.parse(text);
+            return text;
+        },
         timeoutMs
     );
-    return String(await response.text()).replace(/^\uFEFF/, '');
 }
 
 async function fetchAuthorUpstream(path, init, search) {
@@ -101,7 +106,10 @@ async function fetchAuthorUpstream(path, init, search) {
     if (candidates.length === 0) throw new Error('作者站点不可用。');
     return raceFirstOk(
         candidates,
-        (_candidate, signal) => ({ ...init, signal, redirect: 'follow' }),
+        (candidate, signal) => fetch(candidate, { ...init, signal, redirect: 'follow' }).then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response;
+        }),
         GITHUB_FALLBACK_TIMEOUT_MS
     );
 }
