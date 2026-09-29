@@ -1276,9 +1276,12 @@
         return waitForTransaction(tx, '本地同步记录读取失败。', () => requests.map(request => request.result));
     }
 
-    async function buildCachedPacks(db, bucketKey) {
+    async function buildCachedPacks(db, bucketKey, buffer) {
         const packs = [];
-        let buffer = new Uint8Array(CONFIG.targetPackBytes);
+        // 缓冲由调用方传入并跨桶复用（顺序重建语义允许；flush 时 slice 拷贝出
+        // 独立字节，覆写安全）：大库增量连续重建上百个桶，每桶各分配 1MiB 是
+        // 纯 GC 压力。
+        buffer = buffer || new Uint8Array(CONFIG.targetPackBytes);
         let used = 0;
         let entryCount = 0;
         let group;
@@ -1327,8 +1330,9 @@
         const targetSet = new Set(targets);
         const items = (state.packs || []).filter(pack => !targetSet.has(pack.bucketKey));
         let totalBytes = items.reduce((sum, pack) => sum + pack.length, 0);
+        const packBuffer = new Uint8Array(CONFIG.targetPackBytes);
         for (const bucketKey of targets) {
-            const packs = await buildCachedPacks(db, bucketKey);
+            const packs = await buildCachedPacks(db, bucketKey, packBuffer);
             items.push(...packs);
             totalBytes += packs.reduce((sum, pack) => sum + pack.length, 0);
             if (totalBytes > CONFIG.maxSnapshotBytes) throw new Error('本地同步数据超过 1GiB 上限。');
@@ -1698,20 +1702,26 @@
 
     async function* downloadPacksToStaging(remote, packManifest, stagingDb) {
         await clearDownloadStagingStore(stagingDb);
+        // 滑动窗口：始终维持 downloadPackConcurrency 个在途下载，按清单顺序
+        // 产出（恢复解析要求分片顺序）。旧版批间串行——批内全部完成才开始
+        // 下一批，网络往返无法重叠。
+        const concurrency = CONFIG.downloadPackConcurrency;
+        let nextToFetch = 0;
         let completed = 0;
-        for (let start = 0; start < packManifest.length; start += CONFIG.downloadPackConcurrency) {
-            const batch = packManifest.slice(start, start + CONFIG.downloadPackConcurrency);
-            const downloaded = await Promise.all(batch.map(async (pack, batchIndex) => {
-                const index = start + batchIndex;
-                const bytes = await postSyncBinary({
-                    action: 'pull-pack',
-                    version: remote.version,
-                    pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
-                    packIndex: index % MANIFEST_PAGE_PACKS,
-                    checksum: pack.checksum,
-                    length: pack.length,
-                    entryCount: pack.entryCount
-                }, { timeoutMs: CONFIG.packTransferTimeoutMs });
+        const inflight = new Map();
+        const startNext = () => {
+            if (nextToFetch >= packManifest.length) return;
+            const index = nextToFetch++;
+            const pack = packManifest[index];
+            const pending = postSyncBinary({
+                action: 'pull-pack',
+                version: remote.version,
+                pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
+                packIndex: index % MANIFEST_PAGE_PACKS,
+                checksum: pack.checksum,
+                length: pack.length,
+                entryCount: pack.entryCount
+            }, { timeoutMs: CONFIG.packTransferTimeoutMs }).then(async bytes => {
                 if (bytes.byteLength !== pack.length) {
                     throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
                 }
@@ -1719,13 +1729,35 @@
                     throw new Error(`服务器数据包 ${index + 1} 校验失败。`);
                 }
                 return { ...pack, index, bytes };
-            }));
-            for (const pack of downloaded) {
+            });
+            // 未按序抵达的失败由到达时的 await 抛出；此处先行挂钩避免
+            // 未处理拒绝告警。
+            pending.catch(() => { });
+            inflight.set(index, pending);
+        };
+        // staging 写保持与旧版相同的分组（每 4 个连续 pack 一批），
+        // restore-sim/scale-sim 的写批断言依赖这一分组。
+        let staged = [];
+        for (let i = 0; i < concurrency && nextToFetch < packManifest.length; i += 1) startNext();
+        try {
+            while (inflight.size) {
+                const index = Math.min(...inflight.keys());
+                const downloaded = await inflight.get(index);
+                inflight.delete(index);
+                startNext();
                 completed += 1;
                 updateProgress(8 + Math.round((completed / packManifest.length) * 57), '正在恢复…');
-                yield pack;
+                yield downloaded;
+                staged.push(downloaded);
+                if (staged.length >= concurrency) {
+                    await writeDownloadStagingObjects(stagingDb, staged);
+                    staged = [];
+                }
             }
-            await writeDownloadStagingObjects(stagingDb, downloaded);
+            await writeDownloadStagingObjects(stagingDb, staged);
+        } finally {
+            // 下游异常提前退出时，放弃在途下载（运行时回收），不产生未处理拒绝。
+            for (const pending of inflight.values()) pending.catch(() => { });
         }
     }
 
@@ -2997,7 +3029,7 @@
         try {
             const auth = await getAuthStatus();
             if (!auth.authRequired || auth.authenticated) {
-                updateProgress(0, '选择同步方向');
+                updateProgress(0, '请选择同步方向。');
                 setActionButtonsDisabled(false);
                 return;
             }
@@ -3054,7 +3086,7 @@
                     <button type="button" class="rp-sync-action-button" data-action="pull">从云端恢复</button>
                     <button type="button" class="rp-sync-action-button" data-action="rebuild">重建本地索引</button>
                 </div>
-                <p class="rp-sync-modal__status">选择同步</p>
+                <p class="rp-sync-modal__status">请选择同步方向。</p>
                 <div class="rp-sync-progress">
                     <div class="rp-sync-progress__bar"></div>
                 </div>
@@ -3109,7 +3141,7 @@
     function openModal() {
         ensureModal();
         modalRoot.classList.add('is-open');
-        updateProgress(state.progress, state.statusText || '选择同步');
+        updateProgress(state.progress, state.statusText || '请选择同步方向。');
         setActionButtonsDisabled(state.syncing);
     }
 

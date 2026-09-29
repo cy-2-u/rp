@@ -682,7 +682,7 @@ async function fetchYnaiGeneratedImage(params, token, ynai) {
 }
 
 async function handleImageModels(request, env) {
-    if (request.method !== 'GET' && request.method !== 'POST') {
+    if (request.method !== 'GET') {
         return error('Method not allowed.', 405);
     }
     const url = new URL(request.url);
@@ -763,8 +763,9 @@ async function handleImageRender(request, env) {
         bucket.get(primary.key)
     ]);
     if (deleted) {
-        // 走占位图时原图流不再使用，主动取消释放。
+        // 走占位图时原图流与墓碑流都不再使用，主动取消释放。
         try { await cached?.body?.cancel?.(); } catch (_) { }
+        try { await deleted?.body?.cancel?.(); } catch (_) { }
         return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
             'cache-control': 'public, max-age=3600'
         });
@@ -772,7 +773,14 @@ async function handleImageRender(request, env) {
     // 非删除路径：命中原图（最常见的浏览路径）只花 2 个 R2 get（原图 +
     // 墓碑），未命中的生图请求也需要墓碑来排除“已删除”。
     if (cached) {
-        return imageResponse(request.method === 'HEAD' ? null : cached.body, cached.httpMetadata?.contentType, {
+        if (request.method === 'HEAD') {
+            // HEAD 的 Response 不携带正文：显式取消 R2 流，不留 给 GC。
+            try { await cached.body?.cancel?.(); } catch (_) { }
+            return imageResponse(null, cached.httpMetadata?.contentType, {
+                'content-length': String(cached.size || 0)
+            });
+        }
+        return imageResponse(cached.body, cached.httpMetadata?.contentType, {
             'content-length': String(cached.size || 0)
         });
     }
@@ -843,8 +851,9 @@ async function putImageThumbnail(bucket, imageKey, bytes) {
     return thumbKey;
 }
 
-function imageAdminHtml() {
-    return new Response(`<!doctype html>
+// 图库管理页 HTML 是纯静态模板（无 worker 侧插值，runtime-smoke 有断言），
+// 提升为模块级常量：每次 isolate 只求值一次，不再每请求重建 ~15KB 字符串。
+const IMAGE_ADMIN_HTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -1084,7 +1093,10 @@ checkAuth().then(function(ok){
 });
 </script>
 </body>
-</html>`, {
+</html>`;
+
+function imageAdminHtml() {
+    return new Response(IMAGE_ADMIN_HTML, {
         headers: {
             'content-type': 'text/html; charset=utf-8',
             'cache-control': 'no-store'
@@ -1323,8 +1335,8 @@ async function handleImageAdmin(request, env, url, ctx) {
         const imageObject = await bucket.get(key);
         if (!imageObject) return error('\u539f\u56fe\u4e0d\u5b58\u5728\uff0c\u4e0d\u80fd\u4fdd\u5b58\u7f29\u7565\u56fe\u3002', 404);
         const bytes = await readThumbnailBytes(request);
-        const savedKey = await putImageThumbnail(bucket, key, bytes);
-        return json({ ok: true, key: savedKey, bytes: bytes.byteLength });
+        await putImageThumbnail(bucket, key, bytes);
+        return json({ ok: true });
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/delete`) {
         if (request.method !== 'POST') return error('Method not allowed.', 405);
@@ -1364,7 +1376,6 @@ async function handleImageAdmin(request, env, url, ctx) {
             acceptedKeys: acceptedTargets.map(object => object.key),
             deletedCount: acceptedTargets.length,
             deletedBytes,
-            deletedHuman: formatBytes(deletedBytes),
             failedCount,
             remainingKeys: remainingTargets.map(object => object.key)
         });
@@ -2388,7 +2399,7 @@ async function tryLoadAdapter(env) {
     }
 }
 
-function rewriteAuthorHtml(response, pathname, adapterReady = false) {
+function rewriteAuthorHtml(response, pathname, adapterReady) {
     const isMain = pathname === '/' || pathname === '/index.html';
     // 注入面保持最小：主页 3 节点（dirty-tracker、magic-extension、bootstrap），
     // 其他作者 HTML 页只有 dirty-tracker。面板样式由 bootstrap 启动时自行

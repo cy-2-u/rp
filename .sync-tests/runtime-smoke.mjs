@@ -462,13 +462,13 @@ async function testImageAdminApi() {
     assert.equal(openLibrary.status, 200, 'no configured password must mean open gallery access');
 }
 
-// 把 _worker.js 里 imageAdminHtml() 的模板字面量按 worker 相同的方式
+// 把 _worker.js 里 IMAGE_ADMIN_HTML 常量的模板字面量按 worker 相同的方式
 // 求值成页面 HTML 并抽出内联脚本，供语法检查与真实执行两个测试共用。
 async function loadImageAdminPage() {
     const source = await read('_worker.js');
-    const functionStart = source.indexOf('function imageAdminHtml()');
-    assert.ok(functionStart >= 0, 'imageAdminHtml must exist in _worker.js');
-    const literalStart = source.indexOf('`', functionStart);
+    const constStart = source.indexOf('const IMAGE_ADMIN_HTML = `');
+    assert.ok(constStart >= 0, 'IMAGE_ADMIN_HTML must exist in _worker.js');
+    const literalStart = source.indexOf('`', constStart);
     const literalEnd = source.indexOf('`', literalStart + 1);
     assert.ok(literalStart >= 0 && literalEnd > literalStart, 'admin page template literal must be closed');
     const rawBody = source.slice(literalStart + 1, literalEnd);
