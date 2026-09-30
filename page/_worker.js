@@ -52,15 +52,29 @@ function githubMirrorUrls(rawUrl) {
 
 // 竞速一组镜像 URL：任一候选成功即胜出，整体超时后放弃全部候选。
 // run(candidate, signal) 负责单个候选的拉取与内容校验，抛错即该候选出局，
-// 由下一个最快成功者补位；失败候选的响应体交由运行时回收。
+// 由下一个最快成功者补位。
+// 胜者绝不 abort：其返回值可能是尚未消费完的流式 Response（作者页面回源），
+// abort 会在运行时把未读完的正文流掐断（WHATWG fetch § Aborting——模拟实测：
+// 胜者 response.text() 抛 aborted by signal）。落选者与超时兜底照常中止。
 async function raceFirstOk(candidates, run, timeoutMs) {
     const controllers = candidates.map(() => new AbortController());
     const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, timeoutMs);
+    let winnerIndex = -1;
     try {
-        return await Promise.any(candidates.map((candidate, index) => run(candidate, controllers[index].signal)));
+        const winner = await Promise.any(candidates.map(async (candidate, index) => {
+            const value = await run(candidate, controllers[index].signal);
+            return { index, value };
+        }));
+        winnerIndex = winner.index;
+        for (let i = 0; i < controllers.length; i++) {
+            if (i !== winnerIndex) controllers[i].abort();
+        }
+        return winner.value;
     } finally {
         clearTimeout(timer);
-        for (const c of controllers) c.abort();
+        for (let i = 0; i < controllers.length; i++) {
+            if (i !== winnerIndex) controllers[i].abort();
+        }
     }
 }
 

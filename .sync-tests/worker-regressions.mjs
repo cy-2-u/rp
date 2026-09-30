@@ -199,14 +199,27 @@ test('fetch rejection clears deadline', async () => {
 test('author mirror fallback returns a real response when the primary fails', async () => {
     // 主源 5xx 时镜像回退必须返回真实 Response（回归防护：raceFirstOk 改为
     // runner 形态后，调用点若残留 init-builder 形态会返回普通对象并 500）。
-    const { context } = load({ fetch: async url => {
+    // 桩必须信号感知：竞速收尾若误 abort 胜者，其未消费完的流式正文会被
+    // 掐断（WHATWG fetch § Aborting）——50ms 后正常关闭模拟真实流式响应。
+    const { context, timers } = load({ fetch: async (url, options) => {
         const u = String(url);
         if (u.includes('sta1n156.github.io')) return new Response('upstream down', { status: 503 });
-        return new Response('mirror-body', { headers: { 'content-type': 'text/css' } });
+        const body = new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('mirror-body'));
+                setTimeout(() => { try { controller.close(); } catch (_) { } }, 50);
+                options.signal.addEventListener('abort', () => {
+                    try { controller.error(new Error('aborted by signal')); } catch (_) { }
+                }, { once: true });
+            }
+        });
+        return new Response(body, { headers: { 'content-type': 'text/css' } });
     } });
     const response = await context.fetchAuthorUpstream('assets/style.css', { method: 'GET', headers: new Headers() }, '');
     assert.equal(response.ok, true, '镜像回退必须返回真实 Response 而不是候选描述对象');
-    assert.equal(await response.text(), 'mirror-body');
+    const text = await response.text();
+    assert.equal(text, 'mirror-body', '胜者的流式正文不得被竞速收尾的 abort 掐断');
+    assert.equal(timers.size, 0);
 });
 test('author proxy strips local credentials and retains ordinary headers', async () => {
     let forwarded;
