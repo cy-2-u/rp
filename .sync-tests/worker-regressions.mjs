@@ -27,6 +27,7 @@ function bucket() {
     return {
         writes, deletes, reads,
         async get(k) { reads.push(k); return { body: new Uint8Array([1]), size: 1 }; },
+        async head(k) { reads.push(k); return { key: k, size: 1 }; },
         async list({ prefix }) { return { objects: key.startsWith(prefix) ? [{ key, size: 1 }] : [], truncated: false }; },
         async put(...args) { writes.push(args); },
         async delete(keys) { deletes.push(...keys); }
@@ -196,18 +197,27 @@ test('fetch rejection clears deadline', async () => {
     await assert.rejects(context.fetchImageWithTimeout('https://offline.invalid/', {}, () => {}), /offline failure/);
     assert.equal(timers.size, 0);
 });
-test('author mirror fallback returns a real response when the primary fails', async () => {
-    // 主源 5xx 时镜像回退必须返回真实 Response（回归防护：raceFirstOk 改为
-    // runner 形态后，调用点若残留 init-builder 形态会返回普通对象并 500）。
-    // 桩必须信号感知：竞速收尾若误 abort 胜者，其未消费完的流式正文会被
-    // 掐断（WHATWG fetch § Aborting）——50ms 后正常关闭模拟真实流式响应。
-    const { context, timers } = load({ fetch: async (url, options) => {
+test('author upstream is fetched directly: status codes pass through and no mirror host is contacted', async () => {
+    // 直连语义：主源任何状态码（含 503/429）原样返回，不再有镜像回退链；
+    // 同时验证除 AUTHOR_BASE 外不会访问任何镜像/加速反代域名。
+    const contacted = [];
+    const { context } = load({ fetch: async url => {
         const u = String(url);
+        contacted.push(u);
         if (u.includes('sta1n156.github.io')) return new Response('upstream down', { status: 503 });
+        throw new Error(`unexpected fetch: ${u}`);
+    } });
+    const response = await context.fetchAuthorUpstream('assets/style.css', { method: 'GET', headers: new Headers() }, '');
+    assert.equal(response.status, 503, '直连模式下主源状态码原样返回，不再有镜像回退');
+    assert.equal(contacted.length, 1, '只发起一次直连请求');
+    assert.ok(contacted[0].includes('sta1n156.github.io'), '只访问作者站本身');
+});
+test('author upstream direct fetch returns a real streaming response', async () => {
+    const { context } = load({ fetch: async (url, options) => {
         const body = new ReadableStream({
             start(controller) {
-                controller.enqueue(new TextEncoder().encode('mirror-body'));
-                setTimeout(() => { try { controller.close(); } catch (_) { } }, 50);
+                controller.enqueue(new TextEncoder().encode('direct-body'));
+                setTimeout(() => { try { controller.close(); } catch (_) { } }, 20);
                 options.signal.addEventListener('abort', () => {
                     try { controller.error(new Error('aborted by signal')); } catch (_) { }
                 }, { once: true });
@@ -216,10 +226,8 @@ test('author mirror fallback returns a real response when the primary fails', as
         return new Response(body, { headers: { 'content-type': 'text/css' } });
     } });
     const response = await context.fetchAuthorUpstream('assets/style.css', { method: 'GET', headers: new Headers() }, '');
-    assert.equal(response.ok, true, '镜像回退必须返回真实 Response 而不是候选描述对象');
-    const text = await response.text();
-    assert.equal(text, 'mirror-body', '胜者的流式正文不得被竞速收尾的 abort 掐断');
-    assert.equal(timers.size, 0);
+    assert.equal(response.ok, true, '直连回源返回真实 Response');
+    assert.equal(await response.text(), 'direct-body', '流式正文保持可完整消费');
 });
 test('author proxy strips local credentials and retains ordinary headers', async () => {
     let forwarded;
@@ -291,13 +299,82 @@ test('ynai keys route generation to the relay with the OpenAI images shape', asy
     assert.equal(Buffer.from(store.writes[0][1]).toString(), 'ynai-png-bytes');
     assert.equal(timers.size, 0);
 });
+test('ynai JSON limits reject declared and actual oversize bodies and cancel streams', async () => {
+    const { context } = load();
+    const declared = streamFixture(2);
+    await assert.rejects(
+        context.readBoundedJson(new Response(declared.body, {
+            headers: { 'content-length': '65' }
+        }), 64),
+        error => error?.status === 413
+    );
+    assert.equal(declared.pulled, 0, 'declared oversize JSON must be rejected before reading');
+    assert.equal(declared.cancelled, true);
+
+    const actual = streamFixture(2);
+    await assert.rejects(
+        context.readBoundedJson(new Response(actual.body), 64),
+        error => error?.status === 413
+    );
+    assert.ok(actual.pulled <= 2, `read ${actual.pulled} chunks before rejecting`);
+    assert.equal(actual.cancelled, true, 'actual oversize JSON must cancel the body');
+});
+test('ynai JSON body timeout cancels a stalled stream', async () => {
+    let cancelled = false;
+    const { context } = load();
+    const body = new ReadableStream({ cancel() { cancelled = true; } });
+    const controller = new AbortController();
+    const pending = context.readBoundedJson(
+        new Response(body),
+        1024,
+        controller.signal
+    );
+    const timeout = setTimeout(() => controller.abort(), 10);
+    try {
+        await assert.rejects(pending, /Image fetch timed out\./);
+    } finally {
+        clearTimeout(timeout);
+    }
+    assert.equal(cancelled, true, 'aborting a YNAI body must release its stream');
+});
+test('ynai base64 decoder accepts exactly 16 MiB and rejects malformed or larger data', () => {
+    const { context } = load();
+    const maxBytes = 16 * 1024 * 1024;
+    const exact = Buffer.alloc(maxBytes).toString('base64');
+    assert.equal(context.decodeImageBase64(exact).byteLength, maxBytes);
+    assert.throws(
+        () => context.decodeImageBase64(exact + 'AAA'),
+        /YNAI .*16MiB/
+    );
+    assert.throws(() => context.decodeImageBase64('%%%'), /Invalid character|编码/);
+    assert.throws(() => context.decodeImageBase64(''), /图片编码为空/);
+});
+test('ynai oversized decoded image returns 413 without writing R2', async () => {
+    const encoded = Buffer.alloc(16 * 1024 * 1024).toString('base64') + 'AAA';
+    const { context } = load({ fetch: async url => {
+        if (String(url).startsWith('file:')) {
+            return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ data: [{ b64_json: encoded }] }), {
+            headers: { 'content-type': 'application/json' }
+        });
+    } });
+    const store = bucket();
+    store.get = async () => null;
+    const result = await context.handleImageRender(new Request(
+        `https://offline.invalid/api/rp-image?token=${encodeURIComponent(YNAI_TOKEN)}&tag=test&character_name=A..B`,
+        { method: 'POST' }
+    ), { RP_SYNC_R2: store, RPHUB_ADAPTER_URL: 'file:///adapter.json' });
+    assert.equal(result.status, 413);
+    assert.equal(store.writes.length, 0, 'oversized YNAI data must not reach R2');
+});
 test('ynai model list requires YNAI token and cloud config, proxies the relay list once', async () => {
-    let calls = 0, captured;
+    let calls = 0, modelListCaptured;
     const { context } = load({ fetch: async (url, options) => {
         const u = String(url);
         if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
         if (!u.includes('nai.rinko.ai')) return new Response('not found', { status: 404 });
-        calls += 1; captured = { url: u, options };
+        calls += 1; modelListCaptured = { url: u, options };
         return new Response(JSON.stringify({ object: 'list', data: [{ id: 'model-a' }, { id: 'model-b' }, { id: null }] }), { headers: { 'content-type': 'application/json' } });
     } });
     const denied = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': 'plain-token' } }), { RP_SYNC_R2: bucket() });
@@ -309,8 +386,8 @@ test('ynai model list requires YNAI token and cloud config, proxies the relay li
     const env = { RP_SYNC_R2: bucket(), RPHUB_ADAPTER_URL: 'file:///adapter.json' };
     const ok = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
     assert.deepEqual(await ok.json(), { ok: true, data: [{ id: 'model-a' }, { id: 'model-b' }] });
-    assert.equal(captured.url, 'https://nai.rinko.ai/v1/models');
-    assert.equal(captured.options.headers.authorization, `Bearer ${YNAI_TOKEN}`);
+    assert.equal(modelListCaptured.url, 'https://nai.rinko.ai/v1/models');
+    assert.equal(modelListCaptured.options.headers.authorization, `Bearer ${YNAI_TOKEN}`);
     const cached = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
     assert.equal((await cached.json()).data.length, 2);
     assert.equal(calls, 1, '30 秒内存缓存避免重复外呼');
@@ -490,22 +567,43 @@ test('ynai generation without an explicit model uses the cloud defaultModel end 
     assert.equal(result.status, 200);
     assert.equal(JSON.parse(captured.options.body).model, 'relay-default-9', '生成请求使用云端默认模型');
 });
-test('adapter race discards non-JSON mirror responses instead of adopting them', async () => {
-    const mirror = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
-    const { context, timers } = load({ fetch: async url => {
+test('direct adapter source returning garbage 200 falls back to the R2 last-good copy', async () => {
+    const lastGood = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
+    let putCalls = 0;
+    const { context } = load({ fetch: async url => {
         const u = String(url);
-        // 主源最快但返回 200 限流页：必须被淘汰，由合法镜像补位
+        // 直连源返回 200 + HTML（网关限流页形态）：必须按失败处理，
+        // 落到 R2 last-good 兜底，而不是把垃圾页交给解析器。
         if (u.startsWith('https://raw.githubusercontent.com')) return new Response('<html>rate limited</html>', { status: 200 });
-        return new Response(mirror, { headers: { 'content-type': 'application/json' } });
+        throw new Error(`unexpected fetch: ${u}`);
+    } });
+    const store = {
+        async get() { return new Response(lastGood, { headers: { 'content-type': 'application/json' } }); },
+        async put() { putCalls += 1; }
+    };
+    const adapter = await context.loadAdapter({ RP_SYNC_R2: store });
+    assert.equal(adapter.id, 'rp-hub', '直连源垃圾 200 之后由 last-good 兜底');
+    assert.equal(putCalls, 0, 'last-good 来源不回写 R2');
+});
+test('adapter load fails cleanly when the direct source returns non-JSON and no last-good exists', async () => {
+    let lastGoodReads = 0;
+    const { context } = load({ fetch: async () => new Response('<html>err</html>', { status: 200 }) });
+    const store = { async get() { lastGoodReads += 1; return null; }, async put() { } };
+    assert.equal(await context.tryLoadAdapter({ RP_SYNC_R2: store }), null, '直连源非 JSON 且无兜底时适配加载失败且不抛出');
+    assert.equal(lastGoodReads, 1, '失败后已尝试 R2 last-good');
+});
+test('adapter load succeeds against the direct GitHub source only', async () => {
+    const valid = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
+    const contacted = [];
+    const { context } = load({ fetch: async url => {
+        const u = String(url);
+        contacted.push(u);
+        if (u.startsWith('https://raw.githubusercontent.com')) return new Response(valid, { headers: { 'content-type': 'application/json' } });
+        return new Response('mirror host must not be contacted', { status: 200 });
     } });
     const adapter = await context.loadAdapter({});
-    assert.equal(adapter.id, 'rp-hub', '合法镜像内容在垃圾 200 之后被采用');
-    assert.equal(timers.size, 0, '竞速超时器已清理');
-});
-test('adapter race fails cleanly when every candidate returns non-JSON', async () => {
-    const { context, timers } = load({ fetch: async () => new Response('<html>err</html>', { status: 200 }) });
-    assert.equal(await context.tryLoadAdapter({}), null, '全部候选非 JSON 时适配加载失败且不抛出');
-    assert.equal(timers.size, 0);
+    assert.equal(adapter.id, 'rp-hub');
+    assert.equal(contacted.length, 1, '只访问 raw.githubusercontent.com，不访问任何镜像域名');
 });
 test('validateAdapter keeps the author script path inside the rewritable candidate set', () => {
     const { context } = load();

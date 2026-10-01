@@ -222,13 +222,15 @@
         };
     }
     IDBObjectStore.prototype.delete = function (key) {
-        if (isTracked(this) && !RESTORE_PAGE) assertWritable();
-        if (isTracked(this) && !RESTORE_PAGE && key instanceof IDBKeyRange) {
-            const request = this.getAllKeys(key);
-            request.addEventListener('success', () => {
-                for (const candidate of request.result) log(this, { key: candidate });
-            });
-            return nativeDelete.call(this, key);
+        if (isTracked(this) && !RESTORE_PAGE) {
+            assertWritable();
+            if (key instanceof IDBKeyRange) {
+                const request = this.getAllKeys(key);
+                request.addEventListener('success', () => {
+                    for (const candidate of request.result) log(this, { key: candidate });
+                });
+                return nativeDelete.call(this, key);
+            }
         }
         return recordWrite(this, nativeDelete.call(this, key), key);
     };

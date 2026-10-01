@@ -38,9 +38,10 @@
             })
             .then(value => {
                 if (!value) {
-                    // 适配拉取失败（镜像全部慢/失败，或返回限流页等 200 非 JSON）：
-                    // 清空失败句柄并安排延迟重试，首屏没有同步按钮时数秒内自动
-                    // 恢复，不必手动刷新。6 秒对齐 Worker 端 5 秒失败短路过期点。
+                    // 适配拉取失败（Worker 端清单加载失败、返回限流页等 200 非
+                    // JSON，或 sourceChecks 未过而整体降级）：清空失败句柄并安
+                    // 排延迟重试，首屏没有同步按钮时数秒内自动恢复，不必手动
+                    // 刷新。6 秒对齐 Worker 端 5 秒失败短路过期点。
                     adapterLoadPromise = null;
                     if (typeof setTimeout === 'function') {
                         setTimeout(() => {
@@ -545,13 +546,7 @@
         return task;
     };
 
-    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render, startGeneratedImageTask }) => {
-        // 固定生图关闭：整条生图链路交还作者原版实现——请求 URL、令牌与展示
-        // 全部是作者自己的，图片不进 R2。作者的“自动生图”开关仍然生效；
-        // 旧适配清单未透传作者任务函数时，保持原有代理路径不变。
-        if (!isFixedImageEnabled() && autoImageGen !== false && typeof startGeneratedImageTask === 'function') {
-            return startGeneratedImageTask(requestUrl, fresh === true);
-        }
+    const startMagicImageTask = async ({ card, requestUrl, fresh, message, storyScopeId = DEFAULT_STORY_SCOPE_ID, characterId, characterName, autoImageGen, render }) => {
         const currentUrl = normalizeRequestUrl(requestUrl, characterName);
         const token = currentUrl.searchParams.get('token') || '';
         const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);

@@ -447,6 +447,19 @@ globalThis.RPHubAuthorSaveData = async () => { };
 
 const modalA = findSyncModal(documentA);
 assert.ok(modalA, 'sync modal should be created on load');
+const autoSaveToggleA = modalA.querySelector('[data-action="auto-save-toggle"]');
+const autoSaveMinutesA = modalA.querySelector('[data-action="auto-save-minutes"]');
+assert.equal(autoSaveToggleA.checked, false, 'autosave is disabled by default');
+assert.equal(autoSaveMinutesA.value, '5', 'autosave defaults to five minutes');
+autoSaveToggleA.checked = true;
+autoSaveToggleA.dispatch('change');
+assert.equal(localStorageA.getItem('rp_hub_sync_auto_save_enabled_v1'), '1', 'autosave toggle persists locally');
+autoSaveMinutesA.value = '7';
+autoSaveMinutesA.dispatch('change');
+assert.equal(localStorageA.getItem('rp_hub_sync_auto_save_minutes_v1'), '7', 'autosave interval persists locally');
+autoSaveToggleA.checked = false;
+autoSaveToggleA.dispatch('change');
+assert.equal(localStorageA.getItem('rp_hub_sync_auto_save_enabled_v1'), '0', 'autosave can be disabled locally');
 modalA.querySelector('[data-action="push"]').click();
 await waitForUploadDone(modalA, 'browser A initial upload');
 
@@ -463,6 +476,8 @@ for (let index = 0; index < BULK_RECORD_COUNT; index += 1) {
 }
 assert.ok(!packsV1Text.includes('rp_hub_presets'), 'rp_hub_presets must be excluded from sync');
 assert.ok(!packsV1Text.includes('rp_hub_sync_password_v1'), 'sync password key must never be uploaded');
+assert.ok(!packsV1Text.includes('rp_hub_sync_auto_save_enabled_v1'), 'autosave toggle must never be uploaded');
+assert.ok(!packsV1Text.includes('rp_hub_sync_auto_save_minutes_v1'), 'autosave interval must never be uploaded');
 assert.ok(!packsV1Text.includes('secret-a'), 'sync password value must never be uploaded');
 assert.ok(!packsV1Text.includes('unrelated'), 'non-app localStorage keys must not be uploaded');
 console.log('phase 1 (upload): ok');
@@ -628,9 +643,133 @@ assert.doesNotMatch(modalB.innerHTML, /上传到云端|重建本地索引|重新
 JSON.parse = nativeJsonParse;
 console.log(`phase 2 (restore): ok - ${manifestV1.entryCount} entries parsed twice, ${manifestV1.packCount} staged packs read once`);
 
-// A pack whose length, SHA-256 and manifest hashes are all valid can still end
-// with malformed JSON. Full validation must reject it before the first valid
-// entry is allowed to overwrite local data.
+// A valid legacy snapshot must restore normally, preserve its old placement in
+// the local cache as version 7, and require the existing explicit rebuild flow
+// before the next upload creates the v8 layout.
+restorePrototypes(savedPrototypes);
+const legacyBucket = createMemBucket();
+const legacyKey = 'rp_hub_legacy_fixture';
+const legacySha256Hex = async bytes => Buffer.from(await crypto.subtle.digest('SHA-256', bytes)).toString('hex');
+const legacyLineBytes = new TextEncoder().encode(JSON.stringify({
+    type: 'localStorage', key: legacyKey, value: 'legacy-value'
+}) + '\n');
+const legacyChecksum = await legacySha256Hex(legacyLineBytes);
+const legacyHash = (() => {
+    let hash = 2166136261;
+    for (const character of `ls:${legacyKey}`) {
+        hash ^= character.charCodeAt(0);
+        hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+})();
+const legacyChainSeed = '0'.repeat(64);
+const legacyBucketKey = `localStorage|r${String(legacyHash % 32).padStart(3, '0')}`;
+const legacyPack = {
+    bucketKey: legacyBucketKey,
+    group: 'localStorage',
+    part: 0,
+    checksum: legacyChecksum,
+    length: legacyLineBytes.byteLength,
+    entryCount: 1
+};
+const legacyPageHash = await legacySha256Hex(new TextEncoder().encode(JSON.stringify([
+    'rp-sync-manifest-page-v1', 0, legacyChainSeed,
+    [[legacyPack.bucketKey, legacyPack.group, 0, legacyPack.checksum, legacyPack.length, 1]]
+])));
+const legacyBloom = new Uint8Array(32 * 1024);
+for (const offset of [0, 8, 16, 24]) {
+    const bit = Number.parseInt(legacyChecksum.slice(offset, offset + 8), 16) % (legacyBloom.byteLength * 8);
+    legacyBloom[bit >>> 3] |= 1 << (bit & 7);
+}
+const legacyBloomChecksum = await legacySha256Hex(legacyBloom);
+const legacyRootChecksum = await legacySha256Hex(new TextEncoder().encode(JSON.stringify([
+    'rp-sync-paged-jsonl-v4', 13, legacyPack.length, 1, 1, 1, legacyPageHash, legacyBloomChecksum
+])));
+await legacyBucket.put('rp-sync/main/migration-v13.done', JSON.stringify({
+    format: 'rp-sync-migration-v13', legacyEtag: null, createdAt: Date.now()
+}));
+await legacyBucket.put(`rp-sync/main/packs/${legacyChecksum}.bin`, legacyLineBytes, {
+    customMetadata: { entryCount: '1' }
+});
+await legacyBucket.put(`rp-sync/main/blooms/${legacyBloomChecksum}.bin`, legacyBloom);
+await legacyBucket.put(`rp-sync/main/manifests/${legacyRootChecksum}/0000.json`, JSON.stringify({
+    format: 'rp-sync-manifest-page-v1',
+    checksum: legacyRootChecksum,
+    pageIndex: 0,
+    previousPageHash: legacyChainSeed,
+    pageHash: legacyPageHash,
+    packs: [legacyPack]
+}));
+await legacyBucket.put(MANIFEST_KEY, JSON.stringify({
+    format: 'rp-sync-manifest-root-v1',
+    version: 1,
+    checksum: legacyRootChecksum,
+    updatedAt: Date.now(),
+    totalBytes: legacyPack.length,
+    packCount: 1,
+    entryCount: 1,
+    pageCount: 1,
+    pageRoot: legacyPageHash,
+    bloomChecksum: legacyBloomChecksum,
+    snapshotFormat: 'rp-sync-paged-jsonl-v4',
+    schemaVersion: 13
+}));
+const factoryLegacy = new FDBFactory();
+const StorageLegacy = makeStorageClass();
+const localStorageLegacy = new StorageLegacy();
+localStorageLegacy.setItem(legacyKey, 'local-value');
+const documentLegacy = createDocumentStub();
+const locationLegacy = {
+    pathname: '/sync-restore', replaced: null, assigned: null,
+    replace(url) { this.replaced = url; },
+    assign(url) { this.assigned = url; }
+};
+installBrowserGlobals({
+    storageClass: StorageLegacy,
+    localStorage: localStorageLegacy,
+    factory: factoryLegacy,
+    document: documentLegacy,
+    location: locationLegacy,
+    fetchShim: makeFetchShim('legacy restore', { RP_SYNC_R2: legacyBucket }),
+    locks: locksB
+});
+await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+await waitFor(() => locationLegacy.replaced === '/', 60000, 'valid legacy restore');
+assert.equal(localStorageLegacy.getItem(legacyKey), 'legacy-value', 'legacy localStorage must restore');
+const legacyCacheState = await idbGetAll(factoryLegacy, 'RPHubSyncCache', 'state');
+assert.equal(legacyCacheState.get('snapshot').version, 7, 'legacy placements must mark cache version 7');
+assert.match(legacyCacheState.get('snapshot').packs[0].bucketKey, /\|r\d{3}$/);
+console.log('phase 2a (valid legacy restore): ok');
+
+// On the normal page, the first upload after a legacy restore must use the
+// existing one-time confirmation and then rebuild the cache into v8.
+locationLegacy.pathname = '/';
+const documentLegacyHome = createDocumentStub();
+installBrowserGlobals({
+    storageClass: StorageLegacy,
+    localStorage: localStorageLegacy,
+    factory: factoryLegacy,
+    document: documentLegacyHome,
+    location: locationLegacy,
+    fetchShim: makeFetchShim('legacy rebuild upload', { RP_SYNC_R2: legacyBucket }),
+    locks: locksB
+});
+let rebuildConfirmations = 0;
+setGlobal('confirm', () => { rebuildConfirmations += 1; return true; });
+globalThis.RPHubAuthorSaveData = async () => { };
+await runScripts(['DB/bootstrap.js']);
+const legacyHomeModal = findSyncModal(documentLegacyHome);
+assert.ok(legacyHomeModal, 'normal page must expose the sync panel after legacy restore');
+legacyHomeModal.querySelector('[data-action="push"]').click();
+await waitForUploadDone(legacyHomeModal, 'legacy cache rebuild upload');
+assert.equal(rebuildConfirmations, 1, 'legacy cache must ask once before rebuilding');
+const rebuiltCacheState = await idbGetAll(factoryLegacy, 'RPHubSyncCache', 'state');
+assert.equal(rebuiltCacheState.get('snapshot').version, 8, 'confirmed rebuild must produce v8 cache');
+assert.match(rebuiltCacheState.get('snapshot').packs[0].bucketKey, /\|s\d{3}$/);
+console.log('phase 2a (legacy cache confirms v8 rebuild): ok');
+
+// Restore the native fake-indexeddb methods before constructing the malformed
+// snapshot fixture below.
 restorePrototypes(savedPrototypes);
 const corruptBucket = createMemBucket();
 const corruptEnv = { RP_SYNC_R2: corruptBucket };

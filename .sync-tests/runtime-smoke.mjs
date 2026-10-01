@@ -333,7 +333,8 @@ function makeR2BucketMock(objects, hooks = {}) {
                 if (hooks.listCalls > hooks.throwOnList) throw new Error('list degraded');
             }
             const keys = [...objects.keys()].sort().filter(key => key.startsWith(prefix));
-            const start = cursor ? keys.indexOf(cursor) + 1 : 0;
+            const nextIndex = cursor ? keys.findIndex(key => key > cursor) : 0;
+            const start = nextIndex < 0 ? keys.length : nextIndex;
             const page = keys.slice(start, start + limit);
             const truncated = start + limit < keys.length;
             return {
@@ -411,13 +412,15 @@ async function testImageAdminApi() {
         body: JSON.stringify({ characterNames: ['Alice'] })
     }), env, ctx)).json();
     assert.equal(first.deletedCount, 20, 'a single request must process at most 20 targets');
-    assert.equal(first.remainingKeys.length, 4, 'unprocessed targets must be returned for the client to resubmit');
+    assert.deepEqual(first.remainingKeys, [], 'only failed tombstones belong in remainingKeys');
+    assert.deepEqual(first.continuation.characterNames, ['Alice']);
+    assert.ok(first.continuation.cursor, 'unprocessed pages must have a continuation cursor');
     assert.equal(objects.has(`rp-images/_deleted/Alice/${checksumOf(0)}.json`), true, 'tombstones must be written before responding');
 
     const second = await (await worker.fetch(new Request('https://local.test/image/api/delete', {
         method: 'POST',
         headers: { ...authHeaders, 'content-type': 'application/json' },
-        body: JSON.stringify({ keys: first.remainingKeys })
+        body: JSON.stringify(first.continuation)
     }), env, ctx)).json();
     assert.equal(second.deletedCount, 4);
     assert.equal(second.remainingKeys.length, 0);
@@ -855,9 +858,18 @@ async function testImageAdminPageRuntime() {
     await sandbox.enter();
     assert.ok(element('auth').classList.contains('hidden'), 'the right password must hide the login box');
     await waitFor(() => sandbox.data !== null, 'library data after login');
-    assert.equal(sandbox.data.totalCount, 1085, 'both directories must be listed across R2 pagination');
-    assert.deepEqual(sandbox.data.characters.map(character => character.name), ['Alice', 'Bob']);
-    assert.match(element('stats').textContent, /^1085 张图片/, 'stats must show the server-side total');
+    assert.equal(sandbox.data.characters[0].images.length, 40, 'first response must not drain the full directory');
+    assert.ok(sandbox.libraryCursor);
+    assert.match(element('stats').textContent, /尚有更多/);
+    let pages = 1;
+    while (sandbox.libraryCursor) {
+        assert.ok(pages++ < 30, 'pagination must make progress');
+        await sandbox.load(true);
+    }
+    assert.equal(pages, 28);
+    assert.equal(sandbox.data.characters.reduce((n, c) => n + c.images.length, 0), 1085);
+    assert.deepEqual(Array.from(sandbox.data.characters, character => character.name), ['Alice', 'Bob']);
+    assert.match(element('stats').textContent, /^1085 张图片/, 'stats must describe the loaded images');
     assert.match(element('library').innerHTML, /Alice/);
 
     // 页面加载完成后再写 3 张新图（模拟另一台设备继续生图）：
@@ -868,20 +880,18 @@ async function testImageAdminPageRuntime() {
 
     sandbox.deleteCharacterImages('Alice', 1040);
     assert.ok(sandbox.deleteBusy, 'the delete flow must be in flight immediately');
-    assert.deepEqual(sandbox.data.characters.map(character => character.name), ['Bob'],
+    assert.deepEqual(Array.from(sandbox.data.characters, character => character.name), ['Bob'],
         'the cleared group disappears from the UI before any request completes');
     assert.match(element('stats').textContent, /^45 张图片/, 'stats must immediately reflect only the surviving group');
     await waitFor(() => !sandbox.deleteBusy, 'clear-group batches to finish');
 
-    assert.equal(deleteRequests.length, 53, '1043 targets take one expansion request plus 52 key batches');
-    assert.deepEqual(deleteRequests[0], { characterNames: ['Alice'] },
-        'the first request must ask the server to expand the current directory state');
+    assert.equal(deleteRequests.length, 53, '1043 targets take 53 bounded directory pages');
+    assert.deepEqual(deleteRequests[0], { characterNames: ['Alice'] });
     const followUps = deleteRequests.slice(1);
-    assert.equal(followUps.reduce((total, body) => total + body.keys.length, 0), 1023);
     for (const body of followUps) {
-        assert.ok(Array.isArray(body.keys) && body.keys.length > 0 && body.keys.length <= 20,
-            'key batches must respect the per-request budget');
-        assert.equal(body.characterNames, undefined);
+        assert.deepEqual(body.characterNames, ['Alice']);
+        assert.ok(body.cursor, 'follow-ups must advance through directory cursors');
+        assert.equal(body.keys, undefined);
     }
     assert.match(element('notice').textContent, /已删除 1043 张/,
         'images generated after page load must be deleted via server-side expansion');
@@ -940,6 +950,68 @@ async function testImageAdminPageRuntime() {
         assert.equal(objects.has(imageKey('Bob', index)), true, `failed Bob images ${index} must still exist`);
     }
     sandbox.fetch = realFetch;
+
+    // 当前页墓碑部分失败：首个响应同时返回失败键和下一页游标，前端必须
+    // 先重试失败键，成功后才推进 continuation。
+    const originalBucketPut = bucket.put.bind(bucket);
+    const transientKey = imageKey('Bob', 20);
+    let transientFailure = true;
+    bucket.put = async (key, value, options) => {
+        if (transientFailure && key === `rp-images/_deleted/Bob/${checksumOf(20)}.json`) {
+            transientFailure = false;
+            throw new Error('一次性墓碑失败');
+        }
+        return originalBucketPut(key, value, options);
+    };
+    deleteRequests.length = 0;
+    sandbox.deleteCharacterImages('Bob', 25);
+    await waitFor(() => !sandbox.deleteBusy, 'partial tombstone retry and continuation to finish');
+    assert.equal(deleteRequests.length, 3, 'partial tombstone failure must retry before continuing');
+    assert.deepEqual(deleteRequests[0], { characterNames: ['Bob'] });
+    assert.deepEqual(deleteRequests[1], { keys: [transientKey] });
+    assert.equal(deleteRequests[2].characterNames[0], 'Bob');
+    assert.ok(deleteRequests[2].cursor, 'continuation must survive the failed-key retry');
+    assert.match(element('notice').textContent, /已删除 25 张/);
+    assert.equal(sandbox.data.characters.some(character => character.name === 'Bob'), false);
+    await Promise.all(waitUntilPromises.splice(0));
+    for (let index = 20; index < 45; index += 1) {
+        assert.equal(objects.has(imageKey('Bob', index)), false, `retried Bob image ${index} must be deleted`);
+    }
+
+    // 重试也失败时，已接受墓碑仍然生效，失败键与未处理 continuation 都恢复到页面。
+    const carolKeys = Array.from({ length: 21 }, (_, index) => imageKey('Carol', index));
+    for (const key of carolKeys) await bucket.put(key, new Uint8Array([5, 5, 5, 5]));
+    sandbox.data.characters.push({
+        name: 'Carol', count: carolKeys.length, size: carolKeys.length * 4,
+        sizeHuman: '84 B',
+        images: carolKeys.map(key => ({ key, size: 4, sizeHuman: '4 B' }))
+    });
+    const permanentKey = carolKeys[0];
+    let permanentFailure = true;
+    bucket.put = async (key, value, options) => {
+        if (permanentFailure && key === `rp-images/_deleted/Carol/${checksumOf(0)}.json`) {
+            throw new Error('持续墓碑失败');
+        }
+        return originalBucketPut(key, value, options);
+    };
+    deleteRequests.length = 0;
+    sandbox.deleteCharacterImages('Carol', carolKeys.length);
+    await waitFor(() => !sandbox.deleteBusy, 'permanent partial tombstone failure to settle');
+    assert.equal(deleteRequests.length, 2, 'a failed retry must stop before continuation');
+    assert.deepEqual(deleteRequests[0], { characterNames: ['Carol'] });
+    assert.deepEqual(deleteRequests[1], { keys: [permanentKey] });
+    const carol = sandbox.data.characters.find(character => character.name === 'Carol');
+    assert.deepEqual(carol.images.map(image => image.key), [permanentKey, carolKeys[20]],
+        'failed and unprocessed images must be restored after retry failure');
+    assert.match(element('notice').textContent, /删除标记写入失败/);
+    assert.equal(element('notice').style.color, '#dc2626');
+    await Promise.all(waitUntilPromises.splice(0));
+    assert.equal(objects.has(permanentKey), true, 'the permanently failed image must remain');
+    assert.equal(objects.has(carolKeys[20]), true, 'the unprocessed continuation image must remain');
+    for (let index = 1; index < 20; index += 1) {
+        assert.equal(objects.has(carolKeys[index]), false, `accepted Carol image ${index} must be deleted`);
+    }
+    bucket.put = originalBucketPut;
 }
 
 async function testSourceCheckEnforcement() {
@@ -948,10 +1020,10 @@ async function testSourceCheckEnforcement() {
     // 这里会像替换规则一样在本地测试中变红，提示更新清单标记。
     const healthyIndexHtml = await readFromUpstream('index.html');
     const healthyUiComponents = await readFromUpstream('assets/js/ui-components.js');
-    const makeFetchMock = ({ indexHtml = healthyIndexHtml, uiComponents = healthyUiComponents } = {}) => async input => {
+    const makeFetchMock = ({ indexHtml = healthyIndexHtml, uiComponents = healthyUiComponents, adapterText = null } = {}) => async input => {
         const url = new URL(String(input));
         if (url.protocol === 'file:') {
-            const body = await fs.readFile(fileURLToPath(url));
+            const body = adapterText ?? await fs.readFile(fileURLToPath(url));
             return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
         }
         const relative = url.pathname.replace(/^\/RP-Hub\//, '');
@@ -984,7 +1056,7 @@ async function testSourceCheckEnforcement() {
     const stalePage = await staleIndex.fetch(new Request('https://local.test/'), env, {});
     const stalePageBody = await stalePage.text();
     assert.doesNotMatch(stalePageBody, /RPHUB_MAGIC_ADAPTER/, 'a failed page marker must drop all custom injection');
-    assert.doesNotMatch(stalePageBody, /\/DB\/dirty-tracker\.js/, 'a failed page marker must not load the tracker');
+    assert.match(stalePageBody, /\/DB\/dirty-tracker\.js/, 'storage compatibility and journaling must survive UI adapter failure');
     assert.doesNotMatch(stalePageBody, /\/magic-extension\.js|\/DB\/bootstrap\.js/, 'a failed page marker must not load custom features');
     const staleConfig = await staleIndex.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(staleConfig.status, 503, 'the adapter config endpoint must refuse a stale adapter');
@@ -998,6 +1070,17 @@ async function testSourceCheckEnforcement() {
     assert.doesNotMatch(await componentsPage.text(), /RPHUB_MAGIC_ADAPTER=/, 'any failed source check must keep the page unchanged');
     const componentsAppJs = await staleComponents.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
     assert.equal(await componentsAppJs.text(), appJsSource, 'a failed ui-components check must skip the rewrite too');
+
+    const invalidReplacement = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
+    invalidReplacement.author.script.replacements.push({ name: 'mismatch', find: 'ABSENT_AUTHOR_MARKER_123456789', replace: 'unused' });
+    const mismatch = await loadWorker(makeFetchMock({ adapterText: JSON.stringify(invalidReplacement) }));
+    const page = await mismatch.fetch(new Request('https://local.test/'), env, {});
+    const html = await page.text();
+    assert.match(html, /\/DB\/dirty-tracker\.js/);
+    assert.doesNotMatch(html, /\/magic-extension\.js|\/DB\/bootstrap\.js/);
+    assert.equal((await mismatch.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {})).status, 503);
+    assert.equal(await (await mismatch.fetch(new Request('https://local.test/assets/js/app.js'), env, {})).text(), appJsSource,
+        'replacement mismatch must fail the source check before any UI enhancement is injected');
 }
 
 await testImageAdminApi();

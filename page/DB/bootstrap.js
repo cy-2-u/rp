@@ -88,12 +88,7 @@
                     await options.send(records);
                     uploadedBytes += batch.totalBytes;
                     uploadedItems += batch.items.length;
-                    await options.onBatchSuccess?.({
-                        bytes: uploadedBytes,
-                        items: uploadedItems,
-                        batchBytes: batch.totalBytes,
-                        batchItems: batch.items.length
-                    });
+                    await options.onBatchSuccess?.({ bytes: uploadedBytes });
                 } finally {
                     records.forEach(record => { record.bytes = null; });
                 }
@@ -166,6 +161,142 @@
         }
     };
 })();
+
+function createAutoSaveScheduler(options = {}) {
+    const setTimer = options.setTimeout || setTimeout;
+    const clearTimer = options.clearTimeout || clearTimeout;
+    const now = typeof options.now === 'function' ? options.now : () => performance.now();
+    const wallNow = typeof options.wallNow === 'function' ? options.wallNow : Date.now;
+    const isActive = typeof options.isActive === 'function' ? options.isActive : () => true;
+    const tickMs = Number.isFinite(Number(options.tickMs)) && Number(options.tickMs) > 0
+        ? Number(options.tickMs) : 30 * 1000;
+    const lateToleranceMs = Number.isFinite(Number(options.lateToleranceMs))
+        && Number(options.lateToleranceMs) >= 0 ? Number(options.lateToleranceMs) : 5000;
+    let enabled = false;
+    let active = false;
+    let remainingMs = 0;
+    let lastActiveAt = 0;
+    let lastWallAt = 0;
+    let timerId = null;
+    let generation = 0;
+
+    const emit = phase => options.onState?.({
+        phase,
+        enabled,
+        active,
+        remainingMs,
+        timerActive: timerId !== null
+    });
+    const clearScheduled = () => {
+        if (timerId === null) return;
+        clearTimer(timerId);
+        timerId = null;
+    };
+    const readNow = () => {
+        const value = Number(now());
+        return Number.isFinite(value) ? value : Date.now();
+    };
+    const consumeElapsed = current => {
+        const wall = Number(wallNow());
+        const elapsed = current - lastActiveAt;
+        const wallElapsed = wall - lastWallAt;
+        const expected = Math.min(remainingMs, tickMs);
+        const uncertain = elapsed < 0 || !Number.isFinite(wall)
+            || elapsed > expected + lateToleranceMs
+            || Math.abs(wallElapsed - elapsed) > lateToleranceMs;
+        lastActiveAt = current;
+        lastWallAt = wall;
+        // Browser clocks may include OS sleep; uncertain intervals only delay saving.
+        if (!uncertain) remainingMs = Math.max(0, remainingMs - elapsed);
+        return remainingMs === 0;
+    };
+    const schedule = () => {
+        clearScheduled();
+        if (!enabled || !active) return;
+        const delay = Math.max(1, Math.min(remainingMs, tickMs));
+        const expectedGeneration = generation;
+        timerId = setTimer(() => {
+            if (expectedGeneration !== generation) return;
+            timerId = null;
+            if (!enabled || !active) return;
+            if (!isActive()) {
+                pause();
+                return;
+            }
+            const current = readNow();
+            if (consumeElapsed(current)) {
+                active = false;
+                generation += 1;
+                emit('due');
+                let result;
+                try {
+                    result = options.onDue?.();
+                } catch (error) {
+                    options.onError?.(error);
+                    return;
+                }
+                Promise.resolve(result).catch(error => options.onError?.(error));
+                return;
+            }
+            schedule();
+        }, delay);
+    };
+    function start(intervalMs) {
+        const duration = Number(intervalMs);
+        if (!Number.isFinite(duration) || duration <= 0) throw new RangeError('自动保存间隔无效。');
+        clearScheduled();
+        enabled = true;
+        remainingMs = duration;
+        lastActiveAt = readNow();
+        lastWallAt = Number(wallNow());
+        active = Boolean(isActive());
+        generation += 1;
+        schedule();
+        emit('start');
+    }
+    function pause() {
+        if (!enabled) return;
+        if (active) {
+            const current = readNow();
+            consumeElapsed(current);
+        }
+        active = false;
+        generation += 1;
+        clearScheduled();
+        emit('pause');
+    }
+    function resume() {
+        if (!enabled || active) return;
+        active = Boolean(isActive());
+        if (!active) return;
+        lastActiveAt = readNow();
+        lastWallAt = Number(wallNow());
+        generation += 1;
+        schedule();
+        emit('resume');
+    }
+    function stop() {
+        enabled = false;
+        active = false;
+        remainingMs = 0;
+        generation += 1;
+        clearScheduled();
+        emit('stop');
+    }
+    function setActive(value) {
+        if (value) resume();
+        else pause();
+    }
+    return Object.freeze({
+        start,
+        pause,
+        resume,
+        stop,
+        setActive,
+        getState: () => ({ enabled, active, remainingMs, timerActive: timerId !== null })
+    });
+}
+
 (function () {
     const SNAPSHOT_FORMAT = 'rp-sync-paged-jsonl-v4';
     const SNAPSHOT_SCHEMA_VERSION = 13;
@@ -322,6 +453,66 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
+}
+
+.rp-sync-auto-save {
+    margin-top: 14px;
+    padding: 12px;
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    border-radius: 12px;
+    background: #f8fafc;
+}
+
+.rp-sync-auto-save__row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.rp-sync-auto-save__toggle,
+.rp-sync-auto-save__interval {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #374151;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.rp-sync-auto-save__toggle input {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: #2563eb;
+}
+
+.rp-sync-auto-save__interval input {
+    width: 76px;
+    border: 1px solid rgba(209, 213, 219, 0.95);
+    border-radius: 8px;
+    background: #fff;
+    color: #111827;
+    font: inherit;
+    padding: 7px 8px;
+}
+
+.rp-sync-auto-save__interval input:focus {
+    border-color: rgba(37, 99, 235, 0.52);
+    outline: 3px solid rgba(37, 99, 235, 0.11);
+}
+
+.rp-sync-auto-save__interval input[aria-invalid="true"] {
+    border-color: #dc2626;
+    outline-color: rgba(220, 38, 38, 0.12);
+}
+
+.rp-sync-auto-save__status {
+    min-height: 18px;
+    margin: 8px 0 0;
+    color: #64748b;
+    font-size: 12px;
+    line-height: 1.5;
 }
 
 .rp-sync-action-button {
@@ -496,6 +687,18 @@
         gap: 8px;
     }
 
+    // 自动保存区保持与桌面一致的“开关居左、间隔居右”单行布局：常规手机
+    // 宽度（≥320px）放得下；极端窄屏时允许换行，margin-left:auto 让间隔
+    // 组靠右，不会像旧的 column 堆叠那样全部挤在左侧。
+    .rp-sync-auto-save__row {
+        flex-wrap: wrap;
+        row-gap: 10px;
+    }
+
+    .rp-sync-auto-save__interval {
+        margin-left: auto;
+    }
+
     .rp-sync-action-button {
         height: 42px;
         font-size: 14px;
@@ -537,6 +740,13 @@
         // 跨 tab 同步互斥锁名：dirty-tracker.js 的 checkInterruptedRestore
         // 以裸字符串比较同一把锁，改必须双侧同步。
         lockName: 'rp-hub-r2-sync-v1',
+        autoSaveEnabledKey: 'rp_hub_sync_auto_save_enabled_v1',
+        autoSaveMinutesKey: 'rp_hub_sync_auto_save_minutes_v1',
+        autoSaveDefaultMinutes: 5,
+        autoSaveMinMinutes: 1,
+        autoSaveMaxMinutes: 1440,
+        autoSaveTickMs: 30 * 1000,
+        autoSaveLateToleranceMs: 5000,
         knownDatabases: [
             { name: 'RPHubDB', stores: ['store'] },
             { name: 'AICharGen', stores: ['characters'] }
@@ -585,19 +795,26 @@
     const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
     const CACHE_STATE_KEY = 'snapshot';
-    const CACHE_FORMAT_VERSION = 7;
+    const CACHE_FORMAT_VERSION = 8;
     const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
-    const STABLE_BUCKET_COUNT = 32;
-    const ARRAY_BUCKET_ENTRIES = 128;
+    const STABLE_BUCKET_COUNT = 256;
+    const ARRAY_BUCKET_ENTRIES = 32;
 
     const MAX_SUPPORTED_OBJECT_BYTES = 64 * 1024 * 1024;
 
     const state = {
         syncing: false,
+        operationPending: false,
         progress: 0,
         statusText: '请选择同步方向。'
     };
+
+    const AUTO_SAVE_CONFIG = Object.freeze({
+        defaultMinutes: CONFIG.autoSaveDefaultMinutes,
+        minMinutes: CONFIG.autoSaveMinMinutes,
+        maxMinutes: CONFIG.autoSaveMaxMinutes
+    });
 
     let modalRoot = null;
     let modalStatus = null;
@@ -610,6 +827,12 @@
     let passwordInput = null;
     let passwordStatus = null;
     let passwordSubmitButton = null;
+    let autoSaveToggle = null;
+    let autoSaveMinutesInput = null;
+    let autoSaveStatus = null;
+    let autoSaveScheduler = null;
+    let autoSaveLastError = '';
+    let autoSaveRunning = false;
     let checkingPassword = false;
 
     function wait(ms) {
@@ -668,6 +891,29 @@
     async function withCrossTabSyncLock(task) {
         if (!navigator.locks?.request) return task();
         return navigator.locks.request(CONFIG.lockName, { mode: 'exclusive' }, task);
+    }
+
+    async function runSyncOperation(task, options = {}) {
+        const automatic = Boolean(options.automatic);
+        if (state.operationPending || state.syncing) return { skipped: true, reason: 'syncing' };
+        if (automatic && (!isAutoSaveEnabled() || !isAutoSavePageActive())) {
+            return { skipped: true, reason: 'inactive' };
+        }
+        state.operationPending = true;
+        autoSaveScheduler?.pause();
+        setActionButtonsDisabled(true);
+        try {
+            return await withCrossTabSyncLock(async () => {
+                if (automatic && (!isAutoSaveEnabled() || !isAutoSavePageActive())) {
+                    return { skipped: true, reason: 'inactive' };
+                }
+                return task();
+            });
+        } finally {
+            state.operationPending = false;
+            setActionButtonsDisabled(false);
+            restartAutoSaveCycle();
+        }
     }
 
     async function withRestoreWriteLock(task) {
@@ -837,7 +1083,6 @@
         const type = typeof value;
         if (type === 'string') return value.length * 2 + 24;
         if (type === 'number' || type === 'boolean' || type === 'bigint') return 24;
-        if (type !== 'object') return 64;
         if (value instanceof Date) return 24;
         if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value.byteLength + 24;
         if (depth >= 3) return 512;
@@ -1214,7 +1459,7 @@
         return `${left}${right}-${sourceKey.length}`;
     }
 
-    function snapshotEntryBucket(value, id, sourceKey) {
+    function snapshotEntryBucket(value, id, sourceKey, legacy = false) {
         const group = snapshotEntryGroup(value);
         if (group.endsWith(':header')) return `${group}|h`;
         if (group.endsWith(':footer')) return `${group}|z`;
@@ -1222,14 +1467,13 @@
             || value.type === 'recordArrayItem'
             || value.type === 'recordArrayEnd') {
             const length = Number(value.length || 0);
+            const pageSize = legacy ? 128 : ARRAY_BUCKET_ENTRIES;
             const page = value.type === 'recordArrayItem'
-                ? Math.floor(Number(value.index || 0) / ARRAY_BUCKET_ENTRIES)
-                : value.type === 'recordArrayEnd'
-                    ? Math.floor(length / ARRAY_BUCKET_ENTRIES)
-                    : 0;
-            return `${group}|a${arraySourceToken(sourceKey)}|p${String(page).padStart(10, '0')}`;
+                ? Math.floor(Number(value.index || 0) / pageSize)
+                : value.type === 'recordArrayEnd' ? Math.floor(length / pageSize) : 0;
+            return `${group}|a${arraySourceToken(sourceKey)}|${legacy ? 'p' : 'q'}${String(page).padStart(10, '0')}`;
         }
-        return `${group}|r${String(stableHash(id) % STABLE_BUCKET_COUNT).padStart(3, '0')}`;
+        return `${group}|${legacy ? 'r' : 's'}${String(stableHash(id) % (legacy ? 32 : STABLE_BUCKET_COUNT)).padStart(3, '0')}`;
     }
 
     function buildCacheEntry(value) {
@@ -1875,6 +2119,7 @@
                     definition: storeDef,
                     incomingKeys: new Set(),
                     batch: [],
+                    batchBytes: 0,
                     arrayRecord: null,
                     finished: false
                 }]))
@@ -1897,7 +2142,8 @@
         async queueStoreRecord(storeState, record) {
             storeState.incomingKeys.add(stableKeyToken(record.key));
             storeState.batch.push(record);
-            if (storeState.batch.length >= CONFIG.restoreBatchSize) {
+            storeState.batchBytes += estimateRecordBytes(record.value);
+            if (storeState.batch.length >= CONFIG.restoreBatchSize || storeState.batchBytes >= CONFIG.scanBatchBytes) {
                 await this.flushStore(storeState);
             }
         }
@@ -1964,6 +2210,7 @@
             if (storeState.batch.length === 0) return;
             const batch = storeState.batch;
             storeState.batch = [];
+            storeState.batchBytes = 0;
             if (!this.validateOnly) {
                 await writeObjectStoreRecordBatch(this.currentDatabase.db, storeState.definition, batch);
                 await this.yieldIfNeeded();
@@ -2077,7 +2324,8 @@
         const group = snapshotEntryGroup(value);
         const sourceKey = snapshotEntrySource(value);
         const bucketKey = snapshotEntryBucket(value, id, sourceKey);
-        if (bucketKey !== pack.bucketKey || group !== pack.group) {
+        if (group !== pack.group || (bucketKey !== pack.bucketKey
+            && snapshotEntryBucket(value, id, sourceKey, true) !== pack.bucketKey)) {
             throw new Error('服务器同步分片索引不一致。');
         }
     }
@@ -2239,7 +2487,7 @@
         return packManifest;
     }
 
-    async function restoreSnapshotAndCache(stagingDb, packManifest, remote, restoreWatermark) {
+    async function restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState) {
         const cacheDb = await openLocalSyncCache();
         const restorer = new ObjectSnapshotRestorer(remote.entryCount);
         let pendingEntries = [];
@@ -2269,9 +2517,8 @@
                     async consume(value, pack) {
                         await restorer.consume(value);
                         const entry = buildCacheEntry(value);
-                        if (entry.bucketKey !== pack.bucketKey || entry.group !== pack.group) {
-                            throw new Error('服务器同步缓存索引不一致。');
-                        }
+                        assertPackEntryPlacement(value, pack);
+                        entry.bucketKey = pack.bucketKey;
                         pendingEntries.push(entry);
                         pendingBytes += entry.bytes.byteLength;
                         entryCount += 1;
@@ -2311,14 +2558,14 @@
                 checksum: String(remote.checksum).toLowerCase()
             };
             await cacheWriteState(cacheDb, {
-                version: CACHE_FORMAT_VERSION,
+                version: packManifest.some(pack => /\|r\d{3}$|\|p\d{10}$/.test(pack.bucketKey)) ? 7 : CACHE_FORMAT_VERSION,
                 groups: [...new Set(packManifest.map(pack => pack.group))],
                 packs: packManifest.map(pack => ({ ...pack })),
                 epoch: localStorage.getItem(TRACKING_EPOCH_KEY),
-                epochs: (await readDirtyState()).epochs,
+                epochs: dirtyState.epochs,
                 snapshot
             });
-            await window.RPH_SYNC_TRACKER.acknowledge(restoreWatermark);
+            await window.RPH_SYNC_TRACKER.acknowledge(dirtyState.watermark);
         } catch (error) {
             restorer.abort();
             await cacheClear(cacheDb);
@@ -2328,7 +2575,19 @@
         }
     }
 
+    async function checkRestoreStorage(totalBytes) {
+        if (!navigator.storage?.estimate) return;
+        let estimate;
+        try { estimate = await navigator.storage.estimate(); } catch (_) { return; }
+        const available = Number(estimate.quota) - Number(estimate.usage || 0);
+        const required = Number(totalBytes) * 4 + 8 * 1024 * 1024;
+        if (Number.isFinite(available) && available < required) {
+            throw new Error(`浏览器剩余空间不足，恢复暂存与索引预计需要约 ${Math.ceil(required / 1024 / 1024)}MiB，请先释放其他站点空间。`);
+        }
+    }
+
     async function restorePackSnapshot(remote) {
+        await checkRestoreStorage(remote.totalBytes);
         const packManifest = await validateRemotePackManifest(remote);
         const stagingDb = await openDownloadStagingDb();
 
@@ -2355,8 +2614,10 @@
                 await withRestoreWriteLock(async () => {
                     restoreStarted = true;
                     await waitForIndexedDbWriteBarrier();
-                    const restoreWatermark = (await readDirtyState()).watermark;
-                    await restoreSnapshotAndCache(stagingDb, packManifest, remote, restoreWatermark);
+                    // 一次 readDirtyState 同时供恢复水印（acknowledge）与
+                    // 缓存 epochs 使用，避免恢复路径重复全量扫描变更日志。
+                    const dirtyState = await readDirtyState();
+                    await restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState);
                     if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
                         localStorage.removeItem(RESTORE_ACTIVE_KEY);
                     }
@@ -2397,7 +2658,9 @@
         const abortMessage = options.abortMessage || '同步请求超时，请检查网络后重试。';
         let lastError = null;
 
-        for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+        // 循环体每轮必 return/throw（重试次数耗尽时在 catch 内抛出），无需
+        // 兜底返回；retryCount 由调用方约束为非负整数。
+        for (let attempt = 0; ; attempt += 1) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             try {
@@ -2549,17 +2812,44 @@
     }
 
     async function runGcMaintenance() {
-        const maxSteps = Math.ceil(CONFIG.maxPackCount / 256) + 1;
-        for (let step = 0; step < maxSteps; step += 1) {
+        const deadline = Date.now() + 3000;
+        for (let step = 0; step < 2 && Date.now() < deadline; step += 1) {
             const result = await postSync({ action: 'gc-step' }, {
                 retryCount: 0,
-                timeoutMs: CONFIG.commitTimeoutMs
+                timeoutMs: Math.max(1, deadline - Date.now())
             });
             if (result.done) return;
         }
     }
 
     async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
+        let currentBaseVersion = baseVersion;
+        let currentBaseChecksum = baseChecksum;
+        for (let attempt = 0; ; attempt += 1) {
+            try {
+                return await uploadPagedSnapshotAttempt(
+                    snapshot,
+                    currentBaseVersion,
+                    currentBaseChecksum,
+                    progress
+                );
+            } catch (error) {
+                if (!error.response?.recheckRequired || attempt >= 2) throw error;
+                updateProgress(progress.uploadStart, '正在重新核对分片清单…');
+                const latest = await postSync({
+                    action: 'prepare-upload',
+                    schemaVersion: SNAPSHOT_SCHEMA_VERSION
+                }, { timeoutMs: CONFIG.commitTimeoutMs });
+                if (latest.resetRequired) {
+                    throw new Error('同步存储尚未初始化，请重试。');
+                }
+                currentBaseVersion = Number(latest.remote?.version || 0);
+                currentBaseChecksum = String(latest.remote?.checksum || '');
+            }
+        }
+    }
+
+    async function uploadPagedSnapshotAttempt(snapshot, baseVersion, baseChecksum, progress) {
         const bloom = buildPackBloom(snapshot.packManifest);
         const begin = await postSync({
             action: 'begin-upload',
@@ -2655,8 +2945,11 @@
     }
 
     function updateProgress(progress, text) {
-        state.progress = Math.max(0, Math.min(100, progress));
-        state.statusText = text || state.statusText;
+        const next = Math.max(0, Math.min(100, progress));
+        const statusText = text || state.statusText;
+        if (state.progress === next && state.statusText === statusText) return;
+        state.progress = next;
+        state.statusText = statusText;
         modalRoot?.classList.remove('is-error');
         if (modalProgressBar) {
             modalProgressBar.style.width = `${state.progress}%`;
@@ -2678,6 +2971,183 @@
     function setActionButtonsDisabled(disabled) {
         if (pullButton) pullButton.disabled = disabled;
         if (pushButton) pushButton.disabled = disabled;
+        if (rebuildButton) rebuildButton.disabled = disabled;
+    }
+
+    function isAutoSavePageActive() {
+        return document.visibilityState !== 'hidden' && document.hidden !== true;
+    }
+
+    function parseAutoSaveMinutes(value) {
+        const text = String(value ?? '').trim();
+        if (!/^\d+$/.test(text)) return null;
+        const minutes = Number(text);
+        if (!Number.isSafeInteger(minutes)
+            || minutes < AUTO_SAVE_CONFIG.minMinutes
+            || minutes > AUTO_SAVE_CONFIG.maxMinutes) return null;
+        return minutes;
+    }
+
+    function getAutoSaveMinutes() {
+        const stored = parseAutoSaveMinutes(localStorage.getItem(CONFIG.autoSaveMinutesKey));
+        return stored ?? AUTO_SAVE_CONFIG.defaultMinutes;
+    }
+
+    function isAutoSaveEnabled() {
+        return localStorage.getItem(CONFIG.autoSaveEnabledKey) === '1';
+    }
+
+    function setAutoSaveStatus(text) {
+        if (autoSaveStatus) autoSaveStatus.textContent = text;
+    }
+
+    function renderAutoSaveControls() {
+        if (!autoSaveToggle || !autoSaveMinutesInput) return;
+        autoSaveToggle.checked = isAutoSaveEnabled();
+        autoSaveMinutesInput.value = String(getAutoSaveMinutes());
+        autoSaveMinutesInput.min = String(AUTO_SAVE_CONFIG.minMinutes);
+        autoSaveMinutesInput.max = String(AUTO_SAVE_CONFIG.maxMinutes);
+        autoSaveMinutesInput.step = '1';
+        autoSaveMinutesInput.setAttribute('aria-invalid', 'false');
+    }
+
+    function restartAutoSaveCycle(text = '前台计时中') {
+        if (!autoSaveScheduler || RESTORE_PAGE || !isAutoSaveEnabled()) return;
+        if (state.operationPending || state.syncing) {
+            autoSaveScheduler.pause();
+            setAutoSaveStatus('同步进行中，自动保存将在当前操作结束后重新计时。');
+            return;
+        }
+        autoSaveScheduler.start(getAutoSaveMinutes() * 60 * 1000);
+        if (autoSaveScheduler.getState().enabled) {
+            const detail = autoSaveLastError ? `；上次失败：${autoSaveLastError}` : '';
+            setAutoSaveStatus(isAutoSavePageActive()
+                ? `${text}${detail}，每 ${getAutoSaveMinutes()} 分钟自动保存。`
+                : '后台已暂停自动保存。');
+        }
+    }
+
+    function stopAutoSave(text = '自动保存已关闭') {
+        autoSaveScheduler?.stop();
+        setAutoSaveStatus(text);
+    }
+
+    function pauseAutoSave(text = '后台已暂停自动保存') {
+        autoSaveScheduler?.pause();
+        if (isAutoSaveEnabled()) setAutoSaveStatus(text);
+    }
+
+    function resumeAutoSave() {
+        if (!autoSaveScheduler || !isAutoSaveEnabled()) return;
+        if (state.operationPending || state.syncing) {
+            autoSaveScheduler.pause();
+            setAutoSaveStatus('同步进行中，自动保存将在当前操作结束后重新计时。');
+            return;
+        }
+        const current = autoSaveScheduler.getState();
+        if (current.remainingMs <= 0) {
+            if (!autoSaveRunning) restartAutoSaveCycle();
+            return;
+        }
+        autoSaveScheduler.resume();
+        const schedulerState = autoSaveScheduler.getState();
+        if (schedulerState.active) setAutoSaveStatus(`前台计时中，每 ${getAutoSaveMinutes()} 分钟自动保存。`);
+        else if (!isAutoSavePageActive()) setAutoSaveStatus('后台已暂停自动保存。');
+    }
+
+    function persistAutoSaveMinutes(value) {
+        const minutes = parseAutoSaveMinutes(value);
+        if (minutes === null) {
+            autoSaveMinutesInput?.setAttribute('aria-invalid', 'true');
+            setAutoSaveStatus(`请输入 ${AUTO_SAVE_CONFIG.minMinutes}～${AUTO_SAVE_CONFIG.maxMinutes} 的整数分钟。`);
+            return false;
+        }
+        try {
+            localStorage.setItem(CONFIG.autoSaveMinutesKey, String(minutes));
+        } catch (error) {
+            setAutoSaveStatus(`自动保存设置保存失败：${error?.message || '请稍后重试。'}`);
+            return false;
+        }
+        autoSaveMinutesInput?.setAttribute('aria-invalid', 'false');
+        if (isAutoSaveEnabled()) restartAutoSaveCycle();
+        else setAutoSaveStatus(`已设置每 ${minutes} 分钟自动保存。`);
+        return true;
+    }
+
+    async function runAutomaticUpload() {
+        if (!isAutoSaveEnabled() || !isAutoSavePageActive()) {
+            pauseAutoSave();
+            return;
+        }
+        if (autoSaveRunning) {
+            setAutoSaveStatus('同步正在进行，自动保存将在下一轮重试。');
+            return;
+        }
+        autoSaveRunning = true;
+        setAutoSaveStatus('正在自动保存…');
+        try {
+            await runSyncOperation(
+                () => pushToServerUnlocked({ automatic: true }),
+                { automatic: true }
+            );
+        } catch (error) {
+            autoSaveLastError = error?.message || '自动保存失败。';
+            if (isAutoSaveEnabled()) {
+                setAutoSaveStatus(isAutoSavePageActive()
+                    ? `自动保存失败：${autoSaveLastError}；下一完整周期重试。`
+                    : `后台已暂停自动保存；上次失败：${autoSaveLastError}`);
+            }
+        } finally {
+            autoSaveRunning = false;
+        }
+    }
+
+    function initializeAutoSave() {
+        if (RESTORE_PAGE || autoSaveScheduler) return;
+        autoSaveScheduler = createAutoSaveScheduler({
+            tickMs: CONFIG.autoSaveTickMs,
+            lateToleranceMs: CONFIG.autoSaveLateToleranceMs,
+            isActive: isAutoSavePageActive,
+            onState: event => {
+                if (event.phase === 'pause' && isAutoSaveEnabled() && !isAutoSavePageActive()) {
+                    setAutoSaveStatus('后台已暂停自动保存。');
+                }
+            },
+            onDue: runAutomaticUpload,
+            onError: error => {
+                autoSaveLastError = error?.message || '自动保存失败。';
+                setAutoSaveStatus(`自动保存失败：${autoSaveLastError}`);
+                if (isAutoSaveEnabled() && isAutoSavePageActive()) restartAutoSaveCycle();
+            }
+        });
+        renderAutoSaveControls();
+        autoSaveToggle?.addEventListener('change', () => {
+            const enabled = Boolean(autoSaveToggle.checked);
+            try {
+                localStorage.setItem(CONFIG.autoSaveEnabledKey, enabled ? '1' : '0');
+            } catch (error) {
+                autoSaveToggle.checked = !enabled;
+                setAutoSaveStatus(`自动保存设置保存失败：${error?.message || '请稍后重试。'}`);
+                return;
+            }
+            autoSaveLastError = '';
+            if (enabled) restartAutoSaveCycle();
+            else stopAutoSave();
+        });
+        autoSaveMinutesInput?.addEventListener('change', () => {
+            persistAutoSaveMinutes(autoSaveMinutesInput.value);
+            autoSaveMinutesInput.value = String(getAutoSaveMinutes());
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (isAutoSavePageActive()) resumeAutoSave();
+            else pauseAutoSave();
+        });
+        window.addEventListener('pagehide', () => pauseAutoSave('页面已离开，自动保存已暂停。'));
+        window.addEventListener('pageshow', () => resumeAutoSave());
+        document.addEventListener('freeze', () => pauseAutoSave('页面已冻结，自动保存已暂停。'));
+        document.addEventListener('resume', () => resumeAutoSave());
+        if (isAutoSaveEnabled()) restartAutoSaveCycle();
+        else stopAutoSave();
     }
 
     function getAppPersistenceProxy() {
@@ -3086,6 +3556,19 @@
                     <button type="button" class="rp-sync-action-button" data-action="pull">从云端恢复</button>
                     <button type="button" class="rp-sync-action-button" data-action="rebuild">重建本地索引</button>
                 </div>
+                <section class="rp-sync-auto-save" aria-label="自动保存">
+                    <div class="rp-sync-auto-save__row">
+                        <label class="rp-sync-auto-save__toggle">
+                            <input type="checkbox" data-action="auto-save-toggle">
+                            <span>自动保存</span>
+                        </label>
+                        <label class="rp-sync-auto-save__interval">
+                            <span>间隔（分钟）</span>
+                            <input type="number" data-action="auto-save-minutes" inputmode="numeric">
+                        </label>
+                    </div>
+                    <p class="rp-sync-auto-save__status" aria-live="polite"></p>
+                </section>
                 <p class="rp-sync-modal__status">请选择同步方向。</p>
                 <div class="rp-sync-progress">
                     <div class="rp-sync-progress__bar"></div>
@@ -3099,6 +3582,9 @@
         modalProgressBar = modalRoot.querySelector('.rp-sync-progress__bar');
         modalProgressValue = modalRoot.querySelector('.rp-sync-progress__value');
         pullButton = modalRoot.querySelector('[data-action="pull"]');
+        autoSaveToggle = modalRoot.querySelector('[data-action="auto-save-toggle"]');
+        autoSaveMinutesInput = modalRoot.querySelector('[data-action="auto-save-minutes"]');
+        autoSaveStatus = modalRoot.querySelector('.rp-sync-auto-save__status');
 
         if (RESTORE_PAGE) {
             pullButton.addEventListener('click', () => pullFromServer().catch(showSyncError));
@@ -3111,6 +3597,7 @@
         // 重建是恢复手段不是常规操作：默认隐藏。推送遇索引错误时经确认
         // 自动重建并继续；拒绝时才显示按钮走手动路径。
         rebuildButton.style.display = 'none';
+        initializeAutoSave();
 
         modalRoot.querySelector('.rp-sync-modal__close').addEventListener('click', closeModal);
         modalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', () => {
@@ -3123,7 +3610,8 @@
         });
         rebuildButton.addEventListener('click', async () => {
             if (state.syncing || !confirm('这会完整读取本地数据重建索引，但不会上传或覆盖云端。请先导出本地数据备份。继续吗？')) return;
-            await withCrossTabSyncLock(async () => {
+            pauseAutoSave('正在重建索引，自动保存已暂停。');
+            await runSyncOperation(async () => {
                 state.syncing = true;
                 try {
                     setActionButtonsDisabled(true);
@@ -3150,7 +3638,7 @@
         modalRoot.classList.remove('is-open');
     }
 
-    async function commitObjectSnapshot(progress) {
+    async function commitObjectSnapshot(progress, options = {}) {
         updateProgress(progress.check, '准备中…');
         const statusResponse = await postSync({ action: 'prepare-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION }, {
             timeoutMs: CONFIG.commitTimeoutMs
@@ -3165,6 +3653,9 @@
             if (!err?.indexInvalid) throw err;
             // 索引过期不再要求用户离开当前流程：一次确认后自动重建并继续
             // 上传。重建只读本地数据；云端以上传开始时的状态为基准整体替换。
+            if (options.automatic) {
+                throw new Error('本地同步索引需要人工重建，请打开同步面板后重试。');
+            }
             if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据。大库可能需要几分钟。继续吗？')) {
                 if (rebuildButton) rebuildButton.style.display = '';
                 throw err;
@@ -3204,8 +3695,8 @@
 
     async function pullFromServerUnlocked() {
         if (state.syncing) return;
-
         state.syncing = true;
+        pauseAutoSave('正在恢复，自动保存已暂停。');
 
         try {
             openModal();
@@ -3246,18 +3737,22 @@
             setActionButtonsDisabled(false);
         } finally {
             state.syncing = false;
+            setActionButtonsDisabled(false);
         }
     }
 
-    async function pushToServerUnlocked() {
-        if (state.syncing) return;
+    async function pushToServerUnlocked(options = {}) {
+        if (state.syncing) return { skipped: true, reason: 'syncing' };
 
+        pauseAutoSave(options.automatic ? '正在自动保存…' : '正在手动上传，自动保存已暂停。');
         state.syncing = true;
+        const automatic = Boolean(options.automatic);
+        if (automatic) autoSaveLastError = '';
 
         try {
-            openModal();
+            if (!automatic) openModal();
             setActionButtonsDisabled(true);
-            updateProgress(8, '准备中…');
+            updateProgress(8, automatic ? '正在自动保存…' : '准备中…');
             await flushAppState();
             await waitForIndexedDbWriteBarrier();
 
@@ -3266,25 +3761,41 @@
                 uploadStart: 36,
                 uploadEnd: 88,
                 commit: 92
-            });
+            }, { automatic });
             if (alreadyUpToDate) {
-                updateProgress(100, '已是最新');
+                updateProgress(100, automatic ? '数据相同，已是最新' : '已是最新');
+                if (automatic) {
+                    autoSaveLastError = '';
+                    setAutoSaveStatus('数据相同，已是最新。');
+                }
                 setActionButtonsDisabled(false);
-                return;
+                return { alreadyUpToDate: true };
             }
 
-            updateProgress(100, '已完成');
+            updateProgress(100, automatic ? '自动保存完成' : '已完成');
+            if (automatic) {
+                autoSaveLastError = '';
+                setAutoSaveStatus('自动保存完成。');
+            }
             setActionButtonsDisabled(false);
+            return { alreadyUpToDate: false };
         } catch (error) {
-            showSyncError(error);
+            if (automatic) {
+                autoSaveLastError = error?.message || '自动保存失败。';
+                setAutoSaveStatus(`自动保存失败：${autoSaveLastError}`);
+            } else {
+                showSyncError(error);
+            }
             setActionButtonsDisabled(false);
+            if (!automatic) return { error };
+            throw error;
         } finally {
             state.syncing = false;
+            setActionButtonsDisabled(false);
         }
     }
-
-    const pullFromServer = () => withCrossTabSyncLock(pullFromServerUnlocked);
-    const pushToServer = () => withCrossTabSyncLock(pushToServerUnlocked);
+    const pullFromServer = () => runSyncOperation(() => pullFromServerUnlocked());
+    const pushToServer = () => runSyncOperation(() => pushToServerUnlocked());
 
     window.RPH_R2_OPEN_SYNC = () => {
         handleSyncButtonClick().catch(() => { });

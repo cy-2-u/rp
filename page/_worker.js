@@ -26,106 +26,47 @@ const ADAPTER_PATH = '/__rphub/adapter.json';
 const ADAPTER_MAX_BYTES = 512 * 1024;
 const ADAPTER_CACHE_TTL_MS = 30 * 1000;
 const adapterCache = new Map();
+const adapterLoads = new Map();
+const adapterSources = new WeakMap();
+const compiledReplacements = new WeakMap();
 // 成功清单缓存 30 秒；失败也短暂缓存（仅网络源），适配源抖动时不让
-// 每个作者资源请求都重付整条竞速链的超时。
+// 每个作者资源请求都重付一次直连拉取的超时。
 const ADAPTER_FAILURE_TTL_MS = 5 * 1000;
 
-// ---- GitHub 多源容错：适配清单走竞速，作者页面走故障转移链（仅用于公开静态资源） ----
+// ---- 云端配置与作者页面均直连 GitHub（不经过任何第三方镜像/加速反代） ----
 const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good.json';
-const AUTHOR_REPO_RAW = 'https://raw.githubusercontent.com/sta1n156/RP-Hub/main/';
 const AUTHOR_FETCH_TIMEOUT_MS = 8 * 1000;
-const GITHUB_FALLBACK_TIMEOUT_MS = 10 * 1000;
-const AUTHOR_PRIMARY_COOLDOWN_MS = 60 * 1000;
-let authorPrimaryFailures = 0;
-let authorPrimaryCooldownUntil = 0;
+const ADAPTER_FETCH_TIMEOUT_MS = 10 * 1000;
 let adapterLastGoodPersisted = null;
 
-function githubMirrorUrls(rawUrl) {
-    const match = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/.exec(rawUrl);
-    if (!match) return [];
-    return [
-        `https://cdn.jsdelivr.net/gh/${match[1]}/${match[2]}@${match[3]}/${match[4]}`,
-        `https://github.cmliussss.com/${rawUrl}`,
-        `https://github.090227.xyz/${rawUrl}`,
-    ];
+async function fetchAdapterText(url, timeoutMs) {
+    const response = await fetch(url, {
+        headers: { accept: 'application/json,text/plain' },
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: 'follow'
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = String(await response.text()).replace(/^\uFEFF/, '');
+    // 只采纳 JSON 合法的响应：网络设备/网关在故障时可能返回 200 + HTML
+    // 错误页，无校验时它会被当成适配清单交给解析器。非法内容按失败处理，
+    // 由 loadAdapterFresh 落到 R2 last-good 兜底。
+    JSON.parse(text);
+    return text;
 }
 
-// 竞速一组镜像 URL：任一候选成功即胜出，整体超时后放弃全部候选。
-// run(candidate, signal) 负责单个候选的拉取与内容校验，抛错即该候选出局，
-// 由下一个最快成功者补位。
-// 胜者绝不 abort：其返回值可能是尚未消费完的流式 Response（作者页面回源），
-// abort 会在运行时把未读完的正文流掐断（WHATWG fetch § Aborting——模拟实测：
-// 胜者 response.text() 抛 aborted by signal）。落选者与超时兜底照常中止。
-async function raceFirstOk(candidates, run, timeoutMs) {
-    const controllers = candidates.map(() => new AbortController());
-    const timer = setTimeout(() => { for (const c of controllers) c.abort(); }, timeoutMs);
-    let winnerIndex = -1;
-    try {
-        const winner = await Promise.any(candidates.map(async (candidate, index) => {
-            const value = await run(candidate, controllers[index].signal);
-            return { index, value };
-        }));
-        winnerIndex = winner.index;
-        for (let i = 0; i < controllers.length; i++) {
-            if (i !== winnerIndex) controllers[i].abort();
-        }
-        return winner.value;
-    } finally {
-        clearTimeout(timer);
-        for (let i = 0; i < controllers.length; i++) {
-            if (i !== winnerIndex) controllers[i].abort();
-        }
-    }
-}
-
-async function fetchGithubText(url, timeoutMs) {
-    const candidates = [url.href, ...githubMirrorUrls(url.href)];
-    // 只采纳 JSON 合法的候选：镜像在限流/故障时可能返回 200 + HTML 错误页，
-    // 无校验时它会赢下竞速并拖垮整个适配（线上症状：站点打开没有同步按钮
-    // 与密码页，刷新后恢复）。非法候选出局，由下一个最快成功者补位。
-    return raceFirstOk(
-        candidates,
-        async (candidate, signal) => {
-            const response = await fetch(candidate, { headers: { accept: 'application/json,text/plain' }, signal, redirect: 'follow' });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const text = String(await response.text()).replace(/^\uFEFF/, '');
-            JSON.parse(text);
-            return text;
-        },
-        timeoutMs
-    );
-}
-
+// 作者页面直连 GitHub Pages：任何状态码（含 304/4xx/5xx）原样交调用方处理，
+// 超时与网络错误直接抛出（与多源时代的整体失败语义一致，只是不再重试镜像）。
 async function fetchAuthorUpstream(path, init, search) {
     const rel = String(path || '').replace(/^\/+/, '');
-    if (Date.now() >= authorPrimaryCooldownUntil) {
-        const primaryUrl = new URL(rel, AUTHOR_BASE);
-        if (search) primaryUrl.search = search;
-        try {
-            const response = await fetch(primaryUrl, { ...init, signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS) });
-            if (response.ok || response.status === 304 || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
-                authorPrimaryFailures = 0;
-                return response;
-            }
-            authorPrimaryFailures += 1;
-        } catch (_) {
-            authorPrimaryFailures += 1;
-        }
-        if (authorPrimaryFailures >= 2) {
-            authorPrimaryFailures = 0;
-            authorPrimaryCooldownUntil = Date.now() + AUTHOR_PRIMARY_COOLDOWN_MS;
-        }
-    }
-    const candidates = githubMirrorUrls(AUTHOR_REPO_RAW + rel);
-    if (candidates.length === 0) throw new Error('作者站点不可用。');
-    return raceFirstOk(
-        candidates,
-        (candidate, signal) => fetch(candidate, { ...init, signal, redirect: 'follow' }).then((response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response;
-        }),
-        GITHUB_FALLBACK_TIMEOUT_MS
-    );
+    const url = new URL(rel, AUTHOR_BASE);
+    if (search) url.search = search;
+    return fetch(url, { ...init, signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS), redirect: 'follow' });
+}
+
+// 替换规则的 expectedMatches 缺省值在 validateAdapter 与 rewriteAuthorScript
+// 两处使用，必须保持同一解释。
+function expectedMatchesOf(item) {
+    return item.expectedMatches === undefined ? 1 : Number(item.expectedMatches);
 }
 
 function validateAdapter(adapter) {
@@ -150,7 +91,7 @@ function validateAdapter(adapter) {
             || typeof item.replace !== 'string' || !item.find.trim()) {
             throw new Error(`适配清单替换规则无效：${index}。`);
         }
-        const expected = item.expectedMatches === undefined ? 1 : Number(item.expectedMatches);
+        const expected = expectedMatchesOf(item);
         if (!Number.isInteger(expected) || expected < 0 || expected > 8) {
             throw new Error(`适配清单匹配数量无效：${item.name}。`);
         }
@@ -180,7 +121,7 @@ function resolveAdapterUrl(env) {
     } catch (_) {
         throw new Error('外部适配清单地址无效。');
     }
-    if (!['https:', 'http:', 'file:'].includes(url.protocol)) {
+    if (!['https:', 'file:'].includes(url.protocol)) {
         throw new Error('外部适配清单地址协议不受支持。');
     }
     return url;
@@ -203,17 +144,30 @@ async function loadAdapter(env) {
         if (!cached.value) throw new Error('适配清单读取失败：所有源均不可用。');
         return cached.value;
     }
-    try {
-        const adapter = await loadAdapterFresh(env, url);
-        adapterCache.set(url.href, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
-        return adapter;
-    } catch (err) {
-        // file:// 仅供本地测试（失败确定性高，不缓存）。
-        if (url.protocol !== 'file:') {
-            adapterCache.set(url.href, { value: null, expiresAt: Date.now() + ADAPTER_FAILURE_TTL_MS });
+    if (adapterLoads.has(url.href)) return adapterLoads.get(url.href);
+    const loading = (async () => {
+        try {
+            const loaded = await loadAdapterFresh(env, url);
+            // 复用旧 adapter 对象时必须顺带清空它的 sourceCheckCaches：改写
+            // 缓存（rewriteCaches）以 adapter 对象身份为键、由 sourceCheckResults
+            // 顺带填充——两处靠“同一对象 + 清空源检查缓存”隐式耦合，拆改需
+            // 保持该契约（例如把缓存收拢进 adapter 模块时一并处理）。
+            const adapter = cached?.value && adapterSources.get(cached.value) === adapterSources.get(loaded)
+                ? cached.value : loaded;
+            if (adapter === cached?.value) sourceCheckCaches.delete(adapter);
+            adapterCache.set(url.href, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
+            return adapter;
+        } catch (err) {
+            if (url.protocol !== 'file:') {
+                adapterCache.set(url.href, { value: null, expiresAt: Date.now() + ADAPTER_FAILURE_TTL_MS });
+            }
+            throw err;
+        } finally {
+            adapterLoads.delete(url.href);
         }
-        throw err;
-    }
+    })();
+    adapterLoads.set(url.href, loading);
+    return loading;
 }
 
 async function loadAdapterFresh(env, url) {
@@ -225,7 +179,7 @@ async function loadAdapterFresh(env, url) {
         source = String(await response.text()).replace(/^\uFEFF/, '');
     } else {
         try {
-            source = await fetchGithubText(url, GITHUB_FALLBACK_TIMEOUT_MS);
+            source = await fetchAdapterText(url, ADAPTER_FETCH_TIMEOUT_MS);
         } catch (_) {
             source = null;
         }
@@ -248,11 +202,12 @@ async function loadAdapterFresh(env, url) {
         throw error instanceof Error ? error : new Error('适配清单解析失败。');
     }
     if (!fromLastGood && url.protocol !== 'file:' && source !== adapterLastGoodPersisted && env?.[R2_BINDING]) {
-        adapterLastGoodPersisted = source;
         try {
             await env[R2_BINDING].put(ADAPTER_LASTGOOD_KEY, source, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+            adapterLastGoodPersisted = source;
         } catch (_) { /* 兜底缓存写入失败不影响服务 */ }
     }
+    adapterSources.set(adapter, source);
     return adapter;
 }
 
@@ -262,14 +217,18 @@ function rewriteAuthorScript(source, adapter) {
     if (!Array.isArray(replacements) || replacements.length === 0) {
         throw new Error('适配清单缺少脚本替换规则。');
     }
-    for (const item of replacements) {
-        const pattern = authorSourcePattern(item.find);
-        const matches = [...output.matchAll(pattern)].length;
-        const expected = item.expectedMatches === undefined ? 1 : Number(item.expectedMatches);
+    let rules = compiledReplacements.get(adapter);
+    if (!rules) {
+        rules = replacements.map(item => ({ ...item, pattern: authorSourcePattern(item.find) }));
+        compiledReplacements.set(adapter, rules);
+    }
+    for (const item of rules) {
+        let matches = 0;
+        output = output.replace(item.pattern, () => { matches += 1; return item.replace; });
+        const expected = expectedMatchesOf(item);
         if (matches !== expected) {
             throw new Error(`作者代码未匹配：${item.name}（${matches}/${expected}）`);
         }
-        output = output.replace(pattern, () => item.replace);
     }
     return output;
 }
@@ -318,6 +277,9 @@ const IMAGE_DELETE_MAX_TARGETS_PER_REQUEST = 20;
 const IMAGE_DELETE_MAX_KEYS_PER_REQUEST = 20;
 const IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST = 4;
 const IMAGE_MAX_BYTES = 64 * 1024 * 1024;
+// JSON/base64 同时持有编码文本与解码结果，不能沿用二进制接口的 64MiB 限额。
+const YNAI_MAX_BYTES = 16 * 1024 * 1024;
+const YNAI_JSON_MAX_BYTES = Math.ceil(YNAI_MAX_BYTES / 3) * 4 + 64 * 1024;
 const IMAGE_THUMB_MAX_BYTES = 2 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 300000;
 const IMAGE_DEFAULT_MODEL = 'nai-diffusion-4-5-full';
@@ -428,10 +390,16 @@ function isRequestAuthorized(request, env) {
     return providedPassword === expectedPassword;
 }
 
-async function handleAuthStatus(request, env) {
+// /api/rp-sync 与 /image/api/auth-status 共用同一响应形状；授权函数不同
+// （前者只认密码头，后者还认图库会话 cookie），由调用方传入。
+async function authStatusPayload(request, env, checkAuthorized) {
     const authRequired = Boolean(getSyncPassword(env));
-    const authenticated = !authRequired || await isRequestAuthorized(request, env);
-    return json({ ok: true, authRequired, authenticated });
+    const authenticated = !authRequired || await checkAuthorized(request, env);
+    return { ok: true, authRequired, authenticated };
+}
+
+async function handleAuthStatus(request, env) {
+    return json(await authStatusPayload(request, env, isRequestAuthorized));
 }
 
 function getBucket(env) {
@@ -456,8 +424,8 @@ function sanitizeImageKeySegment(value, fallback = '未命名角色') {
     return normalized || fallback;
 }
 
-// 生图提供商由密钥决定：YNAI- 前缀 → ynai 中转，否则 sta1n；无 token 的读取
-// 请求退回 URL provider 参数（魔改层在读取与生成 URL 里都会带上）。
+// 生图提供商由密钥决定：YNAI- 前缀 → ynai 中转，否则 sta1n。URL 不携带
+// provider 参数：历史链接残留的 provider 值会被忽略，provider 不参与缓存键。
 function isYnaiImageToken(token) {
     return String(token || '').trim().toUpperCase().startsWith('YNAI-');
 }
@@ -483,6 +451,9 @@ function applyImageParamDefaults(params, token, characterName, ynaiDefaultModel 
 function buildImageParams(url, token, ynaiDefaultModel = null) {
     const params = {};
     for (const key of IMAGE_PARAM_KEYS) {
+        // provider 不从 URL 读取：applyImageParamDefaults 按密钥恒定重算，
+        // URL 里是否携带 provider 对行为与缓存键都没有影响。
+        if (key === 'provider') continue;
         params[key] = normalizeImageParam(url.searchParams.get(key));
     }
     params.reroll_nonce = normalizeImageParam(url.searchParams.get('reroll_nonce'), 120);
@@ -652,6 +623,54 @@ function imageResponse(body, contentType, extraHeaders = {}) {
 
 // ynai 中转是 OpenAI images 形状：POST JSON、b64_json 应答，解码成 PNG 字节后
 // 与 sta1n 路径共用同一套 R2 存储/墓碑/缩略图逻辑。
+async function readBoundedJson(response, maxBytes, signal) {
+    const reader = response.body?.getReader();
+    const cancel = () => { if (reader) void reader.cancel().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
+    let text = '';
+    let total = 0;
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    try {
+        if (Number(response.headers.get('content-length')) > maxBytes) {
+            throw Object.assign(new Error('JSON 响应超过大小上限。'), { status: 413 });
+        }
+        while (reader) {
+            if (signal?.aborted) throw new Error('Image fetch timed out.');
+            const { done, value } = await reader.read();
+            if (signal?.aborted) throw new Error('Image fetch timed out.');
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) throw Object.assign(new Error('JSON 响应超过大小上限。'), { status: 413 });
+            text += decoder.decode(value, { stream: true });
+        }
+        return JSON.parse(text + decoder.decode());
+    } catch (error) {
+        cancel();
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', cancel);
+        reader?.releaseLock();
+    }
+}
+
+function decodeImageBase64(encoded) {
+    if (typeof encoded !== 'string' || !encoded.length) throw new Error('图片编码为空。');
+    if (encoded.length > Math.ceil(YNAI_MAX_BYTES / 3) * 4) {
+        throw Object.assign(new Error('YNAI 图片超过 16MiB 上限。'), { status: 413 });
+    }
+    let bytes;
+    if (typeof Uint8Array.fromBase64 === 'function') {
+        bytes = Uint8Array.fromBase64(encoded);
+    } else {
+        const binary = atob(encoded);
+        bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    }
+    if (bytes.byteLength > YNAI_MAX_BYTES) throw Object.assign(new Error('YNAI 图片超过 16MiB 上限。'), { status: 413 });
+    if (!bytes.byteLength) throw new Error('图片编码为空。');
+    return bytes;
+}
+
 async function fetchYnaiGeneratedImage(params, token, ynai) {
     return fetchImageWithTimeout(ynai.base + ynai.generatePath, {
         method: 'POST',
@@ -675,23 +694,17 @@ async function fetchYnaiGeneratedImage(params, token, ynai) {
                 noise_schedule: params.noise_schedule
             }
         })
-    }, async (upstreamResponse) => {
+    }, async (upstreamResponse, signal) => {
         if (!upstreamResponse.ok) {
-            return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
+            return error(`生图服务返回异常：HTTP ${upstreamResponse.status}`, upstreamResponse.status);
         }
-        const payload = await upstreamResponse.json().catch(() => null);
-        const encoded = payload?.data?.[0]?.b64_json;
-        if (!encoded) return error('\u751f\u56fe\u670d\u52a1\u6ca1\u6709\u8fd4\u56de\u56fe\u7247\u3002', 502);
-        let binary;
         try {
-            binary = Uint8Array.from(atob(encoded), ch => ch.charCodeAt(0));
-        } catch (_) {
-            return error('\u751f\u56fe\u670d\u52a1\u56fe\u7247\u6570\u636e\u65e0\u6548\u3002', 502);
+            const payload = await readBoundedJson(upstreamResponse, YNAI_JSON_MAX_BYTES, signal);
+            return { bytes: decodeImageBase64(payload?.data?.[0]?.b64_json), contentType: 'image/png' };
+        } catch (err) {
+            if (signal.aborted) throw err;
+            return error(err.status === 413 ? err.message : '生图服务图片数据无效。', err.status === 413 ? 413 : 502);
         }
-        if (binary.byteLength > IMAGE_MAX_BYTES) {
-            return error(`\u56fe\u7247\u8fc7\u5927\uff1a${binary.byteLength}/${IMAGE_MAX_BYTES}`, 413);
-        }
-        return { bytes: binary, contentType: 'image/png' };
     });
 }
 
@@ -719,10 +732,11 @@ async function handleImageModels(request, env) {
     } catch (_) {
         return error('\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002', 503);
     }
-    const text = await response.text();
     if (!response.ok) {
+        try { await response.body?.cancel(); } catch (_) { }
         return error(`\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff1aHTTP ${response.status}`, response.status);
     }
+    const text = await response.text();
     let data;
     try {
         const parsed = JSON.parse(text);
@@ -998,6 +1012,7 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
   <main>
     <div id="notice" class="notice"></div>
     <div id="library"></div>
+    <button id="loadMore" class="btn hidden">加载下一批图片</button>
   </main>
 </section>
 <section id="viewer" class="viewer hidden">
@@ -1039,6 +1054,9 @@ var previewList=[];
 var previewIndex=-1;
 var characterRenderLimits=Object.create(null);
 var deleteBusy=false;
+var libraryCursor=null;
+var libraryLoading=false;
+var loadMoreButton=document.getElementById('loadMore');
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function pass(){return localStorage.getItem(passwordStorageKey)||'';}
 function savePass(value){localStorage.setItem(passwordStorageKey,value);}
@@ -1071,10 +1089,85 @@ function refreshLibraryStats(){var images=(data&&data.characters||[]).flatMap(fu
 function removeDeletedImages(payload){var keys=new Set(payload.keys||[]);var names=new Set(payload.characterNames||[]);data.characters=data.characters.map(function(character){var images=names.has(character.name)?[]:(character.images||[]).filter(function(image){return !keys.has(image.key);});if(!images.length)return null;var size=images.reduce(function(total,image){return total+(Number(image.size)||0);},0);return Object.assign({},character,{images:images,count:images.length,size:size,sizeHuman:formatBytes(size)});}).filter(Boolean);selected.clear();resetCharacterRenderLimits();refreshLibraryStats();render();}
 function render(){if(!data)return;var q=filter.value.trim().toLowerCase();var characters=data.characters.filter(function(c){return !q||c.name.toLowerCase().includes(q);});var total=characters.reduce(function(sum,c){return sum+(c.images||[]).length;},0);if(!total){library.innerHTML='<div class="empty">\u6ca1\u6709\u56fe\u7247</div>';syncToolbar();return;}var html=[];characters.forEach(function(c){var images=c.images||[];if(!images.length)return;var limit=getCharacterRenderLimit(c.name);var shown=images.slice(0,limit);var remaining=Math.max(0,images.length-shown.length);var imgs=shown.map(function(img){var selectedClass=selected.has(img.key)?' selected':'';return '<button class="photo'+selectedClass+'" data-key="'+esc(img.key)+'"><img loading="lazy" decoding="async" src="'+esc(thumbUrl(img.key))+'" onerror="thumbFailed(this)" alt=""><span class="photo-check"></span><span class="photo-info">'+esc(img.sizeHuman)+'</span></button>';}).join('');var more=remaining>0?'<button class="album-more" data-character="'+esc(c.name)+'" data-total="'+images.length+'">\u663e\u793a\u66f4\u591a '+Math.min(albumPageSize(),remaining)+'</button>':'';var actionText=c.count>0?'\u6e05\u7a7a\u672c\u7ec4 ('+c.count+')':'\u6e05\u7a7a\u672c\u7ec4';var actions='<div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="'+esc(c.name)+'" data-count="'+esc(c.count)+'">'+actionText+'</button></div>'+more+'</div>';html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">'+esc(c.name)+'</div><div class="album-meta">'+shown.length+' / '+c.count+' \u5f20 \u00b7 '+esc(c.sizeHuman)+'</div></div></div><div class="gallery">'+imgs+'</div>'+actions+'</section>');});library.innerHTML=html.join('');syncToolbar();scheduleThumbBackfill();}
 function setDeleteMode(value){deleteMode=!!value;selected.clear();library.querySelectorAll('.photo.selected').forEach(function(tile){tile.classList.remove('selected');});syncToolbar();}
-async function load(){if(deleteBusy)return;var scrollPosition=window.scrollY;setNotice('');stats.textContent='\u6b63\u5728\u8bfb\u53d6...';syncToolbar();refreshButton.disabled=true;try{data=await api('/image/api/library',{method:'GET'});var keys=new Set(visibleImages().map(function(image){return image.key;}));selected.forEach(function(key){if(!keys.has(key))selected.delete(key);});stats.textContent=data.totalCount+' \u5f20\u56fe\u7247 / '+data.totalHuman;render();requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});}catch(e){stats.textContent='\u8bfb\u53d6\u5931\u8d25';if(!data)library.innerHTML='<div class="empty">'+esc(e.message)+'</div>';setNotice(e.message,true);}finally{refreshButton.disabled=deleteBusy;}}
+async function load(append){
+    if(deleteBusy||libraryLoading)return;
+    libraryLoading=true;
+    var scrollPosition=window.scrollY;
+    setNotice('');
+    syncToolbar();
+    refreshButton.disabled=true;
+    loadMoreButton.disabled=true;
+    try{
+        var path='/image/api/library'+(append&&libraryCursor?'?cursor='+encodeURIComponent(libraryCursor):'');
+        var page=await api(path,{method:'GET'});
+        if(!append)data={characters:[]};
+        var groups=new Map((data.characters||[]).map(function(c){return [c.name,c];}));
+        (page.characters||[]).forEach(function(c){
+            var prior=groups.get(c.name);
+            if(!prior){groups.set(c.name,c);return;}
+            var images=new Map(prior.images.map(function(img){return [img.key,img];}));
+            c.images.forEach(function(img){images.set(img.key,img);});
+            prior.images=Array.from(images.values());
+            prior.count=prior.images.length;
+            prior.size=prior.images.reduce(function(n,img){return n+img.size;},0);
+            prior.sizeHuman=formatBytes(prior.size);
+        });
+        data.characters=Array.from(groups.values());
+        libraryCursor=page.cursor||null;
+        refreshLibraryStats();
+        if(libraryCursor)stats.textContent+='（已加载，尚有更多）';
+        loadMoreButton.classList.toggle('hidden',!libraryCursor);
+        if(libraryCursor&&filter.value)setNotice('搜索当前已加载图片；可继续加载下一批。');
+        render();
+        requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});
+    }catch(e){setNotice(e.message,true);}
+    finally{libraryLoading=false;refreshButton.disabled=deleteBusy;loadMoreButton.disabled=false;}
+}
+loadMoreButton.onclick=function(){load(true);};
 var deleteChunkSize=20;
-async function deletePayload(payload,message){if(deleteBusy||!confirm(message||'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002'))return;deleteBusy=true;var previousCharacters=data&&data.characters;var previousSelected=new Set(selected);var previousLimits=Object.assign({},characterRenderLimits);removeDeletedImages(payload);var accepted=[],deletedCount=0,deletedBytes=0,failedCount=0,queue=[];function pushKeyChunks(keys){for(var start=0;start<keys.length;start+=deleteChunkSize)queue.push({keys:keys.slice(start,start+deleteChunkSize)});}try{if(payload.characterNames&&payload.characterNames.length){queue.push({characterNames:payload.characterNames.slice(0,4)});}else{var seenKeys=new Set();pushKeyChunks((payload.keys||[]).filter(function(key){if(seenKeys.has(key))return false;seenKeys.add(key);return true;}));}for(var index=0;index<queue.length;index+=1){var r=await api('/image/api/delete',{method:'POST',body:JSON.stringify(queue[index])});deletedCount+=r.deletedCount||0;deletedBytes+=r.deletedBytes||0;failedCount+=r.failedCount||0;(r.acceptedKeys||[]).forEach(function(key){accepted.push(key);});pushKeyChunks(r.remainingKeys||[]);}if(failedCount){data.characters=previousCharacters;characterRenderLimits=previousLimits;removeDeletedImages({keys:accepted});}setNotice('\u5df2\u5220\u9664 '+deletedCount+' \u5f20 / '+formatBytes(deletedBytes)+(failedCount?'\uff0c'+failedCount+' \u5f20\u672a\u5b8c\u6210':''),failedCount>0);}catch(e){data.characters=previousCharacters;characterRenderLimits=previousLimits;if(accepted.length){removeDeletedImages({keys:accepted});}else{selected=previousSelected;refreshLibraryStats();render();}setNotice(e.message,true);}finally{deleteBusy=false;syncToolbar();}}
-function deleteCharacterImages(characterName,count){if(!characterName)return;deletePayload({characterNames:[characterName]},'\u786e\u5b9a\u6e05\u7a7a\u300c'+characterName+'\u300d\u4e0b\u7684 '+(Number(count)||0)+' \u5f20\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');}
+async function deletePayload(payload,message){
+    if(deleteBusy||libraryLoading||!confirm(message||'确定删除选中的图片吗？删除后旧链接不会重新生图。'))return;
+    deleteBusy=true;
+    var previousCharacters=data&&data.characters;
+    var previousSelected=new Set(selected);
+    var previousLimits=Object.assign({},characterRenderLimits);
+    removeDeletedImages(payload);
+    var accepted=[],deletedCount=0,deletedBytes=0,queue=[];
+    function accept(r){
+        deletedCount+=r.deletedCount||0;
+        deletedBytes+=r.deletedBytes||0;
+        (r.acceptedKeys||[]).forEach(function(key){accepted.push(key);});
+    }
+    async function send(body){return api('/image/api/delete',{method:'POST',body:JSON.stringify(body)});}
+    try{
+        if(payload.characterNames&&payload.characterNames.length){
+            queue.push({characterNames:payload.characterNames.slice(0,4)});
+        }else{
+            var keys=Array.from(new Set(payload.keys||[]));
+            for(var start=0;start<keys.length;start+=deleteChunkSize)queue.push({keys:keys.slice(start,start+deleteChunkSize)});
+        }
+        for(var index=0;index<queue.length;index+=1){
+            var r=await send(queue[index]);
+            accept(r);
+            if(r.remainingKeys&&r.remainingKeys.length){
+                var retry=await send({keys:r.remainingKeys});
+                accept(retry);
+                if(retry.failedCount)throw new Error('部分删除标记仍未写入，未完成的图片已保留，请重试。');
+            }else if(r.failedCount){
+                throw new Error('部分图片未完成删除，请重试。');
+            }
+            if(r.continuation)queue.push(r.continuation);
+        }
+        setNotice('已删除 '+deletedCount+' 张 / '+formatBytes(deletedBytes));
+    }catch(e){
+        data.characters=previousCharacters;
+        characterRenderLimits=previousLimits;
+        if(accepted.length){removeDeletedImages({keys:accepted});}
+        else{selected=previousSelected;refreshLibraryStats();render();}
+        setNotice(e.message,true);
+    }finally{deleteBusy=false;syncToolbar();}
+}
+function deleteCharacterImages(characterName,count){if(!characterName)return;deletePayload({characterNames:[characterName]},'\u786e\u5b9a\u6e05\u7a7a\u300c'+characterName+'\u300d\u4e0b\u7684 '+(Number(count)||0)+' 张已加载图片及本组未加载图片吗？\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');}
 function openViewer(key){previewList=visibleImages();previewIndex=previewList.findIndex(function(img){return img.key===key;});if(previewIndex<0)previewIndex=0;renderViewer();viewer.classList.remove('hidden');}
 function closeViewer(){viewer.classList.add('hidden');}
 function moveViewer(delta){if(!previewList.length)return;previewIndex=(previewIndex+delta+previewList.length)%previewList.length;renderViewer();}
@@ -1083,11 +1176,11 @@ function renderViewer(){var img=previewList[previewIndex];if(!img)return;viewerI
 document.getElementById('login').onclick=enter;
 backButton.onclick=function(){location.href='/';};
 passwordInput.onkeydown=function(e){if(e.key==='Enter')enter();};
-refreshButton.onclick=load;
+refreshButton.onclick=function(){load(false);};
 deleteModeButton.onclick=function(){setDeleteMode(true);};
 cancelDeleteButton.onclick=function(){setDeleteMode(false);};
 deleteSelectedButton.onclick=function(){deletePayload({keys:Array.from(selected)},'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684 '+selected.size+' \u5f20\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');};
-filter.oninput=function(){resetCharacterRenderLimits();render();};
+filter.oninput=function(){resetCharacterRenderLimits();render();if(libraryCursor)setNotice('搜索当前已加载图片；可继续加载下一批。');};
 library.onclick=function(e){var clear=e.target.closest('.album-clear');if(clear){deleteCharacterImages(clear.dataset.character,clear.dataset.count);return;}var more=e.target.closest('.album-more');if(more){increaseCharacterRenderLimit(more.dataset.character,Number(more.dataset.total)||0);render();return;}var tile=e.target.closest('.photo');if(!tile)return;var key=tile.dataset.key;if(deleteMode){if(selected.has(key))selected.delete(key);else selected.add(key);tile.classList.toggle('selected',selected.has(key));syncToolbar();return;}openViewer(key);};
 library.addEventListener('load',function(e){if(e.target&&e.target.matches&&e.target.matches('img[data-needs-thumb="1"]'))queueThumbBackfill(e.target);},true);
 document.getElementById('closeViewer').onclick=closeViewer;
@@ -1157,68 +1250,27 @@ function normalizeImageObject(object) {
     };
 }
 
-async function listImageObjects(bucket, prefix = `${IMAGE_OBJECT_PREFIX}/`) {
-    const rawObjects = [];
-    let cursor;
-    do {
-        const page = await bucket.list({
-            prefix,
-            cursor,
-            limit: 1000
-        });
-        for (const object of page.objects || []) {
-            rawObjects.push(object);
-        }
-        cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    return rawObjects.map(normalizeImageObject);
+async function listImageObjects(bucket, prefix = `${IMAGE_OBJECT_PREFIX}/`, cursor, limit = 40) {
+    const page = await bucket.list({ prefix, cursor: cursor || undefined, limit });
+    const nextCursor = getNextSyncCursor(page, cursor || undefined);
+    return { objects: (page.objects || []).map(normalizeImageObject), cursor: nextCursor || null };
 }
 
-async function listImageTombstoneKeys(bucket) {
-    const keys = new Set();
-    let cursor;
-    do {
-        const page = await bucket.list({ prefix: `${IMAGE_DELETED_PREFIX}/`, cursor, limit: 1000 });
-        for (const object of page.objects || []) keys.add(object.key);
-        cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    return keys;
-}
-
-async function getImageDeleteTargets(bucket, keys, characterNames) {
-    // Existence is resolved with one listing per character directory instead
-    // of a per-key head, so the subrequest count scales with distinct
-    // characters rather than with the number of selected images.
-    const directories = new Map();
-    for (const key of keys) {
-        if (!isValidImageObjectKey(key)) continue;
-        const characterName = getImageCharacterFromKey(key);
-        if (!characterName) continue;
-        const directory = directories.get(characterName) || { includeAll: false, requestedKeys: new Set() };
-        directory.requestedKeys.add(key);
-        directories.set(characterName, directory);
+async function getImageDeleteTargets(bucket, keys, characterNames, cursor) {
+    if (characterNames.length) {
+        const name = sanitizeImageKeySegment(characterNames[0]);
+        const page = await listImageObjects(bucket, `${IMAGE_OBJECT_PREFIX}/${name}/`, cursor, IMAGE_DELETE_MAX_TARGETS_PER_REQUEST);
+        return {
+            targets: page.objects,
+            continuation: page.cursor ? { characterNames, cursor: page.cursor }
+                : characterNames.length > 1 ? { characterNames: characterNames.slice(1) } : null
+        };
     }
-    for (const name of characterNames) {
-        const characterName = sanitizeImageKeySegment(name);
-        if (!characterName) continue;
-        const directory = directories.get(characterName) || { includeAll: false, requestedKeys: new Set() };
-        directory.includeAll = true;
-        directories.set(characterName, directory);
-    }
-    const names = [...directories.keys()];
-    const groups = await runConcurrent(names, 4, name => (
-        listImageObjects(bucket, `${IMAGE_OBJECT_PREFIX}/${name}/`)
-    ));
-    const targets = new Map();
-    groups.forEach((objects, index) => {
-        const directory = directories.get(names[index]);
-        for (const object of objects) {
-            if (directory.includeAll || directory.requestedKeys.has(object.key)) {
-                targets.set(object.key, object);
-            }
-        }
+    const objects = await runConcurrent(keys.filter(isValidImageObjectKey), 6, async key => {
+        const object = await bucket.head(key);
+        return object ? normalizeImageObject({ ...object, key }) : null;
     });
-    return [...targets.values()];
+    return { targets: objects.filter(Boolean), continuation: null };
 }
 
 function buildImageLibrary(objects) {
@@ -1285,13 +1337,11 @@ async function handleImageAdmin(request, env, url, ctx) {
         return imageAdminHtml();
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/auth-status`) {
-        const password = getSyncPassword(env);
-        const authRequired = Boolean(password);
-        const authenticated = !authRequired || await isImageAdminAuthorized(request, env);
-        const headers = authRequired && authenticated
-            ? { 'set-cookie': imageAdminSessionCookie(await imageAdminSessionToken(password)) }
+        const status = await authStatusPayload(request, env, isImageAdminAuthorized);
+        const headers = status.authRequired && status.authenticated
+            ? { 'set-cookie': imageAdminSessionCookie(await imageAdminSessionToken(getSyncPassword(env))) }
             : {};
-        return json({ ok: true, authRequired, authenticated }, 200, headers);
+        return json(status, 200, headers);
     }
     if (!await isImageAdminAuthorized(request, env)) {
         return error('Sync password required.', 401, { authRequired: true });
@@ -1299,23 +1349,23 @@ async function handleImageAdmin(request, env, url, ctx) {
 
     const bucket = getBucket(env);
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/library`) {
-        const [allObjects, tombstoneKeys] = await Promise.all([
-            listImageObjects(bucket),
-            listImageTombstoneKeys(bucket)
-        ]);
-        const staleObjects = [];
-        const objects = allObjects.filter(object => {
-            const deleted = tombstoneKeys.has(object.deletedKey);
-            if (deleted) staleObjects.push(object);
-            return !deleted;
-        });
+        const cursor = url.searchParams.get('cursor') || undefined;
+        if (cursor && cursor.length > 4096) return error('图库游标无效。', 400);
+        const page = await listImageObjects(bucket, undefined, cursor);
+        const checked = await runConcurrent(page.objects, 6, async object => ({
+            object, deleted: object.deletedKey ? Boolean(await bucket.head(object.deletedKey)) : false
+        }));
+        const staleObjects = checked.filter(item => item.deleted).map(item => item.object);
+        const objects = checked.filter(item => !item.deleted).map(item => item.object);
         if (staleObjects.length) {
             const cleanup = deleteImageObjectFiles(bucket, staleObjects);
             if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(cleanup);
+            else await cleanup;
         }
         const totalBytes = objects.reduce((sum, object) => sum + object.size, 0);
         return json({
             ok: true,
+            cursor: page.cursor,
             totalCount: objects.length,
             totalBytes,
             totalHuman: formatBytes(totalBytes),
@@ -1364,11 +1414,14 @@ async function handleImageAdmin(request, env, url, ctx) {
         if (characterNames.length > IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST) {
             return error(`单次最多清空 ${IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST} 个角色分组，请分批删除。`, 400);
         }
-        const targets = await getImageDeleteTargets(bucket, keys, characterNames);
-        // 超出单次预算的目标以 remainingKeys 返回，由客户端继续分批提交。
-        const processTargets = targets.slice(0, IMAGE_DELETE_MAX_TARGETS_PER_REQUEST);
-        const remainingTargets = targets.slice(IMAGE_DELETE_MAX_TARGETS_PER_REQUEST);
-        const tombstoneResults = await runConcurrent(processTargets, 8, async (object) => {
+        if (keys.some(key => typeof key !== 'string' || !isValidImageObjectKey(key))
+            || characterNames.some(name => typeof name !== 'string' || !name)
+            || (keys.length && characterNames.length)
+            || (body.cursor !== undefined && (typeof body.cursor !== 'string' || body.cursor.length > 4096))) {
+            return error('删除参数无效。', 400);
+        }
+        const { targets: processTargets, continuation } = await getImageDeleteTargets(bucket, keys, characterNames, body.cursor);
+        const tombstoneResults = await runConcurrent(processTargets, 6, async (object) => {
             try {
                 await writeImageTombstone(bucket, object.key);
                 return { object, accepted: true };
@@ -1391,7 +1444,8 @@ async function handleImageAdmin(request, env, url, ctx) {
             deletedCount: acceptedTargets.length,
             deletedBytes,
             failedCount,
-            remainingKeys: remainingTargets.map(object => object.key)
+            remainingKeys: tombstoneResults.filter(result => !result.accepted).map(result => result.object.key),
+            continuation
         });
     }
     return error('Not found.', 404);
@@ -1624,6 +1678,14 @@ async function handleInitializeStorage(bucket, body) {
     return json({ ok: true, resetRequired: false });
 }
 
+// 末页允许不满页：pack 数按 pageIndex 推导。normalizeManifestPage（读取侧）
+// 与 handleUploadManifestPage（上传侧）共用同一推导，防止两处各写一份漂移。
+function manifestPagePackCount(pageIndex, pageCount, packCount) {
+    return pageIndex === pageCount - 1
+        ? packCount - pageIndex * MANIFEST_PAGE_PACKS
+        : MANIFEST_PAGE_PACKS;
+}
+
 function normalizeManifestPage(value, root, pageIndex) {
     if (!value || typeof value !== 'object' || value.format !== MANIFEST_PAGE_FORMAT) return null;
     if (value.checksum !== root.checksum || Number(value.pageIndex) !== pageIndex) return null;
@@ -1631,10 +1693,7 @@ function normalizeManifestPage(value, root, pageIndex) {
     const pageHash = String(value.pageHash || '').toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(previousPageHash) || !/^[a-f0-9]{64}$/.test(pageHash)) return null;
     if (!Array.isArray(value.packs) || !value.packs.length || value.packs.length > MANIFEST_PAGE_PACKS) return null;
-    const expectedLength = pageIndex === root.pageCount - 1
-        ? root.packCount - pageIndex * MANIFEST_PAGE_PACKS
-        : MANIFEST_PAGE_PACKS;
-    if (value.packs.length !== expectedLength) return null;
+    if (value.packs.length !== manifestPagePackCount(pageIndex, root.pageCount, root.packCount)) return null;
     let packs;
     try {
         packs = value.packs.map((pack, index) => normalizePackEntry(pack, pageIndex * MANIFEST_PAGE_PACKS + index));
@@ -1754,7 +1813,6 @@ function createSyncRequestReader(request, maxBytes) {
     }
 
     return {
-        declaredLength,
         readChunk,
         async dispose() {
             if (!reader) return;
@@ -1793,6 +1851,17 @@ async function readSyncJsonBody(request) {
     }
 }
 
+// upload-pack 与 upload-bloom 共用的二进制上传信封校验：不合法时返回
+// error Response，合法时返回 null。两端各自的错误文案原样保留。
+function binaryUploadEnvelopeError(request, expectedLength, noun, mismatchMessage) {
+    const contentType = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (contentType !== 'application/octet-stream') return error(`${noun}必须使用二进制格式。`, 415);
+    const contentLength = request.headers.get('content-length');
+    if (contentLength !== null && Number(contentLength) !== expectedLength) return error(mismatchMessage, 409);
+    if (!request.body) return error(`${noun}正文为空。`, 400);
+    return null;
+}
+
 async function handleUploadPack(request, bucket, url) {
     const uploadId = String(url.searchParams.get('uploadId') || '');
     const checksum = String(url.searchParams.get('checksum') || '').toLowerCase();
@@ -1806,13 +1875,8 @@ async function handleUploadPack(request, bucket, url) {
     if (!Number.isInteger(entryCount) || entryCount < 0 || entryCount > MAX_PACK_ENTRIES) {
         return error('上传数据包记录数量异常。', 409);
     }
-    const contentType = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType !== 'application/octet-stream') return error('上传数据包必须使用二进制格式。', 415);
-    const contentLength = request.headers.get('content-length');
-    if (contentLength !== null && Number(contentLength) !== length) {
-        return error('上传数据包长度与声明不一致。', 409);
-    }
-    if (!request.body) return error('上传数据包正文为空。', 400);
+    const envelopeError = binaryUploadEnvelopeError(request, length, '上传数据包', '上传数据包长度与声明不一致。');
+    if (envelopeError) return envelopeError;
     if (!await bucket.head(createUploadSessionKey(uploadId))) {
         if (request.body.cancel) await request.body.cancel();
         return error('上传会话不存在或已过期。', 409);
@@ -1842,6 +1906,7 @@ function normalizeUploadSession(value) {
         baseVersion: Number(value.baseVersion),
         baseChecksum: String(value.baseChecksum || ''),
         baseEtag: typeof value.baseEtag === 'string' ? value.baseEtag : null,
+        gcGeneration: typeof value.gcGeneration === 'string' ? value.gcGeneration : '',
         totalBytes: Number(value.totalBytes),
         packCount: Number(value.packCount),
         entryCount: Number(value.entryCount),
@@ -1890,6 +1955,16 @@ function uploadSessionInfo(session) {
 }
 
 async function handleBeginUpload(bucket, body) {
+    const lock = await acquireMutationLock(bucket);
+    if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
+    try {
+        return await beginUploadLocked(bucket, body);
+    } finally {
+        await releaseMutationLock(bucket, lock);
+    }
+}
+
+async function beginUploadLocked(bucket, body) {
     const checksum = String(body.checksum || '').toLowerCase();
     const bloomChecksum = String(body.bloomChecksum || '').toLowerCase();
     const pageRoot = String(body.pageRoot || '').toLowerCase();
@@ -1931,17 +2006,19 @@ async function handleBeginUpload(bucket, body) {
         return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
     }
 
+    const gcGeneration = await readGcGeneration(bucket);
     const existing = await readUploadSession(bucket, checksum);
     if (existing) {
         const session = existing.session;
-        if (session.baseVersion !== baseVersion || session.baseChecksum !== baseChecksum
-            || session.baseEtag !== manifestState.etag || session.bloomChecksum !== bloomChecksum
-            || session.totalBytes !== totalBytes || session.packCount !== packCount
-            || session.entryCount !== entryCount || session.pageCount !== pageCount
-            || session.pageRoot !== pageRoot) {
+        if (session.bloomChecksum !== bloomChecksum || session.totalBytes !== totalBytes
+            || session.packCount !== packCount || session.entryCount !== entryCount
+            || session.pageCount !== pageCount || session.pageRoot !== pageRoot) {
             return error('同一快照存在不兼容的上传会话。', 409);
         }
-        return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
+        if (session.baseVersion === baseVersion && session.baseChecksum === baseChecksum
+            && session.baseEtag === manifestState.etag && session.gcGeneration === gcGeneration) {
+            return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
+        }
     }
 
     const now = Date.now();
@@ -1953,6 +2030,7 @@ async function handleBeginUpload(bucket, body) {
         baseVersion,
         baseChecksum,
         baseEtag: manifestState.etag,
+        gcGeneration,
         totalBytes,
         packCount,
         entryCount,
@@ -1971,11 +2049,14 @@ async function handleBeginUpload(bucket, body) {
     };
     const stored = await bucket.put(createUploadSessionKey(checksum), JSON.stringify(session), {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
-        onlyIf: { etagDoesNotMatch: '*' }
+        onlyIf: existing ? { etagMatches: existing.etag } : { etagDoesNotMatch: '*' }
     });
     if (!stored) {
         const raced = await readUploadSession(bucket, checksum);
         if (!raced) return error('上传会话创建失败。', 503);
+        if (raced.session.baseEtag !== manifestState.etag || raced.session.gcGeneration !== gcGeneration) {
+            return error('上传会话已变化，请重新检查后上传。', 409);
+        }
         return json({ ok: true, committed: false, ...uploadSessionInfo(raced.session) });
     }
     return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
@@ -1995,10 +2076,9 @@ async function handleUploadManifestPage(bucket, body) {
         return error('上传清单页顺序无效。', 409, uploadSessionInfo(session));
     }
     if (!Array.isArray(body.packs)) return error('上传清单页无效。', 409);
-    const expectedLength = pageIndex === session.pageCount - 1
-        ? session.packCount - pageIndex * MANIFEST_PAGE_PACKS
-        : MANIFEST_PAGE_PACKS;
-    if (body.packs.length !== expectedLength) return error('上传清单页数量异常。', 409);
+    if (body.packs.length !== manifestPagePackCount(pageIndex, session.pageCount, session.packCount)) {
+        return error('上传清单页数量异常。', 409);
+    }
 
     const packs = body.packs.map((pack, index) => normalizePackEntry(
         pack, pageIndex * MANIFEST_PAGE_PACKS + index
@@ -2106,13 +2186,8 @@ async function handleUploadBloom(request, bucket, url) {
     if (!/^[a-f0-9]{64}$/.test(uploadId)) return error('上传会话无效。', 400);
     const stored = await readUploadSession(bucket, uploadId);
     if (!stored) return error('上传会话不存在或已过期。', 409);
-    const contentType = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (contentType !== 'application/octet-stream') return error('上传过滤器必须使用二进制格式。', 415);
-    const contentLength = request.headers.get('content-length');
-    if (contentLength !== null && Number(contentLength) !== GC_BLOOM_BYTES) {
-        return error('上传过滤器大小异常。', 409);
-    }
-    if (!request.body) return error('上传过滤器正文为空。', 400);
+    const envelopeError = binaryUploadEnvelopeError(request, GC_BLOOM_BYTES, '上传过滤器', '上传过滤器大小异常。');
+    if (envelopeError) return envelopeError;
     const key = createManifestBloomKey(stored.session.bloomChecksum);
     await bucket.put(key, request.body, {
         sha256: checksumBytes(stored.session.bloomChecksum),
@@ -2177,6 +2252,9 @@ async function handleFinalizeUpload(bucket, body) {
             || manifestState.etag !== session.baseEtag) {
             return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
         }
+        if (session.gcGeneration !== await readGcGeneration(bucket)) {
+            return error('分片回收后需要重新核对本地清单。', 409, { recheckRequired: true });
+        }
         try {
             await readBloomFilter(bucket, session);
         } catch (err) {
@@ -2223,6 +2301,11 @@ async function readBloomFilter(bucket, root) {
     return bytes;
 }
 
+async function readGcGeneration(bucket) {
+    const state = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
+    return typeof state?.value?.generation === 'string' ? state.value.generation : '';
+}
+
 async function handleGcStep(bucket) {
     const lock = await acquireMutationLock(bucket);
     if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
@@ -2252,13 +2335,23 @@ async function handleGcStep(bucket) {
                     : Date.parse(String(uploaded || ''));
             if (Number.isFinite(uploadedAt) && uploadedAt < cutoff) candidates.push(key);
         }
-        if (candidates.length) await bucket.delete(candidates);
-        await bucket.put(GC_STATE_KEY, JSON.stringify({
+        const nextState = {
             format: 'rp-sync-gc-state-v1',
             rootChecksum: root.checksum,
+            generation: candidates.length ? crypto.randomUUID() : (storedState?.value?.generation || ''),
             cursor: nextCursor,
             updatedAt: Date.now()
-        }), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+        };
+        if (candidates.length) {
+            // 先使旧验证失效，再删除；中断时保留原游标，下次可重试同一页。
+            await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, cursor }), {
+                httpMetadata: { contentType: 'application/json; charset=utf-8' }
+            });
+            await bucket.delete(candidates);
+        }
+        await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
+            httpMetadata: { contentType: 'application/json; charset=utf-8' }
+        });
         return json({ ok: true, done: !nextCursor, deletedCount: candidates.length });
     } finally {
         await releaseMutationLock(bucket, lock);
@@ -2368,41 +2461,42 @@ function normalizeSourceCheckPath(value) {
 }
 
 async function sourceCheckResults(adapter, knownContent = null) {
-    const checks = adapter?.author?.sourceChecks;
-    if (!Array.isArray(checks) || checks.length === 0) return true;
-    try {
-        let cache = sourceCheckCaches.get(adapter);
-        if (!cache) {
-            cache = new Map();
-            sourceCheckCaches.set(adapter, cache);
-        }
-        let allPassed = true;
-        for (const check of checks) {
-            const path = normalizeSourceCheckPath(check.path);
-            const markers = Array.isArray(check.contains) ? check.contains : [];
-            if (knownContent && normalizeSourceCheckPath(knownContent.path) === path) {
-                const passed = markers.every(marker => knownContent.text.includes(marker));
-                cache.set(path, passed);
-                if (!passed) allPassed = false;
-                continue;
-            }
-            if (cache.has(path)) {
-                if (!cache.get(path)) allPassed = false;
-                continue;
-            }
-            const response = await fetchAuthorUpstream(check.path);
-            let passed = false;
-            if (response.ok) {
-                const text = await response.text();
-                passed = markers.every(marker => text.includes(marker));
-            }
-            cache.set(path, passed);
-            if (!passed) allPassed = false;
-        }
-        return allPassed;
-    } catch (_) {
-        return false;
+    const scriptPath = String(adapter.author?.script?.path || '/assets/js/app.js');
+    const checks = [...(adapter.author?.sourceChecks || [])];
+    if (!checks.some(check => normalizeSourceCheckPath(check.path) === scriptPath)) {
+        checks.push({ path: scriptPath, contains: [] });
     }
+    let cache = sourceCheckCaches.get(adapter);
+    if (!cache) {
+        cache = new Map();
+        sourceCheckCaches.set(adapter, cache);
+    }
+    const results = await Promise.all(checks.map(check => {
+        const path = normalizeSourceCheckPath(check.path);
+        const known = knownContent && normalizeSourceCheckPath(knownContent.path) === path;
+        if (!known && cache.has(path)) return cache.get(path);
+        const checking = (async () => {
+            try {
+                const previous = path === scriptPath ? rewriteCaches.get(adapter) : null;
+                const response = known ? null : await fetchAuthorUpstream(check.path, previous?.etag
+                    ? { headers: { 'if-none-match': previous.etag } } : undefined);
+                const text = known ? knownContent.text
+                    : response.status === 304 && previous ? previous.source
+                        : response.ok ? await response.text() : null;
+                if (text === null || !(check.contains || []).every(marker => text.includes(marker))) return false;
+                if (path === scriptPath) {
+                    const body = previous?.source === text ? previous.body : rewriteAuthorScript(text, adapter);
+                    rewriteCaches.set(adapter, { source: text, body, etag: knownContent?.etag || response?.headers.get('etag') || null });
+                }
+                return true;
+            } catch (_) {
+                return false;
+            }
+        })();
+        cache.set(path, checking);
+        return checking;
+    }));
+    return results.every(Boolean);
 }
 
 async function tryLoadAdapter(env) {
@@ -2421,9 +2515,9 @@ function rewriteAuthorHtml(response, pathname, adapterReady) {
     // 适配配置不内联进页面——magic-extension 自行拉取 /__rphub/adapter.json
     // （该路径已是扩展测试的既有供给方式），页面响应因此少一个脚本节点与
     // 整份适配 JSON。
-    if (!adapterReady) return response;
+    // journal 已升级的数据库仍需要版本兼容与写追踪，不能随 UI 适配撤掉。
     const injection = `<script src="/DB/dirty-tracker.js"></script>`
-        + (isMain ? `<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
+        + (isMain && adapterReady ? `<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
     headers.set('cache-control', 'no-store');
@@ -2527,20 +2621,18 @@ async function serveAuthor(request, env) {
     const contentType = response.headers.get('content-type') || '';
     if (request.method === 'HEAD' || response.status === 204) return response;
     if (isAppJs && response.status === 304) {
-        return cachedRewrite ? rewrittenAppJsResponse(cachedRewrite.body) : response;
+        return cachedRewrite && await sourceCheckResults(adapter)
+            ? rewrittenAppJsResponse(cachedRewrite.body)
+            : cachedRewrite ? rewrittenAppJsResponse(cachedRewrite.source) : response;
     }
     if (!response.ok) return response;
     if (isAppJs) {
         const source = await response.text();
         let body = source;
-        if (adapter && await sourceCheckResults(adapter, { path: requestUrl.pathname, text: source })) {
-            try {
-                body = rewriteAuthorScript(source, adapter);
-                const etag = response.headers.get('etag');
-                if (etag) rewriteCaches.set(adapter, { etag, body });
-            } catch (_) {
-                body = source;
-            }
+        if (adapter && await sourceCheckResults(adapter, {
+            path: requestUrl.pathname, text: source, etag: response.headers.get('etag')
+        })) {
+            body = rewriteCaches.get(adapter).body;
         }
         return rewrittenAppJsResponse(body);
     }

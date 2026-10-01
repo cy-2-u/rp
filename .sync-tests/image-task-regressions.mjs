@@ -335,26 +335,41 @@ test('legacy adapter without autoImageGen still generates', async () => {
     assert.equal(h.state().transientRecords.size, 1);
 });
 
-test('fixed-off delegates generation to the author task (no R2 path)', async () => {
+test('fixed-off preserves YNAI routing and stores only a transient result', async () => {
     let authorCalls = 0;
-    let authorUrl = '';
-    const h = harness(false, undefined, undefined, (requestUrl, fresh) => {
-        authorCalls += 1;
-        authorUrl = requestUrl;
-        return {
-            job: { status: 'done', imageUrl: 'https://author.example/img.png' },
-            cards: { add() {}, forEach() {} },
-            promise: Promise.resolve({ status: 'done', imageUrl: 'https://author.example/img.png' })
-        };
-    });
-    const task = h.start({ prompt: 'author native', fresh: true });
-    const job = await task.promise;
-    assert.equal(job.status, 'done');
-    assert.equal(job.imageUrl, 'https://author.example/img.png');
-    assert.equal(authorCalls, 1);
-    assert.equal(authorUrl, '/api/rp-image?tag=author%20native', '透传作者的原始请求 URL');
-    assert.equal(h.requests.length, 0, '固定生图关闭时不经过 /api/rp-image');
-    assert.equal(h.window.testState.imageStores.size, 0, '不创建本地图片记录库');
+    const database = new IDBFactory();
+    const h = harness(false, undefined, database, () => { authorCalls += 1; });
+    h.window.localStorage.setItem('rp_hub_magic_ynai_model', 'relay-model-x');
+    const task = h.start({ prompt: 'transient relay', token: 'YNAI-placeholder-123', fresh: true });
+    await h.waitForRequests(1);
+    const url = new URL(h.requests[0].url);
+    assert.equal(url.pathname, '/api/rp-image');
+    assert.equal(url.searchParams.get('token'), 'YNAI-placeholder-123');
+    assert.equal(url.searchParams.get('model'), 'relay-model-x');
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    assert.equal(authorCalls, 0);
+    assert.equal(h.state().records.length, 0);
+    assert.equal(h.state().transientRecords.size, 1);
+    const reloaded = harness(false, undefined, database);
+    const next = reloaded.start({ autoImageGen: false, prompt: 'transient relay' });
+    await next.promise;
+    assert.equal(reloaded.state().records.length, 0, 'fixed-off results must not persist across page loads');
+    assert.ok(next.testCard.testClasses.has('magic-image-suppressed'));
+});
+
+test('fixed-off replays a previously saved record without generating', async () => {
+    const h = harness(true);
+    const first = h.start();
+    await h.waitForRequests(1);
+    h.requests[0].succeed();
+    const saved = await first.promise;
+    h.setFixed(false);
+    h.evict();
+    const replay = await h.start().promise;
+    assert.equal(replay.imageUrl, saved.imageUrl);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.state().records.length, 1);
 });
 
 test('fixed-on keeps our proxy even when the author task is provided', async () => {

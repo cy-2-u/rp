@@ -520,7 +520,45 @@ async function testConcurrentFinalizeAndRootCas(worker) {
         assert.equal(stale.status, 409, 'a second session from the same base must lose the root CAS');
         const rootObject = JSON.parse(Buffer.from(bucket.objects.get(MANIFEST_KEY).bytes).toString('utf8'));
         assert.equal(rootObject.checksum, left.checksum);
+        const restarted = await begin(api, right, rootObject.version, rootObject.checksum);
+        assert.equal(restarted.response.status, 200, 'the same snapshot must rebase instead of getting stuck in its old session');
+        assert.equal(restarted.body.nextPage, 0);
+        assert.deepEqual((await submitPage(api, right, 0)).body.missingPacks, [], 'already uploaded packs are reused');
+        const replaced = await api.json({ action: 'finalize-upload', uploadId: right.checksum });
+        assert.equal(replaced.response.status, 200);
+        assert.equal(replaced.body.remote.checksum, right.checksum);
+        assert.equal(replaced.body.remote.version, rootObject.version + 1);
     }
+}
+
+async function testGcInvalidatesPendingUpload(worker) {
+    const bucket = createR2Mock();
+    const api = makeApi(worker, bucket);
+    await initialize(api);
+    const committed = await buildSnapshot(0);
+    await prepareSnapshot(api, committed);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: committed.checksum })).status, 200);
+    const pending = await buildSnapshot(1, { prefix: 'gc-reuse' });
+    await seedPack(bucket, pending.packs[0], new Date(Date.now() - 48 * 60 * 60 * 1000));
+    await prepareSnapshot(api, pending, 1, committed.checksum);
+    const collected = await api.json({ action: 'gc-step' });
+    assert.equal(collected.body.deletedCount, 1);
+    const rejected = await api.json({ action: 'finalize-upload', uploadId: pending.checksum });
+    assert.equal(rejected.response.status, 409, 'GC must invalidate the old existence checks');
+    assert.equal(rejected.body.recheckRequired, true);
+    const latest = (await api.json({ action: 'prepare-upload', schemaVersion: SCHEMA })).body.remote;
+    const restarted = await begin(api, pending, latest.version, latest.checksum);
+    assert.equal(restarted.response.status, 200);
+    assert.equal(restarted.body.nextPage, 0);
+    assert.deepEqual((await submitPage(api, pending, 0)).body.missingPacks, [pending.packs[0].checksum]);
+    await finishPages(api, pending);
+    const final = await api.json({ action: 'finalize-upload', uploadId: pending.checksum });
+    assert.equal(final.response.status, 200);
+    const pack = pending.packs[0];
+    const pulled = await api.post({ action: 'pull-pack', version: final.body.remote.version,
+        pageIndex: 0, packIndex: 0, checksum: pack.checksum, length: pack.length, entryCount: pack.entryCount });
+    assert.equal(pulled.status, 200, 'a successful commit must remain downloadable');
+    assert.deepEqual(new Uint8Array(await pulled.arrayBuffer()), pack.bytes);
 }
 
 async function testGcCursor(worker, committed) {
@@ -589,6 +627,7 @@ await testLegacyInitializationAndEmptyCommit(worker);
 const committed = await testResumablePagedUploadAndPull(worker);
 await testMetadataBloomAndOrderingRejections(worker);
 await testConcurrentFinalizeAndRootCas(worker);
+await testGcInvalidatesPendingUpload(worker);
 await testGcCursor(worker, committed);
 await testPasswordAndBinaryEndpoint(worker);
 console.log('sync-v13-smoke: ok');
