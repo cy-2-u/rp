@@ -34,7 +34,7 @@ const clientGlobals = {
     ...webGlobals,
     window: 'readonly', document: 'readonly', location: 'readonly', history: 'readonly',
     navigator: 'readonly', localStorage: 'readonly', sessionStorage: 'readonly',
-    indexedDB: 'readonly', IDBKeyRange: 'readonly',
+    indexedDB: 'readonly', IDBKeyRange: 'readonly', IDBFactory: 'readonly',
     IDBDatabase: 'readonly', IDBObjectStore: 'readonly', IDBIndex: 'readonly',
     IDBCursor: 'readonly', IDBTransaction: 'readonly', IDBRequest: 'readonly',
     Storage: 'readonly',

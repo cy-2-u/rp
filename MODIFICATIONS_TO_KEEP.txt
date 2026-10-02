@@ -84,7 +84,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 1. 第一次上传可完整扫描。正常增量上传不得对 `RPHubDB/store` 或 `AICharGen/characters` 打开全量 readonly cursor；只读取日志候选键。
 
-2. 业务 IndexedDB 写入和 `__rp_sync_journal_v2` 日志必须在同一事务提交/回滚。put、add、delete、范围删除、clear、cursor.update/delete 都必须追踪；自增键使用请求成功后的真实 key。
+2. 业务 IndexedDB 写入和 `__rp_sync_journal_v2` 日志必须在同一事务提交/回滚。put、add、delete、范围删除、clear、cursor.update/delete 都必须追踪；自增键使用请求成功后的真实 key。open/deleteDatabase 的写追踪补丁必须打在 `IDBFactory.prototype` 上而不是 `window.indexedDB` 实例上——WebKit（Safari/iOS）会在其数据库进程被回收后重建 indexedDB 工厂实例，实例级补丁会静默消失而 transaction 原型补丁仍在，新连接无 journal 导致所有业务写入与云上传失败（iOS Safari 实测故障）；restore-sim/scale-sim 沙箱已提供 `IDBFactory` 全局，并把这两个补丁点纳入 PATCHED_MEMBERS 原型快照清理。
 
 3. localStorage 写入前创建独立 `rp_sync_intent_v2:<uuid>` 意图。只有云端提交成功并确认水位后才能删除；上传期间产生的新日志/意图保留到下一轮。
 

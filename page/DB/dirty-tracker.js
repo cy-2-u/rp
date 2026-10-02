@@ -85,7 +85,12 @@
     });
     document.addEventListener('DOMContentLoaded', checkInterruptedRestore, { once: true });
     acquireWriterLease();
-    const nativeOpen = indexedDB.open;
+    // Patch the factory prototype, not one window.indexedDB instance. WebKit
+    // can recreate that instance after reconnecting to its database process;
+    // an instance-only patch would then disappear while transaction tracking
+    // remained installed, leaving new connections without a journal.
+    const factoryPrototype = IDBFactory.prototype;
+    const nativeOpen = factoryPrototype.open;
     const storageSetItem = Storage.prototype.setItem;
     const storageRemoveItem = Storage.prototype.removeItem;
     const storageClear = Storage.prototype.clear;
@@ -103,11 +108,12 @@
 
     // Return request events only after the journal store exists. Old explicit
     // author versions remain usable after our internal-only schema upgrade.
-    indexedDB.open = function (name, version) {
+    factoryPrototype.open = function (name, version) {
         if (!KNOWN_STORES[name]) return nativeOpen.apply(this, arguments);
         if (version !== undefined && (!Number.isSafeInteger(version) || version < 1)) {
             return nativeOpen.apply(this, arguments);
         }
+        const factory = this;
         const facade = new EventTarget();
         let current;
         let result;
@@ -142,7 +148,7 @@
         };
         const connect = requestedVersion => {
             current = requestedVersion === undefined
-                ? nativeOpen.call(indexedDB, name) : nativeOpen.call(indexedDB, name, requestedVersion);
+                ? nativeOpen.call(factory, name) : nativeOpen.call(factory, name, requestedVersion);
             current.onblocked = event => emit('blocked', event);
             current.onerror = event => {
                 failure = current.error;
@@ -283,8 +289,8 @@
             if (!key.startsWith('rp_sync_')) storageRemoveItem.call(this, key);
         }
     };
-    const nativeDeleteDatabase = indexedDB.deleteDatabase;
-    indexedDB.deleteDatabase = function (name) {
+    const nativeDeleteDatabase = factoryPrototype.deleteDatabase;
+    factoryPrototype.deleteDatabase = function (name) {
         if (KNOWN_STORES[name]) throw new DOMException('请使用对象存储 clear 清空业务数据，不能删除同步日志。', 'InvalidStateError');
         return nativeDeleteDatabase.apply(this, arguments);
     };

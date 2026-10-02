@@ -39,6 +39,8 @@ const FDBTransaction = await loadFdbClass('FDBTransaction');
 const FDBKeyRange = await loadFdbClass('FDBKeyRange');
 
 const PATCHED_MEMBERS = [
+    [FDBFactory.prototype, 'open'],
+    [FDBFactory.prototype, 'deleteDatabase'],
     [FDBObjectStore.prototype, 'put'],
     [FDBObjectStore.prototype, 'add'],
     [FDBObjectStore.prototype, 'delete'],
@@ -282,6 +284,10 @@ const setGlobal = (name, value) => {
 function installBrowserGlobals({ storageClass, localStorage, factory, document, location, fetchShim, locks = null }) {
     const globals = {
         indexedDB: factory,
+        // dirty-tracker 把 open/deleteDatabase 补丁打在 IDBFactory.prototype
+        // 上（WebKit 会重建 indexedDB 实例，实例级补丁会静默丢失），测试
+        // 环境必须提供与 factory 实例同一原型的构造器才等价于浏览器。
+        IDBFactory: FDBFactory,
         IDBKeyRange: FDBKeyRange,
         IDBDatabase: FDBDatabase,
         IDBObjectStore: FDBObjectStore,
