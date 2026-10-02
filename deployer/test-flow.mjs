@@ -253,7 +253,7 @@ async function deploy(body, ip) {
   calls = []; saved = {}; mock = { accountsFail: true }; uploaded = new Set();
   const req = new Request('http://deployer.local/api/deploy', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': 'ip-bad' },
-    body: JSON.stringify({ token: TOKEN, password: PASSWORD }),
+    body: JSON.stringify({ token: TOKEN, password: PASSWORD, projectName: 'test4' }),
   });
   const data = await (await worker.fetch(req)).json();
   ok(data.ok === false && /令牌/.test(data.error), '令牌无效提示', JSON.stringify(data));
@@ -267,6 +267,16 @@ async function deploy(body, ip) {
   });
   const data = await (await worker.fetch(req)).json();
   ok(data.ok === false && /令牌和密码/.test(data.error), '缺参提示');
+}
+
+// ---------- 6b. 项目名必填 ----------
+{
+  const req = new Request('http://deployer.local/api/deploy', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': 'ip-noname' },
+    body: JSON.stringify({ token: TOKEN, password: PASSWORD }),
+  });
+  const data = await (await worker.fetch(req)).json();
+  ok(data.ok === false && /项目名/.test(data.error), '项目名必填提示', JSON.stringify(data));
 }
 
 // ---------- 7. OPTIONS CORS ----------

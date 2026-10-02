@@ -213,9 +213,9 @@ async function handleDeploy(request, origin) {
   try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
   const token = String((body && body.token) || '').trim();
   const password = String((body && body.password) || '');
-  let projectName = sanitizeProjectName(body && body.projectName);
+  const projectName = sanitizeProjectName(body && body.projectName);
   if (!token || !password) return json({ ok: false, error: '请填写令牌和密码。' }, 200, origin);
-  if (!projectName) projectName = 'rp-' + randomSuffix(4);
+  if (!projectName) return json({ ok: false, error: '请填写项目名。' }, 200, origin);
   if (!/^[a-z0-9][a-z0-9-]*$/.test(projectName)) {
     return json({ ok: false, error: '项目名只能包含小写字母、数字和连字符。' }, 200, origin);
   }

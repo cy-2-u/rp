@@ -87,8 +87,7 @@ body{
 
 /* ---------- 表单 ---------- */
 .fld{display:block; margin-bottom:14px}
-.lbl{display:block; font-size:13px; font-weight:500; margin-bottom:6px}
-.lbl em{font-style:normal; font-weight:400; font-size:12px; color:var(--text-2)}
+ .lbl{display:block; font-size:13px; font-weight:500; margin-bottom:6px}
 input{
   width:100%; height:36px; border-radius:7px;
   border:1px solid var(--inp-border); background:var(--inp-bg); color:var(--text);
@@ -239,8 +238,8 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
         <input id="password" type="password" placeholder="项目访问密码" autocomplete="new-password">
       </label>
       <label class="fld">
-        <span class="lbl">项目名 <em>（可选）</em></span>
-        <input id="projectName" type="text" placeholder="留空自动生成" autocomplete="off" spellcheck="false">
+        <span class="lbl">项目名</span>
+        <input id="projectName" type="text" placeholder="例如 rp-hub" autocomplete="off" spellcheck="false">
       </label>
       <button id="deploy" class="btn-primary" type="button">部署</button>
       <p class="note">令牌通过 zhao 的 Worker 转发部署。</p>
@@ -389,9 +388,10 @@ document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('cl
 $('deploy').addEventListener('click', async () => {
   const token = $('token').value.trim();
   const password = $('password').value;
-  const projectName = $('projectName').value.trim() || ('rp-' + Math.random().toString(36).slice(2, 6));
+  const projectName = $('projectName').value.trim();
   $('err').hidden = true;
   if (!token || !password){ showError('请填写令牌和密码。'); return; }
+  if (!projectName){ showError('请填写项目名。'); return; }
   if (!WORKER){ showError('部署服务未配置。'); return; }
   show('progress'); startSteps();
   try {
