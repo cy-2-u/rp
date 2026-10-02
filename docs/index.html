@@ -384,6 +384,21 @@ document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('cl
   btn.classList.add('ok'); setTimeout(() => btn.classList.remove('ok'), 1200);
 }));
 
+/* 表单记忆：令牌/密码/项目名只保存在本机 localStorage，不上传不同步 */
+const FORM_MEMORY_KEY = 'rp_deploy_form_v1';
+function readFormMemory() {
+  try { return JSON.parse(localStorage.getItem(FORM_MEMORY_KEY) || '{}') || {}; } catch (_) { return {}; }
+}
+function writeFormMemory(form) {
+  try { localStorage.setItem(FORM_MEMORY_KEY, JSON.stringify(form)); } catch (_) { }
+}
+{
+  const saved = readFormMemory();
+  if (saved.token) $('token').value = saved.token;
+  if (saved.password) $('password').value = saved.password;
+  if (saved.projectName) $('projectName').value = saved.projectName;
+}
+
 /* 部署 */
 $('deploy').addEventListener('click', async () => {
   const token = $('token').value.trim();
@@ -393,6 +408,7 @@ $('deploy').addEventListener('click', async () => {
   if (!token || !password){ showError('请填写令牌和密码。'); return; }
   if (!projectName){ showError('请填写项目名。'); return; }
   if (!WORKER){ showError('部署服务未配置。'); return; }
+  writeFormMemory({ token, password, projectName });
   show('progress'); startSteps();
   try {
     const r = await fetch(WORKER + '/api/deploy', {
