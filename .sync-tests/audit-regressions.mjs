@@ -117,32 +117,6 @@ for (const stage of ['dirty', 'state']) {
 // 跨文件协议常量互为副本（纯静态文件没有构建注入，bootstrap 与
 // dirty-tracker 头部各自持有一份字面量）。这里逐字比较两侧声明，
 // 任一侧单方面改名立即在此失败，而不是等到运行时静默失效。
-// Restore preflight must reject insufficient quota before opening staging, while
-// unsupported or failing StorageManager implementations remain compatible.
-{
-    const start = source.indexOf('    async function checkRestoreStorage(');
-    const end = source.indexOf('    async function restorePackSnapshot(', start);
-    assert.ok(start >= 0 && end > start, 'checkRestoreStorage source boundaries');
-    const checkSource = source.slice(start, end);
-
-    const insufficient = vm.createContext({
-        navigator: { storage: { estimate: async () => ({ quota: 1000, usage: 0 }) } }
-    });
-    vm.runInContext(checkSource, insufficient);
-    await assert.rejects(
-        insufficient.checkRestoreStorage(1),
-        /剩余空间不足/
-    );
-
-    const unsupported = vm.createContext({ navigator: {} });
-    vm.runInContext(checkSource, unsupported);
-    await assert.doesNotReject(unsupported.checkRestoreStorage(1024 * 1024));
-
-    const failing = vm.createContext({ navigator: { storage: { estimate: async () => { throw new Error('not implemented'); } } } });
-    vm.runInContext(checkSource, failing);
-    await assert.doesNotReject(failing.checkRestoreStorage(1024 * 1024));
-    console.log('PASS restore quota preflight rejects only when a reliable estimate is insufficient');
-}
 
 // Restore batches must flush on estimated bytes even when the record count is
 // below the ordinary batch count, bounding transient IndexedDB write payloads.

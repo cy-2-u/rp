@@ -415,7 +415,8 @@ await benchmark({
 await benchmark({
     name: 'pull-manifest-page (32 packs)',
     status: 200,
-    minSubrequests: 4,
+    // 清单页在 isolate 内按 (根校验码, 页码) 缓存：稳态样本不再重读页对象。
+    minSubrequests: 3,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -426,7 +427,8 @@ await benchmark({
 await benchmark({
     name: 'pull-pack (1MiB direct stream)',
     status: 200,
-    minSubrequests: 5,
+    // 同上：页缓存命中后 pull-pack 稳态只需 migration+manifest+pack 三次读。
+    minSubrequests: 4,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -702,7 +704,7 @@ await concurrentBenchmark({
                     entryCount: pack.entryCount
                 }),
                 status: 200,
-                minSubrequests: 5
+                minSubrequests: 4
             });
         }
         return lanes;

@@ -114,17 +114,7 @@ function validateAdapter(adapter) {
 
 function resolveAdapterUrl(env) {
     const override = String(env?.[ADAPTER_URL_ENV] || '').trim();
-    const raw = override.startsWith('file:') ? override : DEFAULT_ADAPTER_URL;
-    let url;
-    try {
-        url = new URL(raw, AUTHOR_BASE);
-    } catch (_) {
-        throw new Error('外部适配清单地址无效。');
-    }
-    if (!['https:', 'file:'].includes(url.protocol)) {
-        throw new Error('外部适配清单地址协议不受支持。');
-    }
-    return url;
+    return new URL(override.startsWith('file:') ? override : DEFAULT_ADAPTER_URL, AUTHOR_BASE);
 }
 
 function adapterPublicView(adapter) {
@@ -1266,7 +1256,7 @@ async function getImageDeleteTargets(bucket, keys, characterNames, cursor) {
                 : characterNames.length > 1 ? { characterNames: characterNames.slice(1) } : null
         };
     }
-    const objects = await runConcurrent(keys.filter(isValidImageObjectKey), 6, async key => {
+    const objects = await runConcurrent(keys, 6, async key => {
         const object = await bucket.head(key);
         return object ? normalizeImageObject({ ...object, key }) : null;
     });
@@ -1315,21 +1305,14 @@ async function writeImageTombstone(bucket, key) {
     });
 }
 
-function chunkR2DeleteKeys(keys, size = 1000) {
-    const chunks = [];
-    for (let start = 0; start < keys.length; start += size) chunks.push(keys.slice(start, start + size));
-    return chunks;
-}
-
 async function deleteImageObjectFiles(bucket, objects) {
-    // R2 delete accepts up to 1000 keys per call, so cleanup costs two
-    // subrequests per 1000 images instead of two per image.
+    // R2 单次 delete 上限 1000 键；两处调用方每请求上限分别为 40/20 个
+    // 目标（含缩略图各一批），整批直删即可。
     const objectKeys = objects.map(object => object.key);
     const thumbKeys = objects.map(object => object.thumbKey).filter(Boolean);
-    await Promise.allSettled([
-        ...chunkR2DeleteKeys(objectKeys).map(chunk => bucket.delete(chunk)),
-        ...chunkR2DeleteKeys(thumbKeys).map(chunk => bucket.delete(chunk))
-    ]);
+    await Promise.allSettled([objectKeys, thumbKeys]
+        .filter(keys => keys.length)
+        .map(keys => bucket.delete(keys)));
 }
 
 async function handleImageAdmin(request, env, url, ctx) {
@@ -1703,7 +1686,17 @@ function normalizeManifestPage(value, root, pageIndex) {
     return { previousPageHash, pageHash, packs };
 }
 
+// 清单页按 (根校验码, 页码) 内容寻址且写入不可变（etagDoesNotMatch:*），
+// pull-pack 恢复 N 个包会逐包重读并重验同一页；进程内缓存后恢复 N 包
+// 只付 ≤pageCount 次页读取。根校验码进键名即天然失效；上限防长寿命
+// isolate 在多轮上传后缓慢膨胀。
+const manifestPageCache = new Map();
+const MANIFEST_PAGE_CACHE_MAX = 96;
+
 async function readManifestPage(bucket, root, pageIndex) {
+    const cacheKey = `${root.checksum}/${pageIndex}`;
+    const cached = manifestPageCache.get(cacheKey);
+    if (cached) return cached;
     const stored = await readSmallJsonObject(bucket, createManifestPageKey(root.checksum, pageIndex));
     const page = normalizeManifestPage(stored?.value, root, pageIndex);
     if (!page) throw new SyncRequestError('服务器同步清单页损坏。', 409);
@@ -1715,6 +1708,8 @@ async function readManifestPage(bucket, root, pageIndex) {
     if (expectedHash !== page.pageHash) {
         throw new SyncRequestError('服务器同步清单页校验失败。', 409);
     }
+    if (manifestPageCache.size >= MANIFEST_PAGE_CACHE_MAX) manifestPageCache.clear();
+    manifestPageCache.set(cacheKey, page);
     return page;
 }
 
@@ -2006,8 +2001,10 @@ async function beginUploadLocked(bucket, body) {
         return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
     }
 
-    const gcGeneration = await readGcGeneration(bucket);
-    const existing = await readUploadSession(bucket, checksum);
+    const [gcGeneration, existing] = await Promise.all([
+        readGcGeneration(bucket),
+        readUploadSession(bucket, checksum)
+    ]);
     if (existing) {
         const session = existing.session;
         if (session.bloomChecksum !== bloomChecksum || session.totalBytes !== totalBytes
@@ -2242,7 +2239,12 @@ async function handleFinalizeUpload(bucket, body) {
     const lock = await acquireMutationLock(bucket);
     if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
     try {
-        const manifestState = await getManifestState(bucket);
+        // 三条读链互不依赖，仅依赖已持有的会话，并行取回。
+        const [manifestState, gcGeneration] = await Promise.all([
+            getManifestState(bucket),
+            readGcGeneration(bucket),
+            readBloomFilter(bucket, session)
+        ]);
         if (manifestState.manifest?.checksum === session.checksum) {
             return json({ ok: true, remote: buildRemoteInfo(manifestState.manifest) });
         }
@@ -2252,14 +2254,8 @@ async function handleFinalizeUpload(bucket, body) {
             || manifestState.etag !== session.baseEtag) {
             return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
         }
-        if (session.gcGeneration !== await readGcGeneration(bucket)) {
+        if (session.gcGeneration !== gcGeneration) {
             return error('分片回收后需要重新核对本地清单。', 409, { recheckRequired: true });
-        }
-        try {
-            await readBloomFilter(bucket, session);
-        } catch (err) {
-            if (err instanceof SyncRequestError) return error(err.message, err.status);
-            throw err;
         }
         const root = {
             format: MANIFEST_ROOT_FORMAT,

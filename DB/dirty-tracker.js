@@ -21,7 +21,7 @@
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
     const initialRestoreEpoch = localStorage.getItem(RESTORE_EPOCH_KEY);
     let restorePaused = Boolean(localStorage.getItem(RESTORE_ACTIVE_KEY));
-    const isAppKey = key => String(key).startsWith('rp_hub_') || String(key).startsWith('ai_chargen_');
+    const isAppKey = key => key.startsWith('rp_hub_') || key.startsWith('ai_chargen_');
 
     const showRestorePause = () => {
         if (!document.body || document.getElementById('rp-sync-restore-pause')) return;
@@ -165,8 +165,10 @@
     const excluded = (store, key) => store.transaction.db.name === 'RPHubDB'
         && store.name === 'store' && key === 'rp_hub_presets';
     IDBDatabase.prototype.transaction = function (names, mode, options) {
+        // 只读事务与写追踪无关：直接透传，省掉 scope 复制与查找。
+        if (mode !== 'readwrite') return nativeTransaction.call(this, names, mode, options);
         const scope = typeof names === 'string' ? [names] : Array.from(names);
-        if (mode === 'readwrite' && KNOWN_STORES[this.name]?.some(name => scope.includes(name))) {
+        if (KNOWN_STORES[this.name]?.some(name => scope.includes(name))) {
             if (!RESTORE_PAGE) assertWritable();
             if (!this.objectStoreNames.contains(JOURNAL)) {
                 throw new DOMException('数据库变更日志尚未初始化，请刷新页面。', 'InvalidStateError');
@@ -184,8 +186,9 @@
         }
         return tx;
     };
+    // 调用方已确认 store 受追踪且非恢复页；这里只做排除规则与落日志。
     const log = (store, event) => {
-        if (!isTracked(store) || RESTORE_PAGE || excluded(store, event.key)) return;
+        if (excluded(store, event.key)) return;
         try {
             const request = nativeAdd.call(store.transaction.objectStore(JOURNAL), { store: store.name, ...event });
             request.addEventListener('error', () => { journalFailure = request.error; });
@@ -195,46 +198,51 @@
             throw error;
         }
     };
-    const recordWrite = (store, request, key) => {
-        if (isTracked(store) && !RESTORE_PAGE) {
-            request.addEventListener('success', () => log(store, { key: key === undefined ? request.result : key }));
-        }
-        return request;
-    };
     for (const [name, native] of [['put', nativePut], ['add', nativeAdd]]) {
         IDBObjectStore.prototype[name] = function (...args) {
-            if (isTracked(this) && !RESTORE_PAGE) assertWritable();
-            return recordWrite(this, native.apply(this, args));
+            if (RESTORE_PAGE || !isTracked(this)) return native.apply(this, args);
+            assertWritable();
+            const request = native.apply(this, args);
+            request.addEventListener('success', () => log(this, { key: request.result }));
+            return request;
         };
     }
     IDBObjectStore.prototype.delete = function (key) {
-        if (isTracked(this) && !RESTORE_PAGE) {
-            assertWritable();
-            if (key instanceof IDBKeyRange) {
-                const request = this.getAllKeys(key);
-                request.addEventListener('success', () => {
-                    for (const candidate of request.result) log(this, { key: candidate });
-                });
-                return nativeDelete.call(this, key);
-            }
+        if (RESTORE_PAGE || !isTracked(this)) return nativeDelete.call(this, key);
+        assertWritable();
+        if (key instanceof IDBKeyRange) {
+            const request = this.getAllKeys(key);
+            request.addEventListener('success', () => {
+                for (const candidate of request.result) log(this, { key: candidate });
+            });
+            return nativeDelete.call(this, key);
         }
-        return recordWrite(this, nativeDelete.call(this, key), key);
+        const request = nativeDelete.call(this, key);
+        request.addEventListener('success', () => log(this, { key }));
+        return request;
     };
     IDBObjectStore.prototype.clear = function () {
-        if (isTracked(this) && !RESTORE_PAGE) assertWritable();
+        if (RESTORE_PAGE || !isTracked(this)) return nativeClear.call(this);
+        assertWritable();
         const request = nativeClear.call(this);
-        if (isTracked(this) && !RESTORE_PAGE) request.addEventListener('success', () => log(this, { clear: true }));
+        request.addEventListener('success', () => log(this, { clear: true }));
         return request;
     };
     IDBCursor.prototype.update = function (value) {
         const store = this.source.objectStore || this.source;
-        if (isTracked(store) && !RESTORE_PAGE) assertWritable();
-        return recordWrite(store, nativeCursorUpdate.call(this, value), this.primaryKey);
+        if (RESTORE_PAGE || !isTracked(store)) return nativeCursorUpdate.call(this, value);
+        assertWritable();
+        const request = nativeCursorUpdate.call(this, value);
+        request.addEventListener('success', () => log(store, { key: this.primaryKey }));
+        return request;
     };
     IDBCursor.prototype.delete = function () {
         const store = this.source.objectStore || this.source;
-        if (isTracked(store) && !RESTORE_PAGE) assertWritable();
-        return recordWrite(store, nativeCursorDelete.call(this), this.primaryKey);
+        if (RESTORE_PAGE || !isTracked(store)) return nativeCursorDelete.call(this);
+        assertWritable();
+        const request = nativeCursorDelete.call(this);
+        request.addEventListener('success', () => log(store, { key: this.primaryKey }));
+        return request;
     };
 
     const shouldTrackKey = key => isAppKey(key) && !key.startsWith('rp_hub_sync_');

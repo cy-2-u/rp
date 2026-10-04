@@ -10,7 +10,7 @@
     const IMAGE_STORAGE_PREFIX = 'rp_hub_image_renders_';
     const IMAGE_RECORD_LIMIT = 256;
     const DEFAULT_STORY_SCOPE_ID = 'main';
-    const IMAGE_PARAM_KEYS = ['provider', 'tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
+    const IMAGE_PARAM_KEYS = ['tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
     const isUsableAdapter = value => value && typeof value === 'object' && !Array.isArray(value)
         && value.ok !== false
         && Number(value.schema) === 1
@@ -160,6 +160,8 @@
         request.onsuccess = () => resolve(request.result);
     });
 
+    // 注意：normalizeRecordList 对重复 key 是“删除后重设”（后写者排到末尾），
+    // 与 mergeRecordLists 的 base 处理（Map 去重保首位置）顺序语义不同，不可合并。
     const normalizeRecordList = (value, characterName = '') => {
         if (!Array.isArray(value)) return [];
         const records = new Map();
@@ -304,8 +306,6 @@
         const url = new URL('/api/rp-image', location.origin);
         const snapshot = record.paramsSnapshot || {};
         IMAGE_PARAM_KEYS.forEach(key => url.searchParams.set(key, key === 'tag' ? record.prompt : String(snapshot[key] || '')));
-        // 历史快照可能残留 provider 字段：缓存不区分来源，重放 URL 一律不带
-        url.searchParams.delete('provider');
         if (snapshot.rerollNonce) url.searchParams.set('reroll_nonce', String(snapshot.rerollNonce));
         if (allowGeneration) {
             url.searchParams.set('generate', '1');
@@ -853,17 +853,6 @@
             grid.insertBefore(button, settingsButton || null);
             return;
         }
-
-        const nav = document.querySelector('.app-sidebar .sidebar-nav');
-        if (!nav || nav.querySelector('.magic-image-nav')) return;
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'sidebar-nav-button magic-image-nav flex items-center rounded-xl transition-all duration-200 font-medium w-full px-3 py-2.5 text-gray-600 hover:bg-gray-50 hover:text-gray-900';
-        button.title = '图片管理';
-        button.innerHTML = '<svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5zm3 10 3-3 2 2 2-2 3 3M8 8h.01"></path></svg><span>图片管理</span>';
-        button.addEventListener('click', () => { window.location.href = '/image'; });
-        const settingsButton = [...nav.querySelectorAll(':scope > button')].find(item => item.textContent.includes('设置'));
-        nav.insertBefore(button, settingsButton || null);
     };
     const findFixedImageAnchor = () => {
         const cfg = settingsConfig();
@@ -913,7 +902,7 @@
     // sta1n 密钥时移除劫持、还原作者浮窗。浮窗定位不写死 DOM 结构：按适配层
     // ui.settings.modelLabel 文本找到设置标签，再找同容器里的 custom-select 渲染根。
     const YNAI_SELECT_CLASS = 'magic-ynai-select';
-    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, models: null };
+    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, models: null, renderedModels: null };
 
     const readAuthorImageGenKey = async () => {
         try {
@@ -988,7 +977,14 @@
             ynaiSelectState.loaded = false;
             ynaiSelectState.models = readStoredYnaiModels();
         }
-        if (ynaiSelectState.models) renderYnaiSelectOptions(select, ynaiSelectState.models);
+        if (ynaiSelectState.models) {
+            // 选项未变化时跳过重建：渲染会清空重挂 <option> 并写 localStorage，
+            // 不加守卫时每次 reconcile（≤4 秒节流）都触发一轮 mutation→reconcile 循环。
+            if (ynaiSelectState.renderedModels !== ynaiSelectState.models) {
+                renderYnaiSelectOptions(select, ynaiSelectState.models);
+                ynaiSelectState.renderedModels = ynaiSelectState.models;
+            }
+        }
         if (ynaiSelectState.loading || ynaiSelectState.loaded) return;
         ynaiSelectState.key = key;
         ynaiSelectState.loading = true;
@@ -999,6 +995,7 @@
             if (!response.ok || !models.length) throw new Error(payload?.error || `HTTP ${response.status}`);
             ynaiSelectState.models = models;
             ynaiSelectState.loaded = true;
+            ynaiSelectState.renderedModels = models;
             try { localStorage.setItem(YNAI_MODEL_LIST_KEY, JSON.stringify(models)); } catch (_) { }
             renderYnaiSelectOptions(select, models);
         } finally {

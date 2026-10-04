@@ -787,7 +787,7 @@ function createAutoSaveScheduler(options = {}) {
     // 对不上、跨 tab 互斥失效）；audit-regressions.mjs 的静态断言会抓住
     // 两侧不一致。
     const LOCAL_CACHE_DB = 'RPHubSyncCache';
-    const LOCAL_CACHE_DB_VERSION = 3;
+    const LOCAL_CACHE_DB_VERSION = 4;
     const LOCAL_CACHE_ENTRY_STORE = 'entries';
     const LOCAL_CACHE_STATE_STORE = 'state';
     const LOCAL_CACHE_PACK_STORE = 'packs';
@@ -952,11 +952,9 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
-    function openDbByName(dbName, version) {
+    function openDbByName(dbName) {
         return new Promise((resolve, reject) => {
-            const request = typeof version === 'number'
-                ? indexedDB.open(dbName, version)
-                : indexedDB.open(dbName);
+            const request = indexedDB.open(dbName);
             request.onerror = () => reject(request.error || new Error('IndexedDB open failed.'));
             request.onsuccess = () => resolve(request.result);
         });
@@ -1269,10 +1267,11 @@ function createAutoSaveScheduler(options = {}) {
                 const db = request.result;
                 if (!db.objectStoreNames.contains(LOCAL_CACHE_ENTRY_STORE)) {
                     const store = db.createObjectStore(LOCAL_CACHE_ENTRY_STORE, { keyPath: 'id' });
-                    store.createIndex('bucketKey', 'bucketKey', { unique: false });
                     store.createIndex('sourceKey', 'sourceKey', { unique: false });
                 } else {
                     const store = request.transaction.objectStore(LOCAL_CACHE_ENTRY_STORE);
+                    // v3 曾创建过无人查询的 bucketKey 索引，升级时清理。
+                    if (store.indexNames.contains('bucketKey')) store.deleteIndex('bucketKey');
                     if (!store.indexNames.contains('sourceKey')) store.createIndex('sourceKey', 'sourceKey', { unique: false });
                 }
                 const entries = request.transaction.objectStore(LOCAL_CACHE_ENTRY_STORE);
@@ -1455,7 +1454,7 @@ function createAutoSaveScheduler(options = {}) {
         return `${group}|${legacy ? 'r' : 's'}${String(stableHash(id) % (legacy ? 32 : STABLE_BUCKET_COUNT)).padStart(3, '0')}`;
     }
 
-    function buildCacheEntry(value) {
+    function buildCacheEntry(value, canonicalBytes = null) {
         const id = snapshotEntryId(value);
         const group = snapshotEntryGroup(value);
         const sourceKey = snapshotEntrySource(value);
@@ -1466,7 +1465,9 @@ function createAutoSaveScheduler(options = {}) {
                 : value.type === 'recordArrayEnd'
                     ? '2'
                     : '1';
-        const bytes = serializeSnapshotObject(value);
+        // 恢复路径直接透传服务器数据包里的行字节（本就是同一规范序列化器
+        // 产出、上传时经 sha256 验证的），省掉对全量数据再跑一遍序列化。
+        const bytes = canonicalBytes || serializeSnapshotObject(value);
         if (bytes.byteLength > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('单条本地数据超过 64MiB 同步上限。');
         return { id, group, sourceKey, sortKey: `${sourceKey}|${sequence}`, bucketKey: snapshotEntryBucket(value, id, sourceKey), bytes };
     }
@@ -1620,12 +1621,12 @@ function createAutoSaveScheduler(options = {}) {
         const touchBucket = bucket => {
             if (affectedBuckets.has(bucket)) return;
             affectedBuckets.add(bucket);
-            state.pendingBuckets = [...affectedBuckets];
             bucketsDirty = true;
         };
         const flushPendingBuckets = async () => {
             if (!bucketsDirty) return;
             bucketsDirty = false;
+            state.pendingBuckets = [...affectedBuckets];
             await cacheWriteState(cacheDb, state);
         };
         const yieldIfNeeded = createYieldController();
@@ -2284,7 +2285,7 @@ function createAutoSaveScheduler(options = {}) {
                 catch (_) { throw new Error('服务器同步数据包 JSON 不正确。'); }
                 fragments = [];
                 fragmentBytes = 0;
-                await consumer.consume(value, pack);
+                await consumer.consume(value, pack, bytes);
                 count += 1;
                 offset = end + 1;
             }
@@ -2493,9 +2494,9 @@ function createAutoSaveScheduler(options = {}) {
                 iterateStagedSnapshotPacks(stagingDb, packManifest),
                 packManifest.length,
                 {
-                    async consume(value, pack) {
+                    async consume(value, pack, lineBytes) {
                         await restorer.consume(value);
-                        const entry = buildCacheEntry(value);
+                        const entry = buildCacheEntry(value, lineBytes);
                         assertPackEntryPlacement(value, pack);
                         entry.bucketKey = pack.bucketKey;
                         pendingEntries.push(entry);
@@ -2554,19 +2555,7 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    async function checkRestoreStorage(totalBytes) {
-        if (!navigator.storage?.estimate) return;
-        let estimate;
-        try { estimate = await navigator.storage.estimate(); } catch (_) { return; }
-        const available = Number(estimate.quota) - Number(estimate.usage || 0);
-        const required = Number(totalBytes) * 4 + 8 * 1024 * 1024;
-        if (Number.isFinite(available) && available < required) {
-            throw new Error(`浏览器剩余空间不足，恢复暂存与索引预计需要约 ${Math.ceil(required / 1024 / 1024)}MiB，请先释放其他站点空间。`);
-        }
-    }
-
     async function restorePackSnapshot(remote) {
-        await checkRestoreStorage(remote.totalBytes);
         const packManifest = await validateRemotePackManifest(remote);
         const stagingDb = await openDownloadStagingDb();
 
@@ -2942,7 +2931,7 @@ function createAutoSaveScheduler(options = {}) {
     }
 
     function isAutoSavePageActive() {
-        return document.visibilityState !== 'hidden' && document.hidden !== true;
+        return document.visibilityState !== 'hidden';
     }
 
     function parseAutoSaveMinutes(value) {
@@ -3340,8 +3329,6 @@ function createAutoSaveScheduler(options = {}) {
                 overlay.remove();
                 if (lockBody) lockBody.style.overflow = lockBodyOverflow || '';
             }, 240);
-        } else if (lockBody) {
-            lockBody.style.overflow = lockBodyOverflow || '';
         }
         resolveAccessGate();
     }
@@ -3677,7 +3664,6 @@ function createAutoSaveScheduler(options = {}) {
 
             if (!remote) {
                 updateProgress(100, '没有可恢复的数据');
-                setActionButtonsDisabled(false);
                 if (RESTORE_PAGE) location.replace('/');
                 return;
             }
@@ -3692,7 +3678,6 @@ function createAutoSaveScheduler(options = {}) {
             await restorePackSnapshot(remote);
 
             updateProgress(100, '恢复完成');
-            setActionButtonsDisabled(false);
             if (RESTORE_PAGE) {
                 location.replace('/');
             } else {
@@ -3701,7 +3686,6 @@ function createAutoSaveScheduler(options = {}) {
         } catch (error) {
             showSyncError(error);
             if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');
-            setActionButtonsDisabled(false);
         } finally {
             state.syncing = false;
             setActionButtonsDisabled(false);
@@ -3735,7 +3719,6 @@ function createAutoSaveScheduler(options = {}) {
                     autoSaveLastError = '';
                     setAutoSaveStatus('数据相同，已是最新。');
                 }
-                setActionButtonsDisabled(false);
                 return { alreadyUpToDate: true };
             }
 
@@ -3744,7 +3727,6 @@ function createAutoSaveScheduler(options = {}) {
                 autoSaveLastError = '';
                 setAutoSaveStatus('自动保存完成。');
             }
-            setActionButtonsDisabled(false);
             return { alreadyUpToDate: false };
         } catch (error) {
             if (automatic) {
@@ -3753,7 +3735,6 @@ function createAutoSaveScheduler(options = {}) {
             } else {
                 showSyncError(error);
             }
-            setActionButtonsDisabled(false);
             if (!automatic) return { error };
             throw error;
         } finally {

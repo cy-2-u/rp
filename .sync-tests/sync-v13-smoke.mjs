@@ -425,7 +425,11 @@ async function testResumablePagedUploadAndPull(worker) {
     damaged.pageHash = '0'.repeat(64);
     storedPage.bytes = encoder.encode(JSON.stringify(damaged));
     storedPage.size = storedPage.bytes.byteLength;
-    const damagedPull = await api.post({ action: 'pull-manifest-page', version: 1, pageIndex: 1 });
+    // 清单页在 isolate 内有内容寻址缓存（页对象按协议不可变）；本用例改写
+    // R2 属于隔离体外损坏，需用全新 isolate 验证读取路径仍会校验并拒绝。
+    const damagedWorker = await loadWorker();
+    const damagedApi = makeApi(damagedWorker, bucket);
+    const damagedPull = await damagedApi.post({ action: 'pull-manifest-page', version: 1, pageIndex: 1 });
     assert.equal(damagedPull.status, 409, 'damaged manifest pages must be rejected');
     storedPage.bytes = originalPage;
     storedPage.size = originalPage.byteLength;
