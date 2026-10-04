@@ -344,8 +344,7 @@ for (const stage of ['dirty', 'state']) {
         'rp_sync_tracking_epoch_v2',
         'rp_sync_restore_active',
         'rp_sync_restore_epoch',
-        'rp-hub-r2-sync-v1',
-        'rp-hub-app-writers-v1'
+        'rp-hub-r2-sync-v1'
     ];
     const declares = (text, literal) => text.includes(`'${literal}'`) || text.includes(`"${literal}"`);
     for (const literal of sharedLiterals) {

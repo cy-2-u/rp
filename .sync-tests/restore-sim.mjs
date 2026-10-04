@@ -870,51 +870,7 @@ assert.equal(localStorageD.getItem('rp_sync_restore_active'), null,
 assert.equal(locationD.replaced, null, 'a failed restore must stay on the progress surface');
 console.log('phase 2b (late corruption leaves local data untouched): ok');
 
-// A restore that cannot obtain the exclusive app-writer lock has not started
-// overwriting data. It must preserve an older interruption marker (if any) and
-// leave business data unchanged.
-restorePrototypes(savedPrototypes);
-const factoryE = new FDBFactory();
-const StorageE = makeStorageClass();
-const localStorageE = new StorageE();
-await idbPut(factoryE, 'RPHubDB', 'store', 'chat1', 'lock-blocked-local');
-localStorageE.setItem('rp_sync_restore_active', 'older-interrupted-restore');
-const documentE = createDocumentStub();
-const locationE = {
-    pathname: '/sync-restore', replaced: null,
-    replace(url) { this.replaced = url; },
-    assign() { }
-};
-const blockedLocks = {
-    request(name, options, callback) {
-        if (name === 'rp-hub-app-writers-v1' && options?.mode === 'exclusive') {
-            return Promise.reject(new DOMException('blocked', 'AbortError'));
-        }
-        return Promise.resolve().then(callback);
-    },
-    query: async () => ({ held: [] })
-};
-installBrowserGlobals({
-    storageClass: StorageE,
-    localStorage: localStorageE,
-    factory: factoryE,
-    document: documentE,
-    location: locationE,
-    fetchShim: makeFetchShim('blocked-lock restore'),
-    locks: blockedLocks
-});
-await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-await waitFor(() => {
-    const modalE = findSyncModal(documentE);
-    return modalE ? modalE.classList.contains('is-error') : false;
-}, 60000, 'blocked restore lock');
-assert.equal((await idbGetAll(factoryE, 'RPHubDB', 'store')).get('chat1'), 'lock-blocked-local',
-    'failure before the writer lock must not alter business data');
-assert.equal(localStorageE.getItem('rp_sync_restore_active'), 'older-interrupted-restore',
-    'failure before the writer lock must restore the prior interruption marker');
-console.log('phase 2c (writer lock failure preserves local state): ok');
-
-// Once the exclusive lock callback starts, a write failure can leave a partial
+// Once restore writes begin, a write failure can leave a partial
 // cross-database restore. The active marker must remain so normal app tabs keep
 // refusing writes until a complete retry succeeds.
 restorePrototypes(savedPrototypes);

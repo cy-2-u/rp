@@ -25,7 +25,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 8. 开屏访问门禁：主页与恢复页由 bootstrap.js 在站点打开时先静默做一次同步密码校验（`auth-status` 单次请求，`retryCount: 0`、8 秒超时）。**已保存密码（`rp_hub_sync_password_v1`）验证通过时全程不出现任何登录 UI**，照常进入站点；只有云端要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录锁页（z-index 10000，面板与锁页样式均由 bootstrap 自注入，不依赖外部样式表加载时序；body 为 null 时挂到 documentElement；浅色纯 CSS 极光背景 + 玻璃卡片，徽标 + 眼睛明文切换 + 抖动错误 + spinner + `prefers-reduced-motion` 降级）。锁页表单提交正确密码后保存到该 key，同步弹窗与图片管理页照常复用（图片管理页本就自动用该 key 登录），正常使用中不再弹出密码框（原 401 兜底密码弹窗保留，用于会话中途改密）。云端不可达直接放行（首屏静默路径网络失败即放行；锁页表单态的提交失败显示错误并可重试，刷新页面同样回到静默放行路径）：门禁只是体验层，真正的数据防护始终由 Worker 端 401 承担，不得因网络故障把整站锁死。恢复页在门禁放行（静默或表单解锁）后才开始拉取；测试与代码不得依赖 body children 顺序定位同步面板。
 
-9. bootstrap.js 与 dirty-tracker.js 的协议常量（journal/intent/epoch/restore 标记、RESTORE_PAGE 判定、`rp-hub-r2-sync-v1` 与 `rp-hub-app-writers-v1` 两把 Web Locks 锁名）是人肉双写副本，两侧均有互指注释；audit-regressions.mjs 的静态断言逐字比较两侧声明，任何一侧改名必须双侧同步。
+9. bootstrap.js 与 dirty-tracker.js 的协议常量（journal/intent/epoch/restore 标记、RESTORE_PAGE 判定、`rp-hub-r2-sync-v1` 这把 Web Locks 锁名）是人肉双写副本，两侧均有互指注释；audit-regressions.mjs 的静态断言逐字比较两侧声明，任何一侧改名必须双侧同步。原第二把锁 `rp-hub-app-writers-v1`（业务页共享写租约 + 恢复排他锁）已于 2026-10 移除：真实浏览器中同页面持共享租约再请求排他会互相卡死，恢复流程反复误报"请关闭其他 RP Hub 页面"。恢复期间的跨标签页写保护改由 RESTORE_ACTIVE_KEY storage 信号（其他标签页暂停写入并显示遮罩）+ 恢复标签页自身的 write barrier（等待在途 IndexedDB 写事务收尾）承担，不再依赖 Web Locks 排他等待；不得在无重设计的情况下把这对共享/排他锁加回来。
 
 二、同步协议硬约束
 

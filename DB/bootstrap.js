@@ -916,27 +916,6 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    async function withRestoreWriteLock(task) {
-        if (!navigator.locks?.request) throw new Error('此浏览器不支持安全恢复，请更新浏览器后重试。');
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
-        try {
-            // 锁名与 dirty-tracker.js acquireWriterLease 的 shared 模式锁
-            // 互为副本（恢复期间排他压过业务页共享租约），改必须双侧同步。
-            return await navigator.locks.request('rp-hub-app-writers-v1', {
-                mode: 'exclusive', signal: controller.signal
-            }, async () => {
-                clearTimeout(timeout);
-                return task();
-            });
-        } catch (error) {
-            if (error.name === 'AbortError') throw new Error('请关闭其他 RP Hub 页面后重试恢复。');
-            throw error;
-        } finally {
-            clearTimeout(timeout);
-        }
-    }
-
     function getStoredSyncPassword() {
         return localStorage.getItem(CONFIG.passwordStorageKey) || '';
     }
@@ -2605,32 +2584,20 @@ function createAutoSaveScheduler(options = {}) {
                 }
             );
             updateProgress(72, '正在恢复…');
-            const previousRestoreActive = localStorage.getItem(RESTORE_ACTIVE_KEY);
             const restoreEpoch = crypto.randomUUID();
-            let restoreStarted = false;
+            // 写冻结信号先于任何业务库写入：其他标签页收到 storage 事件后
+            // 暂停写入并显示恢复遮罩；本标签页由 waitForIndexedDbWriteBarrier
+            // 等待在途写事务收尾。恢复中途失败时保留该标记（其他标签页
+            // 维持写冻结），由中断恢复流程接管或完整重试后清除。
             localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
             localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
-            try {
-                await withRestoreWriteLock(async () => {
-                    restoreStarted = true;
-                    await waitForIndexedDbWriteBarrier();
-                    // 一次 readDirtyState 同时供恢复水印（acknowledge）与
-                    // 缓存 epochs 使用，避免恢复路径重复全量扫描变更日志。
-                    const dirtyState = await readDirtyState();
-                    await restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState);
-                    if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
-                        localStorage.removeItem(RESTORE_ACTIVE_KEY);
-                    }
-                });
-            } catch (error) {
-                if (!restoreStarted && localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
-                    if (previousRestoreActive) {
-                        localStorage.setItem(RESTORE_ACTIVE_KEY, previousRestoreActive);
-                    } else {
-                        localStorage.removeItem(RESTORE_ACTIVE_KEY);
-                    }
-                }
-                throw error;
+            await waitForIndexedDbWriteBarrier();
+            // 一次 readDirtyState 同时供恢复水印（acknowledge）与
+            // 缓存 epochs 使用，避免恢复路径重复全量扫描变更日志。
+            const dirtyState = await readDirtyState();
+            await restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState);
+            if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
+                localStorage.removeItem(RESTORE_ACTIVE_KEY);
             }
         } finally {
             try { await clearDownloadStagingStore(stagingDb); } catch (_) { }

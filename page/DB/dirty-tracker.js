@@ -21,16 +21,6 @@
     const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
     const initialRestoreEpoch = localStorage.getItem(RESTORE_EPOCH_KEY);
     let restorePaused = Boolean(localStorage.getItem(RESTORE_ACTIVE_KEY));
-    let releaseWriterLease = null;
-    const acquireWriterLease = () => {
-        if (!navigator.locks?.request || restorePaused || RESTORE_PAGE) return;
-        // 锁名与 bootstrap.js withRestoreWriteLock 的排他锁互为副本
-        // （恢复期间被排他压制），改必须双侧同步。
-        navigator.locks.request('rp-hub-app-writers-v1', { mode: 'shared' }, () => {
-            if (restorePaused || localStorage.getItem(RESTORE_ACTIVE_KEY)) return;
-            return new Promise(resolve => { releaseWriterLease = resolve; });
-        });
-    };
     const isAppKey = key => String(key).startsWith('rp_hub_') || String(key).startsWith('ai_chargen_');
 
     const showRestorePause = () => {
@@ -51,8 +41,6 @@
     const checkRestoreState = () => {
         if (localStorage.getItem(RESTORE_ACTIVE_KEY)) {
             restorePaused = true;
-            releaseWriterLease?.();
-            releaseWriterLease = null;
             showRestorePause();
         } else if (restorePaused || localStorage.getItem(RESTORE_EPOCH_KEY) !== initialRestoreEpoch) {
             location.reload();
@@ -74,17 +62,9 @@
     window.addEventListener('storage', event => {
         if (event.key === RESTORE_ACTIVE_KEY || event.key === RESTORE_EPOCH_KEY) checkRestoreState();
     });
-    window.addEventListener('pageshow', event => {
-        checkInterruptedRestore();
-        if (event.persisted && !restorePaused) acquireWriterLease();
-    });
+    window.addEventListener('pageshow', checkInterruptedRestore);
     window.addEventListener('focus', checkInterruptedRestore);
-    window.addEventListener('pagehide', () => {
-        releaseWriterLease?.();
-        releaseWriterLease = null;
-    });
     document.addEventListener('DOMContentLoaded', checkInterruptedRestore, { once: true });
-    acquireWriterLease();
     // Patch the factory prototype, not one window.indexedDB instance. WebKit
     // can recreate that instance after reconnecting to its database process;
     // an instance-only patch would then disappear while transaction tracking
