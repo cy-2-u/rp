@@ -875,8 +875,10 @@
         if (typeof window.RPHubAuthorSaveData !== 'function') return { grid: null, anchor: null };
         const cfg = settingsConfig();
         const { grid, anchor } = findFixedImageAnchor();
+        // 设置视图是条件渲染：网格尚未挂载时先跳过，等观察者在网格出现后补装。
+        if (!grid) return { grid: null, anchor: null };
         // 安装判定看开关行特有的 input：模型行复用同一个行类，但不能被当成开关本体
-        if (grid && grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return { grid, anchor };
+        if (grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return { grid, anchor };
         const label = document.createElement('label');
         // 行样式类全部来自适配层 ui.settings：作者改设置行样式时只更新适配 JSON。
         // 兜底值跟随作者当前设置行语义类，适配键缺失也不渲染裸样式。
@@ -1129,12 +1131,21 @@
             uiObserver.observe(target, { childList: true, subtree });
         });
     };
-    function reconcileUi() {
-        installSidebarActions();
-        installImageNav();
-        const fixedAnchor = installFixedImageSetting();
-        installYnaiModelHijack();
-        installScrollButton();
+        function reconcileUi() {
+        // 每步独立兜底：条件渲染的视图未挂载时单步可能拿不到锚点，
+        // 任何一步异常都不允许炸断后续安装与观察者挂载，否则视图
+        // 出现后无人补装（固定生图按钮永久消失正是这个链条断裂）。
+        let fixedAnchor = null;
+        const steps = [
+            () => installSidebarActions(),
+            () => installImageNav(),
+            () => { fixedAnchor = installFixedImageSetting(); },
+            () => installYnaiModelHijack(),
+            () => installScrollButton(),
+        ];
+        for (const step of steps) {
+            try { step(); } catch (_) { /* 单步失败不阻塞其余安装 */ }
+        }
         observeUiTargets(fixedAnchor);
     }
     const start = () => {

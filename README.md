@@ -241,7 +241,7 @@ npm run scale-sim
 
 ## 6. 适配与注入
 
-适配规则完全外置。`sourceChecks` 会对照真实作者文件验证标记；任一失配时 app.js 不做部分替换，主页面不注入 magic-extension/bootstrap，但仍注入 dirty-tracker 作为 IndexedDB 版本兼容和日志层。固定生图设置行复用作者 `settings-toggle-row` 语义类，行样式类同样来自适配清单：作者调整样式通常无需任何操作，改类名只需更新适配 JSON。
+适配规则完全外置。`sourceChecks` 会对照真实作者文件验证标记；任一失配时 app.js 不做部分替换，主页面不注入 magic-extension/bootstrap，但仍注入 dirty-tracker 作为 IndexedDB 版本兼容和日志层。固定生图设置行复用作者 `settings-toggle-row` 语义类，行样式类同样来自适配清单：作者调整样式通常无需任何操作，改类名只需更新适配 JSON。设置视图为条件渲染时网格可能晚于首屏挂载：固定生图安装会判空跳过，等 UI 观察者在网格出现后补装；reconcileUi 每步独立兜底，单步异常不影响观察者挂载与其余安装步骤。
 
 适配清单与作者页面均直连 GitHub，不经过任何第三方镜像/加速反代（2026-10 起移除多源竞速，避免镜像滞后与限流页污染）：适配清单只从 `raw.githubusercontent.com` 直连拉取（10 秒超时，响应体必须通过 JSON 校验——网关故障时可能返回 200 + HTML 错误页），失败后读取 R2 中的最近有效版本（`rp-adapter/last-good.json`）兜底；作者页面直连 GitHub Pages 主源，任何状态码（含 304/4xx/5xx）原样交调用方处理，不再有镜像回退与熔断状态。客户端适配拉取失败后每 6 秒自动重试（对齐 Worker 端 5 秒失败短路过期点），首屏注入缺失自动恢复、无需手动刷新。
 
