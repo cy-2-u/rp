@@ -176,7 +176,9 @@
             if (!scope.includes(JOURNAL)) scope.push(JOURNAL);
         }
         const tx = nativeTransaction.call(this, scope, mode, options);
-        if (mode === 'readwrite' && scope.includes(JOURNAL)) {
+        // mode 恒为 readwrite（只读事务已在函数开头透传返回）；
+        // 只有 scope 实际含 journal 时才需要完成/中止守卫。
+        if (scope.includes(JOURNAL)) {
             const pending = new Promise(resolve => {
                 tx.addEventListener('complete', resolve, { once: true });
                 tx.addEventListener('abort', resolve, { once: true });

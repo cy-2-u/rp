@@ -1,5 +1,5 @@
 RP Hub 魔改版：修改时必须保留的当前实现
-更新时间：2026-09-30
+更新时间：2026-10-08
 
 一、部署与文件边界
 
@@ -12,6 +12,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 3. R2 binding 固定为 `RP_SYNC_R2`；可选密码固定为 `RP_SYNC_PASSWORD`。
    外部适配地址固定在 `_worker.js` 的 `DEFAULT_ADAPTER_URL`。
    `RPHUB_ADAPTER_URL` 只允许本地 `file://` 测试覆盖。
+   部署器（deployer/worker.js）新增的 `/api/projects`、`/api/project-check`、`/api/update` 依赖同一对常量做"魔改版项目"判定（生产配置同时含该密码变量与该 R2 绑定）；判定只看键名存在性，不得读取或回传变量值。`/api/update` 服务端必须保留二次校验，防止绕过前端刷新非魔改版项目；更新不改密码、不动 R2 数据。
 
 4. 未注册路径继续回源作者站。适配规则、source checks、UI 选择器和注入行样式类（固定生图 rowClass/textClass/toggleWrapClass/toggleClass，跟随作者 `settings-toggle-row` 语义类）继续放在 `adapter/rp-hub.json`，不要重新硬编码进 Worker 或 magic-extension。
 
@@ -21,7 +22,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 6. 云端配置与作者页面均直连 GitHub，不经过任何第三方镜像/加速反代（2026-10 起移除多源竞速与作者页镜像回退/60 秒熔断，避免镜像滞后与限流页污染；任何用户数据同样不得经过第三方镜像）：适配清单只从 `raw.githubusercontent.com` 直连拉取（10 秒超时，响应体必须通过 JSON 校验——网关在故障时可能返回 200 + HTML 错误页，非 JSON 内容按失败处理），失败后读 R2 `rp-adapter/last-good.json` 兜底；作者页面直连 GitHub Pages 主源，任何状态码（含 304/4xx/5xx）原样交调用方处理，超时/网络错误直接抛出，sourceChecks 走同一条直连链；`tryLoadAdapter` 失败降级为纯代理的语义保持不变；适配清单加载失败（连 last-good 也没有）时按 5 秒失败短路缓存，避免适配源抖动期间每个作者资源请求重付直连超时（file:// 本地源不缓存失败）；magic-extension 侧适配拉取失败后每 6 秒自动重试（对齐失败短路过期点），首屏注入缺失自动恢复、无需手动刷新。
 
-7. 三个注入静态文件（dirty-tracker、magic-extension、bootstrap）的资产缓存固定为 no-cache 协商缓存：每次部署 etag 必然变化，刷新必然拿到当前部署副本（409 版本门语义），未变化请求 304，不重复下载约 215KB；不得退回 no-store。
+7. 三个注入静态文件（dirty-tracker、magic-extension、bootstrap）的资产缓存固定为 no-cache 协商缓存：每次部署 etag 必然变化，刷新必然拿到当前部署副本（409 版本门语义），未变化请求 304，不重复下载约 234KB；不得退回 no-store。
 
 8. 开屏访问门禁：主页与恢复页由 bootstrap.js 在站点打开时先静默做一次同步密码校验（`auth-status` 单次请求，`retryCount: 0`、8 秒超时）。**已保存密码（`rp_hub_sync_password_v1`）验证通过时全程不出现任何登录 UI**，照常进入站点；只有云端要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录锁页（z-index 10000，面板与锁页样式均由 bootstrap 自注入，不依赖外部样式表加载时序；body 为 null 时挂到 documentElement；浅色纯 CSS 极光背景 + 玻璃卡片，徽标 + 眼睛明文切换 + 抖动错误 + spinner + `prefers-reduced-motion` 降级）。锁页表单提交正确密码后保存到该 key，同步弹窗与图片管理页照常复用（图片管理页本就自动用该 key 登录），正常使用中不再弹出密码框（原 401 兜底密码弹窗保留，用于会话中途改密）。云端不可达直接放行（首屏静默路径网络失败即放行；锁页表单态的提交失败显示错误并可重试，刷新页面同样回到静默放行路径）：门禁只是体验层，真正的数据防护始终由 Worker 端 401 承担，不得因网络故障把整站锁死。恢复页在门禁放行（静默或表单解锁）后才开始拉取；测试与代码不得依赖 body children 顺序定位同步面板。
 
@@ -103,7 +104,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 8. 上传/下载为整体替换语义（单用户产品决策，最后点击者生效）：上传以上传开始时的云端状态为 CAS 基准，用本机数据整体替换云端（本机为空则清空云端）；下载用云端整体替换本机。客户端不做跨设备基线比对与自动合并；服务器端根切换 etag CAS 与 mutation lock 保持不变（并发上传时后提交者会 CAS 失败报错）。
 
-9. 不同步：`rp_hub_presets`、同步密码、自动保存开关与分钟配置、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、恢复状态键。
+9. 不同步：`rp_hub_presets`、同步密码、自动保存开关与分钟配置、上次同步徽标（`rp_hub_sync_last_result_v1`，bootstrap.js 启动时读入同步浮窗头部右侧，格式 `16:30 同步成功/同步失败`）、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、恢复状态键。
 
 10. 自动保存只使用一个前台 one-shot 定时器，不使用高频轮询：打开或刷新页面重新计时；隐藏、pagehide、freeze 时暂停，pageshow、resume 或重新可见时继续；电脑休眠没有跨浏览器可靠事件，延迟回调按保守策略不立即补传。自动保存复用现有上传 runner、Web Lock 和 `state.syncing`，无变化也执行 checksum 检查，失败等待下一完整周期，不自动弹窗或自动重建失效索引。
 
@@ -142,7 +143,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 2. 网络任务按读取 URL 共享；每个角色/消息/槽位独立提交记录。旧失败不能删除新任务的记录；成功记录继续复用；任务 Map 结束后清理，已结算槽位受上限淘汰。
 
-3. 图库后端列表必须使用 R2 cursor 分页（单页 40 个对象），前端用“加载下一批”合并角色数据；删除保持两阶段：先写墓碑并返回，再后台批量删除原图/缩略图。每请求最多 20 个目标，清空分组通过服务端 continuation 游标续传；失败 tombstone 必须保留在响应中供重试。
+3. 图库管理页整库单次加载：`/image/api/library` 循环翻页列出全部对象后一次性返回所有角色分组，前端一次 load 渲染全部角色卡，不做“加载下一批”；每张角色卡默认只渲染 8 张缩略图（≤720px 视口 6 张），卡内“显示更多”按钮纯前端按页追加，不产生额外请求。后端 library 的墓碑过滤用一次墓碑前缀全列集合比对（`listImageTombstoneKeys`），不逐对象 head。删除保持两阶段：先写墓碑并返回，再后台批量删除原图/缩略图。每请求最多 20 个目标，清空分组通过服务端 continuation 游标续传（游标分页的 `listImageObjects` 变体仅供 delete 目录展开使用）；失败 tombstone 必须保留在响应中供重试。
 
 4. 墓碑不能当工作区垃圾或 R2 垃圾删除。主 `/api/rp-image` 读取按墓碑优先（先查墓碑再查原图），删除后的生图读取立即返回占位图；后台物理删除失败时残留原图不会泄漏，会在下次打开图库时被后台清理。图库管理端点的墓碑优先策略尚未统一，不能扩大为全端点权限或读取保护承诺。
 

@@ -116,6 +116,31 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
 .btn-primary:active{transform:scale(.985)}
 .btn-primary[disabled]{opacity:.45; cursor:default}
 .note{margin:12px 0 0; text-align:center; font-size:11.5px; color:var(--text-2)}
+.btn-update{margin-top:8px; background:var(--ghost-bg); color:var(--text)}
+.btn-update:hover{background:rgba(120,120,128,.2)}
+.btn-update:disabled{opacity:.45; cursor:default}
+
+/* ---------- 项目列表（更新流程） ---------- */
+#projects{margin-top:14px}
+.proj-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px}
+.proj-title{font-size:13px; font-weight:600}
+.proj-head .btn-ghost{height:26px; padding:0 10px; font-size:12px}
+.proj-list{list-style:none; margin:0; padding:0; display:grid; gap:6px}
+.proj-item{
+  width:100%; display:flex; align-items:center; gap:8px;
+  border:1px solid var(--inp-border); border-radius:8px;
+  background:var(--inp-bg); color:var(--text);
+  font-family:inherit; font-size:13px; text-align:left;
+  padding:8px 10px; cursor:pointer;
+  transition:border-color .15s, background .15s;
+}
+.proj-item:hover{border-color:var(--blue); background:rgba(0,122,255,.06)}
+.proj-item:disabled{opacity:.55; cursor:wait}
+.proj-name{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.proj-check{flex:none; margin-left:auto; font-size:11.5px; color:var(--text-2); white-space:nowrap}
+.proj-check.ok{color:#1d8a2e}
+.proj-check.bad{color:var(--err-t)}
+.proj-empty{margin:0; font-size:12.5px; color:var(--text-2); text-align:center; padding:8px 0}
 .err{
   margin-top:12px; border-radius:8px; padding:9px 12px;
   background:var(--err-bg); color:var(--err-t);
@@ -242,8 +267,16 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
         <input id="projectName" type="text" placeholder="例如 rp-hub" autocomplete="off" spellcheck="false">
       </label>
       <button id="deploy" class="btn-primary" type="button">部署</button>
-      <p class="note">令牌通过 zhao 的 Worker 转发部署。</p>
+      <button id="update" class="btn-primary btn-update" type="button">更新</button>
+      <p class="note">令牌通过 zhao 的 Worker 转发部署；「更新」把已有魔改版项目刷成 GitHub 最新版。</p>
       <div id="err" class="err" hidden></div>
+      <div id="projects" hidden>
+        <div class="proj-head">
+          <span class="proj-title">你的项目</span>
+          <button id="proj-refresh" class="btn-ghost sm" type="button">刷新</button>
+        </div>
+        <ul id="proj-list" class="proj-list"></ul>
+      </div>
     </div>
 
     <!-- 部署中 -->
@@ -261,13 +294,12 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
       <div class="row"><span class="rl">网址</span><code class="chip" id="url"></code>
         <button class="copy" data-copy="url" aria-label="拷贝网址"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg></button>
       </div>
-      <div class="row"><span class="rl">密码</span><code class="chip" id="pwd"></code>
+      <div class="row" id="pwdrow"><span class="rl">密码</span><code class="chip" id="pwd"></code>
         <button class="copy" data-copy="pwd" aria-label="拷贝密码"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg></button>
       </div>
       <p class="note">网址就是你的 RP-Hub 站点地址，浏览器直接打开即可；密码是站点访问密码，首次打开站点时输入一次（同步与图片管理共用），不是填进站内的同步设置。</p>
       <div class="btnrow">
         <a id="open" class="btn-primary sm" href="#" target="_blank" rel="noopener">打开站点</a>
-        <button id="again" class="btn-ghost" type="button">再部署一个</button>
       </div>
     </div>
 
@@ -347,6 +379,8 @@ const pages = { deploy: $('page-deploy'), token: $('page-token'), r2: $('page-r2
 function switchPage(name) {
   document.querySelectorAll('#mainNav button').forEach(b => b.classList.toggle('on', b.dataset.page === name));
   for (const k in pages) pages[k].hidden = (k !== name);
+  // “再部署一个”按钮已移除：完成页点导航上的「部署」回到表单（部署进行中不打扰）
+  if (name === 'deploy' && views.done.hidden === false) show('form');
 }
 document.querySelectorAll('#mainNav button').forEach(b => b.addEventListener('click', () => switchPage(b.dataset.page)));
 
@@ -433,7 +467,145 @@ $('deploy').addEventListener('click', async () => {
   }
 });
 
-$('again').addEventListener('click', () => show('form'));
+/* 更新：拉取项目列表 → 点击项目校验魔改版标记 → 确认后刷新到 GitHub 最新版 */
+const updateBtn = $('update');
+let updating = false;
+
+function postWorker(path, body){
+  return fetch(WORKER + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(r => r.json().catch(() => null));
+}
+
+async function loadProjects(){
+  const token = $('token').value.trim();
+  $('err').hidden = true;
+  if (!token){ showError('请先填写令牌。'); return; }
+  if (!WORKER){ showError('部署服务未配置。'); return; }
+  writeFormMemory({ token, password: $('password').value, projectName: $('projectName').value.trim() });
+  updateBtn.disabled = true;
+  updateBtn.textContent = '读取中…';
+  const box = $('projects');
+  const list = $('proj-list');
+  list.replaceChildren(Object.assign(document.createElement('li'), { className: 'proj-empty', textContent: '正在读取项目…' }));
+  box.hidden = false;
+  try {
+    const data = await postWorker('/api/projects', { token });
+    if (!(data && data.ok) || !Array.isArray(data.projects)){
+      list.replaceChildren(Object.assign(document.createElement('li'), {
+        className: 'proj-empty',
+        textContent: (data && data.error) || ('读取失败（HTTP 状态异常）'),
+      }));
+      return;
+    }
+    if (!data.projects.length){
+      list.replaceChildren(Object.assign(document.createElement('li'), {
+        className: 'proj-empty',
+        textContent: '该账号下没有 Pages 项目，先用「部署」创建一个。',
+      }));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const p of data.projects){
+      const li = document.createElement('li');
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'proj-item';
+      btn.dataset.project = p.name;
+      const name = document.createElement('span');
+      name.className = 'proj-name';
+      name.textContent = p.name;
+      const check = document.createElement('span');
+      check.className = 'proj-check' + (p.isMod ? ' ok' : ' bad');
+      check.textContent = p.isMod ? '魔改版 ✓' : '非魔改版';
+      btn.append(name, check);
+      btn.addEventListener('click', () => pickProject(p, btn));
+      li.append(btn);
+      frag.append(li);
+    }
+    list.replaceChildren(frag);
+  } catch {
+    list.replaceChildren(Object.assign(document.createElement('li'), {
+      className: 'proj-empty',
+      textContent: '网络异常，稍后再试。',
+    }));
+  } finally {
+    updateBtn.disabled = false;
+    updateBtn.textContent = '更新';
+  }
+}
+
+async function pickProject(p, btn){
+  if (updating) return;
+  const token = $('token').value.trim();
+  $('err').hidden = true;
+  if (!p.isMod){
+    showError('「' + p.name + '」不是魔改版部署（缺少同步密码变量或 R2 绑定），不能从这里更新。');
+    return;
+  }
+  // 列表快照可能过期：点选时再查一次该项目的实时配置确认魔改版身份
+  btn.disabled = true;
+  const prevLabel = btn.querySelector('.proj-check').textContent;
+  const check = btn.querySelector('.proj-check');
+  check.className = 'proj-check';
+  check.textContent = '正在校验…';
+  let live;
+  try {
+    live = await postWorker('/api/project-check', { token, projectName: p.name });
+  } catch {
+    live = null;
+  }
+  btn.disabled = false;
+  if (!(live && live.ok)){
+    check.className = 'proj-check bad';
+    check.textContent = prevLabel;
+    showError((live && live.error) || '校验失败，请稍后再试。');
+    return;
+  }
+  if (!live.isMod){
+    check.className = 'proj-check bad';
+    check.textContent = '非魔改版';
+    showError('「' + p.name + '」不是魔改版部署，不能从这里更新。');
+    return;
+  }
+  check.className = 'proj-check ok';
+  check.textContent = '魔改版 ✓';
+  if (!confirm('确认把「' + p.name + '」更新到 GitHub 最新版？\n现有云端数据不受影响，站点会短暂重新部署。')) return;
+  runUpdate(p.name, token);
+}
+
+async function runUpdate(name, token){
+  updating = true;
+  updateBtn.disabled = true;
+  document.querySelectorAll('.proj-item').forEach(b => { b.disabled = true; });
+  show('progress'); startSteps();
+  try {
+    const data = await postWorker('/api/update', { token, projectName: name });
+    if (data && data.ok){
+      stopSteps();
+      $('url').textContent = data.url;
+      const pw = $('password').value;
+      $('pwdrow').hidden = !pw;
+      $('pwd').textContent = pw;
+      $('open').href = data.url;
+      show('done');
+    } else {
+      stopSteps(); show('form');
+      showError((data && data.error) || ('更新失败（HTTP 状态异常）'));
+    }
+  } catch {
+    stopSteps(); show('form');
+    showError('网络异常，稍后再试。');
+  } finally {
+    updating = false;
+    updateBtn.disabled = false;
+  }
+}
+
+updateBtn.addEventListener('click', () => { loadProjects().catch(() => {}); });
+$('proj-refresh').addEventListener('click', () => { loadProjects().catch(() => {}); });
 </script>
 </body>
 </html>

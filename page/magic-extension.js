@@ -242,6 +242,12 @@
 
     const saveImageStore = (state, retry = false) => {
         if (!state) return Promise.resolve();
+        // 无待写内容且无未结算修订时完全短路：不开库、不排队、不递增
+        // revision（过去 flush 重试路径会对空 pendings 白跑一次读改写）。
+        if (state.savedRevision === state.saveRevision
+            && state.pendingUpserts.size === 0 && state.pendingDeleteKeys.size === 0) {
+            return Promise.resolve();
+        }
         if (!retry) state.saveRevision += 1;
         const write = state.writeQueue.catch(() => undefined).then(async () => {
             if (state.savedRevision === state.saveRevision
@@ -714,14 +720,7 @@
     const migrateLegacyImageRegex = () => new Promise(resolve => {
         if (!activeAdapter) return resolve(false);
         if (localStorage.getItem(LEGACY_REGEX_MIGRATION_KEY) === '1') return resolve(false);
-        const request = indexedDB.open('RPHubDB');
-        request.onupgradeneeded = event => {
-            const db = event.target.result;
-            if (!db.objectStoreNames.contains('store')) db.createObjectStore('store');
-        };
-        request.onerror = () => resolve(false);
-        request.onsuccess = () => {
-            const db = request.result;
+        openImageDatabase().then(db => {
             if (!db.objectStoreNames.contains('store')) {
                 db.close();
                 localStorage.setItem(LEGACY_REGEX_MIGRATION_KEY, '1');
@@ -751,7 +750,7 @@
                 db.close();
                 resolve(false);
             };
-        };
+        }, () => resolve(false));
     });
 
     loadUiAdapter().then(adapter => {
@@ -799,9 +798,6 @@
             '.magic-scroll-button.is-visible{display:flex}',
             '.magic-scroll-sentinel{width:1px;height:1px;pointer-events:none}',
             '.magic-image-suppressed{display:none!important}',
-            '.magic-ynai-model-row .magic-ynai-model-select{max-width:180px;height:32px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#111827;font-size:12px;padding:0 6px;outline:none}',
-            '.magic-ynai-model-row .magic-ynai-model-hint{margin-left:8px;font-size:11px;color:#6b7280;cursor:pointer;white-space:nowrap}',
-            '.magic-ynai-model-row .magic-ynai-model-hint:hover{color:#2563eb}',
             '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
             '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}'
@@ -876,11 +872,11 @@
         return { grid, anchor };
     };
     const installFixedImageSetting = () => {
-        if (typeof window.RPHubAuthorSaveData !== 'function') return;
+        if (typeof window.RPHubAuthorSaveData !== 'function') return { grid: null, anchor: null };
         const cfg = settingsConfig();
         const { grid, anchor } = findFixedImageAnchor();
         // 安装判定看开关行特有的 input：模型行复用同一个行类，但不能被当成开关本体
-        if (!grid || grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return;
+        if (grid && grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return { grid, anchor };
         const label = document.createElement('label');
         // 行样式类全部来自适配层 ui.settings：作者改设置行样式时只更新适配 JSON。
         // 兜底值跟随作者当前设置行语义类，适配键缺失也不渲染裸样式。
@@ -893,6 +889,7 @@
         grid.insertBefore(label, anchor
             ? (insertAfter ? anchor.nextSibling : anchor)
             : (insertAfter ? grid.children[0]?.nextSibling || null : null));
+        return { grid, anchor };
     };
 
     // YNAI 模型劫持：密钥为 YNAI- 时隐藏作者“生图版本”浮窗，原位放入同款样式的
@@ -902,7 +899,7 @@
     // sta1n 密钥时移除劫持、还原作者浮窗。浮窗定位不写死 DOM 结构：按适配层
     // ui.settings.modelLabel 文本找到设置标签，再找同容器里的 custom-select 渲染根。
     const YNAI_SELECT_CLASS = 'magic-ynai-select';
-    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, models: null, renderedModels: null };
+    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, failedAt: 0, models: null, renderedModels: null };
 
     const readAuthorImageGenKey = async () => {
         try {
@@ -964,6 +961,30 @@
         localStorage.setItem(YNAI_MODEL_KEY, preferred);
     };
 
+    // ynai 模型列表拉取：30 秒超时；失败后退避（同 key 60 秒内不重发），
+    // 避免 reconcile 每 4 秒对故障端点连续打请求。
+    const YNAI_MODEL_FETCH_TIMEOUT_MS = 30_000;
+    const YNAI_MODEL_FAILURE_BACKOFF_MS = 60_000;
+    const fetchYnaiModels = async key => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), YNAI_MODEL_FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch('/api/rp-image-models', {
+                headers: { 'x-rp-image-token': key.trim() },
+                signal: controller.signal
+            });
+            const payload = await response.json().catch(() => null);
+            const models = payload && Array.isArray(payload.data) ? payload.data.filter(item => item?.id) : [];
+            if (!response.ok || !models.length) throw new Error(payload?.error || `HTTP ${response.status}`);
+            return models;
+        } catch (error) {
+            ynaiSelectState.failedAt = Date.now();
+            throw error;
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
     const applyYnaiModelHijack = async (box, control, select, force = false) => {
         const now = Date.now();
         if (!force && now - ynaiSelectState.checkedAt < 4000) return;
@@ -975,6 +996,7 @@
         if (!ynai) return;
         if (ynaiSelectState.key !== key) {
             ynaiSelectState.loaded = false;
+            ynaiSelectState.failedAt = 0;
             ynaiSelectState.models = readStoredYnaiModels();
         }
         if (ynaiSelectState.models) {
@@ -986,18 +1008,20 @@
             }
         }
         if (ynaiSelectState.loading || ynaiSelectState.loaded) return;
+        // 上次拉取失败后 60 秒内静默跳过（缓存列表仍可显示）。
+        if (ynaiSelectState.failedAt && now - ynaiSelectState.failedAt < YNAI_MODEL_FAILURE_BACKOFF_MS) return;
         ynaiSelectState.key = key;
         ynaiSelectState.loading = true;
         try {
-            const response = await fetch('/api/rp-image-models', { headers: { 'x-rp-image-token': key.trim() } });
-            const payload = await response.json().catch(() => null);
-            const models = payload && Array.isArray(payload.data) ? payload.data.filter(item => item?.id) : [];
-            if (!response.ok || !models.length) throw new Error(payload?.error || `HTTP ${response.status}`);
+            const models = await fetchYnaiModels(key);
             ynaiSelectState.models = models;
             ynaiSelectState.loaded = true;
+            ynaiSelectState.failedAt = 0;
             ynaiSelectState.renderedModels = models;
             try { localStorage.setItem(YNAI_MODEL_LIST_KEY, JSON.stringify(models)); } catch (_) { }
             renderYnaiSelectOptions(select, models);
+        } catch (_) {
+            // 失败保持已有缓存/回退默认；failedAt 已记录，退避到期后 reconcile 重试。
         } finally {
             ynaiSelectState.loading = false;
         }
@@ -1085,7 +1109,7 @@
             reconcileUi();
         });
     });
-    const observeUiTargets = () => {
+    const observeUiTargets = fixedAnchor => {
         uiObserver.disconnect();
         const targets = new Set([
             document.body,
@@ -1093,7 +1117,9 @@
             document.querySelector('.app-sidebar'),
             document.querySelector(navigationConfig().content || '.app-navigation-content'),
             document.querySelector('.app-main'),
-            findFixedImageAnchor().grid,
+            // reconcileUi 已算过一次固定生图锚点（installFixedImageSetting 的
+            // 返回值），这里直接复用，不再第三次扫设置区 DOM。
+            fixedAnchor?.grid || null,
             document.querySelector(chatConfig().input || 'textarea.chat-input-scrollbar')?.closest(chatConfig().row || '.relative.w-full.flex.items-end'),
             scrollContainer
         ].filter(Boolean));
@@ -1106,10 +1132,10 @@
     function reconcileUi() {
         installSidebarActions();
         installImageNav();
-        installFixedImageSetting();
+        const fixedAnchor = installFixedImageSetting();
         installYnaiModelHijack();
         installScrollButton();
-        observeUiTargets();
+        observeUiTargets(fixedAnchor);
     }
     const start = () => {
         installStyle();

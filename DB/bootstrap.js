@@ -283,16 +283,11 @@ function createAutoSaveScheduler(options = {}) {
         clearScheduled();
         emit('stop');
     }
-    function setActive(value) {
-        if (value) resume();
-        else pause();
-    }
     return Object.freeze({
         start,
         pause,
         resume,
         stop,
-        setActive,
         getState: () => ({ enabled, active, remainingMs, timerActive: timerId !== null })
     });
 }
@@ -508,11 +503,43 @@ function createAutoSaveScheduler(options = {}) {
 }
 
 .rp-sync-auto-save__status {
+    flex: 1 1 auto;
+    min-width: 0;
     min-height: 18px;
     margin: 8px 0 0;
     color: #64748b;
     font-size: 12px;
     line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 底行：左自动保存状态、右上次同步结果，形成对称 */
+.rp-sync-auto-save__footer {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+/* 上次同步结果：与左侧自动保存状态同一行、靠右对称，一行短文案（HH:MM 同步成功/失败） */
+.rp-sync-last-sync {
+    flex: 0 0 auto;
+    margin: 8px 0 0;
+    padding-left: 12px;
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.5;
+    white-space: nowrap;
+}
+
+.rp-sync-last-sync.is-ok {
+    color: #15803d;
+}
+
+.rp-sync-last-sync.is-fail {
+    color: #b91c1c;
 }
 
 .rp-sync-action-button {
@@ -699,6 +726,13 @@ function createAutoSaveScheduler(options = {}) {
         margin-left: auto;
     }
 
+    // 窄屏底行两段文案可能放不下：允许换行，右侧徽标掉到状态下一行靠左，
+    // 与桌面"同一行左右对称"的差异只发生在 320px 级别的极端窄屏。
+    .rp-sync-auto-save__footer {
+        flex-wrap: wrap;
+        row-gap: 2px;
+    }
+
     .rp-sync-action-button {
         height: 42px;
         font-size: 14px;
@@ -742,6 +776,7 @@ function createAutoSaveScheduler(options = {}) {
         lockName: 'rp-hub-r2-sync-v1',
         autoSaveEnabledKey: 'rp_hub_sync_auto_save_enabled_v1',
         autoSaveMinutesKey: 'rp_hub_sync_auto_save_minutes_v1',
+        lastSyncKey: 'rp_hub_sync_last_result_v1',
         autoSaveDefaultMinutes: 5,
         autoSaveMinMinutes: 1,
         autoSaveMaxMinutes: 1440,
@@ -875,7 +910,6 @@ function createAutoSaveScheduler(options = {}) {
 
     function requestExplicitRebuild() {
         localStorage.setItem('rp_sync_rebuild_requested', '1');
-        return true;
     }
 
 
@@ -1630,20 +1664,28 @@ function createAutoSaveScheduler(options = {}) {
             await cacheWriteState(cacheDb, state);
         };
         const yieldIfNeeded = createYieldController();
-        const removeEntries = async keys => {
+        const removeEntries = async (keys, knownBuckets = null) => {
             const list = [...keys];
             if (!list.length) return;
-            for (const entry of await readCacheEntries(cacheDb, list)) {
-                if (entry) touchBucket(entry.bucketKey);
+            // clear 差分路径已在游标单遍里顺带收集桶，跳过按键重读；
+            // 其余路径仍需读回条目取 bucketKey。
+            if (knownBuckets) {
+                for (const bucketKey of knownBuckets) touchBucket(bucketKey);
+            } else {
+                for (const entry of await readCacheEntries(cacheDb, list)) {
+                    if (entry) touchBucket(entry.bucketKey);
+                }
             }
             await flushPendingBuckets();
             await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE, list);
         };
-        const replaceSource = async (sourceKey, value) => {
+        const replaceSource = async (sourceKey, value, previous = null) => {
             const remaining = new Set(await cacheSourceKeys(cacheDb, sourceKey));
             if (value) {
                 const id = snapshotEntryId(value);
-                const previous = await cacheReadEntry(cacheDb, id);
+                // 调用方若已预读同一条目（如 header 的 stabilize 判断）则直接
+                // 复用，省一次事务；其余路径照旧自读。
+                if (!previous) previous = await cacheReadEntry(cacheDb, id);
                 remaining.delete(id);
                 if (!previous || !snapshotBytesEqual(value, previous.bytes)) {
                     const entry = buildCacheEntry(value);
@@ -1729,7 +1771,7 @@ function createAutoSaveScheduler(options = {}) {
                         headerValue = stabilized;
                     }
                 }
-                await replaceSource(`db:${database}`, headerValue);
+                await replaceSource(`db:${database}`, headerValue, previousHeader);
                 await replaceSource(`db-end:${database}`, { type: 'databaseEnd', name: database });
                 for (const definition of stores) {
                     await replaceSource(`store-end:${database}/${definition.name}`, { type: 'storeEnd', database, store: definition.name });
@@ -1752,14 +1794,20 @@ function createAutoSaveScheduler(options = {}) {
                     const request = tx.objectStore(LOCAL_CACHE_ENTRY_STORE)
                         .index('sourceKey').openCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
                     const keys = [];
+                    const staleBuckets = new Set();
                     request.onsuccess = () => {
                         const cursor = request.result;
                         if (!cursor) return;
-                        if (!finalSources.has(cursor.key)) keys.push(cursor.primaryKey);
+                        if (!finalSources.has(cursor.key)) {
+                            keys.push(cursor.primaryKey);
+                            if (cursor.value?.bucketKey) staleBuckets.add(cursor.value.bucketKey);
+                        }
                         cursor.continue();
                     };
                     const staleKeys = await waitForTransaction(tx, '本地同步索引读取失败。', () => keys);
-                    await removeEntries(staleKeys);
+                    // 单遍完成收集与桶标记：游标值上已带 bucketKey，
+                    // removeEntries 不再把同一批键按键重读一遍。
+                    await removeEntries(staleKeys, staleBuckets);
                 }
                 const dirtyKeys = [...item.keys.values()].filter(key => !isSyncExcludedRecord(database, store, key));
                 // 单连接 + 批量只读事务读取变化键：原来每键重开一次数据库、
@@ -2299,13 +2347,15 @@ function createAutoSaveScheduler(options = {}) {
         await consumer.finish();
     }
 
-    function assertPackEntryPlacement(value, pack) {
-        const id = snapshotEntryId(value);
-        const group = snapshotEntryGroup(value);
-        const sourceKey = snapshotEntrySource(value);
-        const bucketKey = snapshotEntryBucket(value, id, sourceKey);
+    // entry 传入时复用已算好的 id/group/sourceKey/bucketKey（恢复热路径
+    // buildCacheEntry 刚算过同一套值），缺省时从 value 现算。
+    function assertPackEntryPlacement(value, pack, entry = null) {
+        const group = entry?.group ?? snapshotEntryGroup(value);
+        const bucketKey = entry?.bucketKey ?? snapshotEntryBucket(
+            value, snapshotEntryId(value), snapshotEntrySource(value)
+        );
         if (group !== pack.group || (bucketKey !== pack.bucketKey
-            && snapshotEntryBucket(value, id, sourceKey, true) !== pack.bucketKey)) {
+            && snapshotEntryBucket(value, snapshotEntryId(value), snapshotEntrySource(value), true) !== pack.bucketKey)) {
             throw new Error('服务器同步分片索引不一致。');
         }
     }
@@ -2405,20 +2455,30 @@ function createAutoSaveScheduler(options = {}) {
 
         const packManifest = [];
         let previousPageHash = MANIFEST_CHAIN_SEED;
-        for (let start = 0; start < pageCount; start += CONFIG.downloadPackConcurrency) {
-            const indexes = Array.from(
-                { length: Math.min(CONFIG.downloadPackConcurrency, pageCount - start) },
-                (_, offset) => start + offset
-            );
-            const pages = await Promise.all(indexes.map(pageIndex => postSync({
+        // 滑动窗口：始终维持 downloadPackConcurrency 个在途页请求。哈希链
+        // 要求按页序校验，所以按序 await；旧版批间串行——批内全部完成才
+        // 发下一批，网络往返无法重叠。
+        const concurrency = CONFIG.downloadPackConcurrency;
+        let nextToFetch = 0;
+        const inflight = new Map();
+        const startNext = () => {
+            if (nextToFetch >= pageCount) return;
+            const pageIndex = nextToFetch++;
+            const pending = postSync({
                 action: 'pull-manifest-page',
                 schemaVersion: SNAPSHOT_SCHEMA_VERSION,
                 version: remote.version,
                 pageIndex
-            })));
-            for (let offset = 0; offset < pages.length; offset += 1) {
-                const pageIndex = indexes[offset];
-                const page = pages[offset];
+            });
+            pending.catch(() => { });
+            inflight.set(pageIndex, pending);
+        };
+        for (let i = 0; i < concurrency && nextToFetch < pageCount; i += 1) startNext();
+        try {
+            for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+                const page = await inflight.get(pageIndex);
+                inflight.delete(pageIndex);
+                startNext();
                 if (Number(page.pageIndex) !== pageIndex || page.previousPageHash !== previousPageHash
                     || !Array.isArray(page.packs)) throw new Error('服务器同步清单页顺序异常。');
                 const normalized = page.packs.map(pack => ({
@@ -2436,6 +2496,9 @@ function createAutoSaveScheduler(options = {}) {
                 previousPageHash = expectedPageHash;
                 packManifest.push(...normalized);
             }
+        } finally {
+            // 校验异常提前退出时，放弃在途请求，不产生未处理拒绝。
+            for (const pending of inflight.values()) pending.catch(() => { });
         }
         if (previousPageHash !== pageRoot || packManifest.length !== packCount) {
             throw new Error('服务器同步清单页根不一致。');
@@ -2497,7 +2560,8 @@ function createAutoSaveScheduler(options = {}) {
                     async consume(value, pack, lineBytes) {
                         await restorer.consume(value);
                         const entry = buildCacheEntry(value, lineBytes);
-                        assertPackEntryPlacement(value, pack);
+                        // 恢复热路径：placement 断言直接复用 entry 的派生字段。
+                        assertPackEntryPlacement(value, pack, entry);
                         entry.bucketKey = pack.bucketKey;
                         pendingEntries.push(entry);
                         pendingBytes += entry.bytes.byteLength;
@@ -2648,16 +2712,21 @@ function createAutoSaveScheduler(options = {}) {
         );
     }
 
+    // JSON 与二进制拉取共用的请求发出：同一 endpoint、同一 header 构造、
+    // 同一 body 序列化，响应体留给调用方按需消费。
+    function sendSyncRequest(payload, options, signal) {
+        return fetch(CONFIG.apiEndpoint, {
+            method: 'POST',
+            headers: buildSyncHeaders(options),
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+            signal
+        });
+    }
+
     async function postSync(payload, options = {}) {
         return withSyncRetry(options, async signal => {
-            const response = await fetch(CONFIG.apiEndpoint, {
-                method: 'POST',
-                headers: buildSyncHeaders(options),
-                body: JSON.stringify(payload),
-                credentials: 'same-origin',
-                signal
-            });
-
+            const response = await sendSyncRequest(payload, options, signal);
             const data = await response.json().catch(() => ({}));
             if (!response.ok || !data.ok) throwSyncHttpError(response, data, options.keepPasswordOnAuthError);
             return data;
@@ -2666,14 +2735,7 @@ function createAutoSaveScheduler(options = {}) {
 
     async function postSyncBinary(payload, options = {}) {
         return withSyncRetry(options, async signal => {
-            const response = await fetch(CONFIG.apiEndpoint, {
-                method: 'POST',
-                headers: buildSyncHeaders(options),
-                body: JSON.stringify(payload),
-                credentials: 'same-origin',
-                signal
-            });
-
+            const response = await sendSyncRequest(payload, options, signal);
             if (!response.ok) {
                 throwSyncHttpError(response, await response.json().catch(() => ({})), options.keepPasswordOnAuthError);
             }
@@ -2681,22 +2743,10 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
-    async function postUploadPack(records, uploadId) {
-        if (!Array.isArray(records) || records.length !== 1) throw new Error('每次只能上传一个同步分片。');
-        const record = records[0];
-        const body = record.bytes;
-        record.bytes = null;
-        const params = new URLSearchParams({
-            action: 'upload-pack',
-            uploadId,
-            checksum: record.checksum,
-            length: String(record.length),
-            entryCount: String(record.entryCount)
-        });
-        return withSyncRetry({
-            timeoutMs: CONFIG.packTransferTimeoutMs,
-            abortMessage: '上传超时，请检查网络后重试。'
-        }, async signal => {
+    // 二进制上传（upload-pack/upload-bloom）共用的 octet-stream POST：
+    // 地址带 query、成功返回空体 204。
+    async function postBinaryToQuery(params, body, options = {}) {
+        return withSyncRetry(options, async signal => {
             const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
                 method: 'POST',
                 headers: {
@@ -2713,25 +2763,29 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
+    async function postUploadPack(records, uploadId) {
+        if (!Array.isArray(records) || records.length !== 1) throw new Error('每次只能上传一个同步分片。');
+        const record = records[0];
+        const body = record.bytes;
+        record.bytes = null;
+        const params = new URLSearchParams({
+            action: 'upload-pack',
+            uploadId,
+            checksum: record.checksum,
+            length: String(record.length),
+            entryCount: String(record.entryCount)
+        });
+        return postBinaryToQuery(params, body, {
+            timeoutMs: CONFIG.packTransferTimeoutMs,
+            abortMessage: '上传超时，请检查网络后重试。'
+        });
+    }
+
     async function postUploadBloom(uploadId, bloom) {
         const params = new URLSearchParams({ action: 'upload-bloom', uploadId });
-        return withSyncRetry({
+        return postBinaryToQuery(params, bloom, {
             timeoutMs: CONFIG.packTransferTimeoutMs,
             abortMessage: '同步过滤器上传超时，请检查网络后重试。'
-        }, async signal => {
-            const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
-                method: 'POST',
-                headers: {
-                    ...buildSyncHeaders({}, false),
-                    'content-type': 'application/octet-stream'
-                },
-                body: bloom,
-                credentials: 'same-origin',
-                signal
-            });
-            if (!response.ok) {
-                throwSyncHttpError(response, await response.json().catch(() => ({})));
-            }
         });
     }
 
@@ -2829,37 +2883,47 @@ function createAutoSaveScheduler(options = {}) {
         }
         const uploadId = begin.uploadId;
         await postUploadBloom(uploadId, bloom);
-        for (let pageIndex = Number(begin.nextPage || 0); pageIndex < snapshot.pageCount; pageIndex += 1) {
-            const packs = snapshot.packManifest.slice(
-                pageIndex * MANIFEST_PAGE_PACKS,
-                (pageIndex + 1) * MANIFEST_PAGE_PACKS
-            );
-            let pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
-                timeoutMs: CONFIG.commitTimeoutMs
-            });
-            if (Array.isArray(pageResult.missingPacks) && pageResult.missingPacks.length) {
-                const missing = new Set(pageResult.missingPacks);
-                const pageStart = progress.uploadStart + Math.round(
-                    (pageIndex / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
+        // 本地分片缓存连接按需懒开、整个上传会话复用：旧实现每缺片页各开
+        // 一次 IndexedDB，大库恢复续传时反复付开库开销；分片齐全的常见
+        // 续传路径则一次都不用开。
+        let cacheDb = null;
+        try {
+            for (let pageIndex = Number(begin.nextPage || 0); pageIndex < snapshot.pageCount; pageIndex += 1) {
+                const packs = snapshot.packManifest.slice(
+                    pageIndex * MANIFEST_PAGE_PACKS,
+                    (pageIndex + 1) * MANIFEST_PAGE_PACKS
                 );
-                const pageEnd = progress.uploadStart + Math.round(
-                    ((pageIndex + 1) / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
-                );
-                const pageBytes = packs.reduce((sum, pack) => sum + pack.length, 0);
-                await uploadCachedSnapshot(
-                    packs.filter(pack => missing.has(pack.checksum)),
-                    uploadId,
-                    pageBytes,
-                    pageStart,
-                    pageEnd
-                );
-                pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
+                let pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
                     timeoutMs: CONFIG.commitTimeoutMs
                 });
-                if (pageResult.missingPacks?.length) throw new Error('服务器仍缺少刚上传的同步分片。');
+                if (Array.isArray(pageResult.missingPacks) && pageResult.missingPacks.length) {
+                    const missing = new Set(pageResult.missingPacks);
+                    const pageStart = progress.uploadStart + Math.round(
+                        (pageIndex / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
+                    );
+                    const pageEnd = progress.uploadStart + Math.round(
+                        ((pageIndex + 1) / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
+                    );
+                    const pageBytes = packs.reduce((sum, pack) => sum + pack.length, 0);
+                    if (!cacheDb) cacheDb = await openLocalSyncCache();
+                    await uploadCachedSnapshot(
+                        packs.filter(pack => missing.has(pack.checksum)),
+                        uploadId,
+                        pageBytes,
+                        pageStart,
+                        pageEnd,
+                        cacheDb
+                    );
+                    pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
+                        timeoutMs: CONFIG.commitTimeoutMs
+                    });
+                    if (pageResult.missingPacks?.length) throw new Error('服务器仍缺少刚上传的同步分片。');
+                }
+                const ratio = snapshot.pageCount ? (pageIndex + 1) / snapshot.pageCount : 1;
+                updateProgress(progress.uploadStart + Math.round(ratio * (progress.commit - progress.uploadStart)), '正在分页校验…');
             }
-            const ratio = snapshot.pageCount ? (pageIndex + 1) / snapshot.pageCount : 1;
-            updateProgress(progress.uploadStart + Math.round(ratio * (progress.commit - progress.uploadStart)), '正在分页校验…');
+        } finally {
+            cacheDb?.close();
         }
         const finalized = await postSync({ action: 'finalize-upload', uploadId }, {
             retryCount: 1,
@@ -2871,33 +2935,30 @@ function createAutoSaveScheduler(options = {}) {
         return finalized.remote;
     }
 
-    async function uploadCachedSnapshot(packSource, uploadId, totalBytes, progressStart, progressEnd) {
-        const cacheDb = await openLocalSyncCache();
-        try {
-            const engine = window.RPH_SYNC_UPLOAD_ENGINE;
-            if (!engine?.runBoundedUpload) throw new Error('上传引擎未就绪，请刷新页面后重试。');
-            await engine.runBoundedUpload({
-                items: packSource,
-                concurrency: CONFIG.uploadBatchConcurrency,
-                maxItems: CONFIG.uploadBatchMaxPacks,
-                maxBytes: CONFIG.uploadBatchMaxBytes,
-                read: async pack => {
-                    const bytes = await cachePack(cacheDb, pack.checksum);
-                    if (!bytes || bytes.byteLength !== pack.length) {
-                        await cacheWriteState(cacheDb, null);
-                        throw new Error('本地同步缓存不完整，请重新上传。');
-                    }
-                    return { bytes };
-                },
-                send: records => postUploadPack(records, uploadId),
-                onBatchSuccess: ({ bytes }) => {
-                    const ratio = totalBytes > 0 ? Math.min(1, bytes / totalBytes) : 1;
-                    updateProgress(progressStart + Math.round(ratio * (progressEnd - progressStart)), '正在按分片上传…');
+    // cacheDb 由调用方（uploadPagedSnapshotAttempt）按需打开并统一关闭，
+    // 本函数只借用：一次会话可能因多页缺片进入多次。
+    async function uploadCachedSnapshot(packSource, uploadId, totalBytes, progressStart, progressEnd, cacheDb) {
+        const engine = window.RPH_SYNC_UPLOAD_ENGINE;
+        if (!engine?.runBoundedUpload) throw new Error('上传引擎未就绪，请刷新页面后重试。');
+        await engine.runBoundedUpload({
+            items: packSource,
+            concurrency: CONFIG.uploadBatchConcurrency,
+            maxItems: CONFIG.uploadBatchMaxPacks,
+            maxBytes: CONFIG.uploadBatchMaxBytes,
+            read: async pack => {
+                const bytes = await cachePack(cacheDb, pack.checksum);
+                if (!bytes || bytes.byteLength !== pack.length) {
+                    await cacheWriteState(cacheDb, null);
+                    throw new Error('本地同步缓存不完整，请重新上传。');
                 }
-            });
-        } finally {
-            cacheDb.close();
-        }
+                return { bytes };
+            },
+            send: records => postUploadPack(records, uploadId),
+            onBatchSuccess: ({ bytes }) => {
+                const ratio = totalBytes > 0 ? Math.min(1, bytes / totalBytes) : 1;
+                updateProgress(progressStart + Math.round(ratio * (progressEnd - progressStart)), '正在按分片上传…');
+            }
+        });
     }
 
     function updateProgress(progress, text) {
@@ -2928,6 +2989,43 @@ function createAutoSaveScheduler(options = {}) {
         if (pullButton) pullButton.disabled = disabled;
         if (pushButton) pushButton.disabled = disabled;
         if (rebuildButton) rebuildButton.disabled = disabled;
+    }
+
+    // ---- 上次同步结果徽标 ----
+    // 放在自动保存区底行右侧（与左侧自动保存状态对称）。只存最近一次的
+    // 结果（时间戳 + 成功/失败），格式化成 "16:30 同步成功"。
+    // 今天之外的记录不写日期（用户预期就是"最近一次"，过久会显示旧时间，
+    // 可接受；避免为极简文案引入日期逻辑）。
+    function readLastSync() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(CONFIG.lastSyncKey) || 'null');
+            if (!raw || typeof raw !== 'object' || !Number.isFinite(raw.at)) return null;
+            return { at: raw.at, ok: raw.ok === true };
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function renderLastSync() {
+        const badge = modalRoot?.querySelector('.rp-sync-last-sync');
+        if (!badge) return;
+        const record = readLastSync();
+        if (!record) {
+            badge.textContent = '';
+            badge.className = 'rp-sync-last-sync';
+            return;
+        }
+        const time = new Date(record.at);
+        const text = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')} ${record.ok ? '同步成功' : '同步失败'}`;
+        badge.textContent = text;
+        badge.className = `rp-sync-last-sync ${record.ok ? 'is-ok' : 'is-fail'}`;
+    }
+
+    function recordLastSync(ok) {
+        try {
+            localStorage.setItem(CONFIG.lastSyncKey, JSON.stringify({ at: Date.now(), ok: ok === true }));
+        } catch (error) { }
+        renderLastSync();
     }
 
     function isAutoSavePageActive() {
@@ -3030,6 +3128,17 @@ function createAutoSaveScheduler(options = {}) {
         return true;
     }
 
+    // 自动保存失败文案的唯一写入点：runAutomaticUpload 与调度器
+    // onError 都走这里，autoSaveLastError 与状态条保持同步。
+    function reportAutoSaveFailure(error) {
+        autoSaveLastError = error?.message || '自动保存失败。';
+        if (isAutoSaveEnabled()) {
+            setAutoSaveStatus(isAutoSavePageActive()
+                ? `自动保存失败：${autoSaveLastError}；下一完整周期重试。`
+                : `后台已暂停自动保存；上次失败：${autoSaveLastError}`);
+        }
+    }
+
     async function runAutomaticUpload() {
         if (!isAutoSaveEnabled() || !isAutoSavePageActive()) {
             pauseAutoSave();
@@ -3047,12 +3156,7 @@ function createAutoSaveScheduler(options = {}) {
                 { automatic: true }
             );
         } catch (error) {
-            autoSaveLastError = error?.message || '自动保存失败。';
-            if (isAutoSaveEnabled()) {
-                setAutoSaveStatus(isAutoSavePageActive()
-                    ? `自动保存失败：${autoSaveLastError}；下一完整周期重试。`
-                    : `后台已暂停自动保存；上次失败：${autoSaveLastError}`);
-            }
+            reportAutoSaveFailure(error);
         } finally {
             autoSaveRunning = false;
         }
@@ -3071,8 +3175,7 @@ function createAutoSaveScheduler(options = {}) {
             },
             onDue: runAutomaticUpload,
             onError: error => {
-                autoSaveLastError = error?.message || '自动保存失败。';
-                setAutoSaveStatus(`自动保存失败：${autoSaveLastError}`);
+                reportAutoSaveFailure(error);
                 if (isAutoSaveEnabled() && isAutoSavePageActive()) restartAutoSaveCycle();
             }
         });
@@ -3350,6 +3453,16 @@ function createAutoSaveScheduler(options = {}) {
         if (lockSubmitLabel) lockSubmitLabel.textContent = busy ? '验证中…' : '解锁并进入';
     }
 
+    // 锁页与同步面板密码弹窗共用的验证核心：请求 auth-status、按结果
+    // 决定保存还是清除密码；两个调用方各自渲染自己的 UI 反馈。
+    async function verifySyncPasswordCore(password, options) {
+        const auth = await getAuthStatus(password, options);
+        if (auth.authRequired && !auth.authenticated) return { ok: false };
+        if (auth.authRequired) saveStoredSyncPassword(password);
+        else clearStoredSyncPassword();
+        return { ok: true };
+    }
+
     async function submitLockPassword() {
         if (!lockOverlay || lockVerifying) return;
         const password = lockFormInput.value;
@@ -3361,14 +3474,12 @@ function createAutoSaveScheduler(options = {}) {
         lockVerifying = true;
         setLockBusy(true);
         try {
-            const auth = await getAuthStatus(password, { retryCount: 0, timeoutMs: 10000 });
-            if (auth?.authRequired && !auth.authenticated) {
+            const result = await verifySyncPasswordCore(password, { retryCount: 0, timeoutMs: 10000 });
+            if (!result.ok) {
                 showLockError('密码不正确，请重新输入。');
                 lockFormInput.select();
                 return;
             }
-            if (auth?.authRequired) saveStoredSyncPassword(password);
-            else clearStoredSyncPassword();
             closeAccessGate();
         } catch (error) {
             showLockError(error?.message || '密码验证失败，请稍后再试。');
@@ -3420,18 +3531,12 @@ function createAutoSaveScheduler(options = {}) {
         passwordStatus.textContent = '验证中…';
 
         try {
-            const auth = await getAuthStatus(password);
-            if (auth.authRequired && !auth.authenticated) {
+            const result = await verifySyncPasswordCore(password, {});
+            if (!result.ok) {
                 clearStoredSyncPassword();
                 passwordStatus.textContent = '密码不正确，请重新输入。';
                 passwordInput.select();
                 return;
-            }
-
-            if (auth.authRequired) {
-                saveStoredSyncPassword(password);
-            } else {
-                clearStoredSyncPassword();
             }
             passwordModalRoot.classList.remove('is-open');
             if (RESTORE_PAGE) pullFromServer().catch(showSyncError);
@@ -3521,7 +3626,10 @@ function createAutoSaveScheduler(options = {}) {
                             <input type="number" data-action="auto-save-minutes" inputmode="numeric">
                         </label>
                     </div>
-                    <p class="rp-sync-auto-save__status" aria-live="polite"></p>
+                    <div class="rp-sync-auto-save__footer">
+                        <p class="rp-sync-auto-save__status" aria-live="polite"></p>
+                        <span class="rp-sync-last-sync" aria-live="polite"></span>
+                    </div>
                 </section>
                 <p class="rp-sync-modal__status">请选择同步方向。</p>
                 <div class="rp-sync-progress">
@@ -3548,6 +3656,7 @@ function createAutoSaveScheduler(options = {}) {
 
         pushButton = modalRoot.querySelector('[data-action="push"]');
         rebuildButton = modalRoot.querySelector('[data-action="rebuild"]');
+        renderLastSync();
         // 重建是恢复手段不是常规操作：默认隐藏。推送遇索引错误时经确认
         // 自动重建并继续；拒绝时才显示按钮走手动路径。
         rebuildButton.style.display = 'none';
@@ -3677,6 +3786,7 @@ function createAutoSaveScheduler(options = {}) {
             updateProgress(8, '正在恢复…');
             await restorePackSnapshot(remote);
 
+            recordLastSync(true);
             updateProgress(100, '恢复完成');
             if (RESTORE_PAGE) {
                 location.replace('/');
@@ -3684,6 +3794,7 @@ function createAutoSaveScheduler(options = {}) {
                 location.reload();
             }
         } catch (error) {
+            recordLastSync(false);
             showSyncError(error);
             if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');
         } finally {
@@ -3715,26 +3826,25 @@ function createAutoSaveScheduler(options = {}) {
             }, { automatic });
             if (alreadyUpToDate) {
                 updateProgress(100, automatic ? '数据相同，已是最新' : '已是最新');
+                recordLastSync(true);
                 if (automatic) {
                     autoSaveLastError = '';
                     setAutoSaveStatus('数据相同，已是最新。');
                 }
                 return { alreadyUpToDate: true };
             }
-
             updateProgress(100, automatic ? '自动保存完成' : '已完成');
+            recordLastSync(true);
             if (automatic) {
                 autoSaveLastError = '';
                 setAutoSaveStatus('自动保存完成。');
             }
             return { alreadyUpToDate: false };
         } catch (error) {
-            if (automatic) {
-                autoSaveLastError = error?.message || '自动保存失败。';
-                setAutoSaveStatus(`自动保存失败：${autoSaveLastError}`);
-            } else {
-                showSyncError(error);
-            }
+            recordLastSync(false);
+            if (!automatic) showSyncError(error);
+            // 自动保存失败文案统一由 runAutomaticUpload 的 catch 写入一次，
+            // 这里不再重复 setAutoSaveStatus（过去两层各写一遍、文案还不一致）。
             if (!automatic) return { error };
             throw error;
         } finally {

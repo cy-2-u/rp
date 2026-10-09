@@ -472,12 +472,15 @@ async function buildImageLookupCandidate(params) {
     };
 }
 
+// 键构造函数信任 characterName 已归一化：生图路径的段来自
+// applyImageParamDefaults 的 sanitize，R2 键反解路径的段来自
+// createImageKey 写入的既有键（sanitize 幂等，重复处理是纯浪费）。
 function createImageKey(characterName, checksum) {
-    return `${IMAGE_OBJECT_PREFIX}/${sanitizeImageKeySegment(characterName)}/${checksum}`;
+    return `${IMAGE_OBJECT_PREFIX}/${characterName}/${checksum}`;
 }
 
 function createImageThumbKey(characterName, checksum) {
-    return `${IMAGE_THUMB_PREFIX}/${sanitizeImageKeySegment(characterName)}/${checksum}.webp`;
+    return `${IMAGE_THUMB_PREFIX}/${characterName}/${checksum}.webp`;
 }
 
 function isValidImageObjectKey(key) {
@@ -502,7 +505,7 @@ function getImageCharacterFromKey(key) {
 }
 
 function createImageDeletedKey(characterName, checksum) {
-    return `${IMAGE_DELETED_PREFIX}/${sanitizeImageKeySegment(characterName)}/${checksum}.json`;
+    return `${IMAGE_DELETED_PREFIX}/${characterName}/${checksum}.json`;
 }
 
 function createImageThumbKeyFromImageKey(key) {
@@ -818,21 +821,21 @@ async function handleImageRender(request, env) {
         result = await fetchYnaiGeneratedImage(primary.params, token, ynaiConfig);
     } else {
         result = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token), {}, async (upstreamResponse, signal) => {
-        if (!upstreamResponse.ok) {
-            return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
-        }
-        const contentType = upstreamResponse.headers.get('content-type') || 'image/png';
-        if (!contentType.toLowerCase().startsWith('image/')) {
-            return error('\u751f\u56fe\u670d\u52a1\u6ca1\u6709\u8fd4\u56de\u56fe\u7247\u3002', 502);
-        }
-        try {
-            const bytes = await readBoundedImageBytes(upstreamResponse, IMAGE_MAX_BYTES, '图片过大', signal);
-            return { bytes, contentType };
-        } catch (err) {
-            if (err.status === 413) return error(err.message, 413);
-            throw err;
-        }
-    });
+            if (!upstreamResponse.ok) {
+                return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
+            }
+            const contentType = upstreamResponse.headers.get('content-type') || 'image/png';
+            if (!contentType.toLowerCase().startsWith('image/')) {
+                return error('\u751f\u56fe\u670d\u52a1\u6ca1\u6709\u8fd4\u56de\u56fe\u7247\u3002', 502);
+            }
+            try {
+                const bytes = await readBoundedImageBytes(upstreamResponse, IMAGE_MAX_BYTES, '图片过大', signal);
+                return { bytes, contentType };
+            } catch (err) {
+                if (err.status === 413) return error(err.message, 413);
+                throw err;
+            }
+        });
     }
     if (result instanceof Response) return result;
     const { bytes, contentType } = result;
@@ -878,7 +881,7 @@ const IMAGE_ADMIN_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>\u89d2\u8272\u56fe\u7247\u7ba1\u7406</title>
 <style>
-:root{color-scheme:light;--blue:#2563eb;--blue-dark:#1d4ed8;--red:#dc2626;--red-soft:#fee2e2;--text:#111827;--muted:#687386;--line:#dde3ec;--bg:#f6f8fb;--panel:#fff;--soft:#eef2f7}
+:root{color-scheme:light;--blue:#2563eb;--blue-dark:#1d4ed8;--red-soft:#fee2e2;--text:#111827;--muted:#687386;--line:#dde3ec;--bg:#f6f8fb}
 *{box-sizing:border-box}
 body{min-height:100svh;margin:0;font-family:Inter,"Microsoft YaHei",Arial,sans-serif;background:var(--bg);color:var(--text)}
 body:before{content:"";position:fixed;inset:0 0 auto 0;height:46vh;pointer-events:none;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:34px 34px;opacity:.42;mask-image:linear-gradient(to bottom,#000 0%,transparent 78%)}
@@ -904,7 +907,7 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
 .auth-card{width:min(420px,100%);background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 48px rgba(15,23,42,.08)}
 .auth-kicker{font-size:11px;font-weight:850;letter-spacing:.16em;color:var(--blue);text-transform:uppercase;margin-bottom:10px}
 .auth h2{margin:0 0 8px;font-size:22px;line-height:1.2}
-.auth p,.empty,.meta{color:var(--muted);font-size:13px}
+.auth p,.empty{color:var(--muted);font-size:13px}
 .auth input{width:100%;height:44px;border:1px solid var(--line);border-radius:8px;padding:0 12px;margin:16px 0 12px;outline:none;font-size:14px}
 .auth .btn{width:100%;height:44px}
 .auth-msg{min-height:18px;margin:12px 0 0;color:#b91c1c;font-weight:700}
@@ -952,7 +955,6 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
   .search{grid-column:1/-1}
   h1{font-size:20px}
   .btn{height:38px;padding:0 11px}
-  .btn span{display:none}
   main{padding:14px 10px 36px}
   .auth{align-items:flex-start;padding:22vh 12px 24px}
   .auth-card{padding:20px;border-radius:8px}
@@ -1002,7 +1004,6 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
   <main>
     <div id="notice" class="notice"></div>
     <div id="library"></div>
-    <button id="loadMore" class="btn hidden">加载下一批图片</button>
   </main>
 </section>
 <section id="viewer" class="viewer hidden">
@@ -1026,6 +1027,7 @@ var library=document.getElementById('library');
 var stats=document.getElementById('stats');
 var notice=document.getElementById('notice');
 var filter=document.getElementById('filter');
+var filterDebounce=0;
 var backButton=document.getElementById('back');
 var refreshButton=document.getElementById('refresh');
 var deleteModeButton=document.getElementById('deleteMode');
@@ -1044,9 +1046,6 @@ var previewList=[];
 var previewIndex=-1;
 var characterRenderLimits=Object.create(null);
 var deleteBusy=false;
-var libraryCursor=null;
-var libraryLoading=false;
-var loadMoreButton=document.getElementById('loadMore');
 function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function pass(){return localStorage.getItem(passwordStorageKey)||'';}
 function savePass(value){localStorage.setItem(passwordStorageKey,value);}
@@ -1079,44 +1078,10 @@ function refreshLibraryStats(){var images=(data&&data.characters||[]).flatMap(fu
 function removeDeletedImages(payload){var keys=new Set(payload.keys||[]);var names=new Set(payload.characterNames||[]);data.characters=data.characters.map(function(character){var images=names.has(character.name)?[]:(character.images||[]).filter(function(image){return !keys.has(image.key);});if(!images.length)return null;var size=images.reduce(function(total,image){return total+(Number(image.size)||0);},0);return Object.assign({},character,{images:images,count:images.length,size:size,sizeHuman:formatBytes(size)});}).filter(Boolean);selected.clear();resetCharacterRenderLimits();refreshLibraryStats();render();}
 function render(){if(!data)return;var q=filter.value.trim().toLowerCase();var characters=data.characters.filter(function(c){return !q||c.name.toLowerCase().includes(q);});var total=characters.reduce(function(sum,c){return sum+(c.images||[]).length;},0);if(!total){library.innerHTML='<div class="empty">\u6ca1\u6709\u56fe\u7247</div>';syncToolbar();return;}var html=[];characters.forEach(function(c){var images=c.images||[];if(!images.length)return;var limit=getCharacterRenderLimit(c.name);var shown=images.slice(0,limit);var remaining=Math.max(0,images.length-shown.length);var imgs=shown.map(function(img){var selectedClass=selected.has(img.key)?' selected':'';return '<button class="photo'+selectedClass+'" data-key="'+esc(img.key)+'"><img loading="lazy" decoding="async" src="'+esc(thumbUrl(img.key))+'" onerror="thumbFailed(this)" alt=""><span class="photo-check"></span><span class="photo-info">'+esc(img.sizeHuman)+'</span></button>';}).join('');var more=remaining>0?'<button class="album-more" data-character="'+esc(c.name)+'" data-total="'+images.length+'">\u663e\u793a\u66f4\u591a '+Math.min(albumPageSize(),remaining)+'</button>':'';var actionText=c.count>0?'\u6e05\u7a7a\u672c\u7ec4 ('+c.count+')':'\u6e05\u7a7a\u672c\u7ec4';var actions='<div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="'+esc(c.name)+'" data-count="'+esc(c.count)+'">'+actionText+'</button></div>'+more+'</div>';html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">'+esc(c.name)+'</div><div class="album-meta">'+shown.length+' / '+c.count+' \u5f20 \u00b7 '+esc(c.sizeHuman)+'</div></div></div><div class="gallery">'+imgs+'</div>'+actions+'</section>');});library.innerHTML=html.join('');syncToolbar();scheduleThumbBackfill();}
 function setDeleteMode(value){deleteMode=!!value;selected.clear();library.querySelectorAll('.photo.selected').forEach(function(tile){tile.classList.remove('selected');});syncToolbar();}
-async function load(append){
-    if(deleteBusy||libraryLoading)return;
-    libraryLoading=true;
-    var scrollPosition=window.scrollY;
-    setNotice('');
-    syncToolbar();
-    refreshButton.disabled=true;
-    loadMoreButton.disabled=true;
-    try{
-        var path='/image/api/library'+(append&&libraryCursor?'?cursor='+encodeURIComponent(libraryCursor):'');
-        var page=await api(path,{method:'GET'});
-        if(!append)data={characters:[]};
-        var groups=new Map((data.characters||[]).map(function(c){return [c.name,c];}));
-        (page.characters||[]).forEach(function(c){
-            var prior=groups.get(c.name);
-            if(!prior){groups.set(c.name,c);return;}
-            var images=new Map(prior.images.map(function(img){return [img.key,img];}));
-            c.images.forEach(function(img){images.set(img.key,img);});
-            prior.images=Array.from(images.values());
-            prior.count=prior.images.length;
-            prior.size=prior.images.reduce(function(n,img){return n+img.size;},0);
-            prior.sizeHuman=formatBytes(prior.size);
-        });
-        data.characters=Array.from(groups.values());
-        libraryCursor=page.cursor||null;
-        refreshLibraryStats();
-        if(libraryCursor)stats.textContent+='（已加载，尚有更多）';
-        loadMoreButton.classList.toggle('hidden',!libraryCursor);
-        if(libraryCursor&&filter.value)setNotice('搜索当前已加载图片；可继续加载下一批。');
-        render();
-        requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});
-    }catch(e){setNotice(e.message,true);}
-    finally{libraryLoading=false;refreshButton.disabled=deleteBusy;loadMoreButton.disabled=false;}
-}
-loadMoreButton.onclick=function(){load(true);};
+async function load(){if(deleteBusy)return;var scrollPosition=window.scrollY;setNotice('');stats.textContent='\u6b63\u5728\u8bfb\u53d6...';syncToolbar();refreshButton.disabled=true;try{data=await api('/image/api/library',{method:'GET'});var keys=new Set(visibleImages().map(function(image){return image.key;}));selected.forEach(function(key){if(!keys.has(key))selected.delete(key);});stats.textContent=data.totalCount+' \u5f20\u56fe\u7247 / '+data.totalHuman;render();requestAnimationFrame(function(){window.scrollTo({top:scrollPosition,behavior:'instant'});});}catch(e){stats.textContent='\u8bfb\u53d6\u5931\u8d25';if(!data)library.innerHTML='<div class="empty">'+esc(e.message)+'</div>';setNotice(e.message,true);}finally{refreshButton.disabled=deleteBusy;}}
 var deleteChunkSize=20;
 async function deletePayload(payload,message){
-    if(deleteBusy||libraryLoading||!confirm(message||'确定删除选中的图片吗？删除后旧链接不会重新生图。'))return;
+    if(deleteBusy||!confirm(message||'确定删除选中的图片吗？删除后旧链接不会重新生图。'))return;
     deleteBusy=true;
     var previousCharacters=data&&data.characters;
     var previousSelected=new Set(selected);
@@ -1166,11 +1131,11 @@ function renderViewer(){var img=previewList[previewIndex];if(!img)return;viewerI
 document.getElementById('login').onclick=enter;
 backButton.onclick=function(){location.href='/';};
 passwordInput.onkeydown=function(e){if(e.key==='Enter')enter();};
-refreshButton.onclick=function(){load(false);};
+refreshButton.onclick=load;
 deleteModeButton.onclick=function(){setDeleteMode(true);};
 cancelDeleteButton.onclick=function(){setDeleteMode(false);};
 deleteSelectedButton.onclick=function(){deletePayload({keys:Array.from(selected)},'\u786e\u5b9a\u5220\u9664\u9009\u4e2d\u7684 '+selected.size+' \u5f20\u56fe\u7247\u5417\uff1f\u5220\u9664\u540e\u65e7\u94fe\u63a5\u4e0d\u4f1a\u91cd\u65b0\u751f\u56fe\u3002');};
-filter.oninput=function(){resetCharacterRenderLimits();render();if(libraryCursor)setNotice('搜索当前已加载图片；可继续加载下一批。');};
+filter.oninput=function(){clearTimeout(filterDebounce);filterDebounce=setTimeout(function(){resetCharacterRenderLimits();render();},150);};
 library.onclick=function(e){var clear=e.target.closest('.album-clear');if(clear){deleteCharacterImages(clear.dataset.character,clear.dataset.count);return;}var more=e.target.closest('.album-more');if(more){increaseCharacterRenderLimit(more.dataset.character,Number(more.dataset.total)||0);render();return;}var tile=e.target.closest('.photo');if(!tile)return;var key=tile.dataset.key;if(deleteMode){if(selected.has(key))selected.delete(key);else selected.add(key);tile.classList.toggle('selected',selected.has(key));syncToolbar();return;}openViewer(key);};
 library.addEventListener('load',function(e){if(e.target&&e.target.matches&&e.target.matches('img[data-needs-thumb="1"]'))queueThumbBackfill(e.target);},true);
 document.getElementById('closeViewer').onclick=closeViewer;
@@ -1240,10 +1205,34 @@ function normalizeImageObject(object) {
     };
 }
 
-async function listImageObjects(bucket, prefix = `${IMAGE_OBJECT_PREFIX}/`, cursor, limit = 40) {
-    const page = await bucket.list({ prefix, cursor: cursor || undefined, limit });
-    const nextCursor = getNextSyncCursor(page, cursor || undefined);
-    return { objects: (page.objects || []).map(normalizeImageObject), cursor: nextCursor || null };
+// 图库整库单次加载：循环翻页列出目录下全部对象后一次性返回，
+// 前端不再有“加载下一批”。带 cursor/limit 的分页形式仅供
+// /api/delete 的目录展开续传使用。
+async function listImageObjects(bucket, prefix = `${IMAGE_OBJECT_PREFIX}/`, cursor, limit) {
+    if (cursor || limit) {
+        const page = await bucket.list({ prefix, cursor: cursor || undefined, limit });
+        const nextCursor = getNextSyncCursor(page, cursor || undefined);
+        return { objects: (page.objects || []).map(normalizeImageObject), cursor: nextCursor || null };
+    }
+    const rawObjects = [];
+    let nextCursor;
+    do {
+        const page = await bucket.list({ prefix, cursor: nextCursor, limit: 1000 });
+        for (const object of page.objects || []) rawObjects.push(object);
+        nextCursor = page.truncated ? page.cursor : undefined;
+    } while (nextCursor);
+    return { objects: rawObjects.map(normalizeImageObject), cursor: null };
+}
+
+async function listImageTombstoneKeys(bucket) {
+    const keys = new Set();
+    let cursor;
+    do {
+        const page = await bucket.list({ prefix: `${IMAGE_DELETED_PREFIX}/`, cursor, limit: 1000 });
+        for (const object of page.objects || []) keys.add(object.key);
+        cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return keys;
 }
 
 async function getImageDeleteTargets(bucket, keys, characterNames, cursor) {
@@ -1332,14 +1321,16 @@ async function handleImageAdmin(request, env, url, ctx) {
 
     const bucket = getBucket(env);
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/library`) {
-        const cursor = url.searchParams.get('cursor') || undefined;
-        if (cursor && cursor.length > 4096) return error('图库游标无效。', 400);
-        const page = await listImageObjects(bucket, undefined, cursor);
-        const checked = await runConcurrent(page.objects, 6, async object => ({
-            object, deleted: object.deletedKey ? Boolean(await bucket.head(object.deletedKey)) : false
-        }));
-        const staleObjects = checked.filter(item => item.deleted).map(item => item.object);
-        const objects = checked.filter(item => !item.deleted).map(item => item.object);
+        const [{ objects: allObjects }, tombstoneSet] = await Promise.all([
+            listImageObjects(bucket),
+            listImageTombstoneKeys(bucket)
+        ]);
+        const staleObjects = [];
+        const objects = allObjects.filter(object => {
+            const deleted = tombstoneSet.has(object.deletedKey);
+            if (deleted) staleObjects.push(object);
+            return !deleted;
+        });
         if (staleObjects.length) {
             const cleanup = deleteImageObjectFiles(bucket, staleObjects);
             if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(cleanup);
@@ -1348,7 +1339,6 @@ async function handleImageAdmin(request, env, url, ctx) {
         const totalBytes = objects.reduce((sum, object) => sum + object.size, 0);
         return json({
             ok: true,
-            cursor: page.cursor,
             totalCount: objects.length,
             totalBytes,
             totalHuman: formatBytes(totalBytes),
@@ -1379,8 +1369,8 @@ async function handleImageAdmin(request, env, url, ctx) {
             });
         }
         if (request.method !== 'PUT' && request.method !== 'POST') return error('Method not allowed.', 405);
-        const imageObject = await bucket.get(key);
-        if (!imageObject) return error('\u539f\u56fe\u4e0d\u5b58\u5728\uff0c\u4e0d\u80fd\u4fdd\u5b58\u7f29\u7565\u56fe\u3002', 404);
+        // 只需存在性判断：head 代替 get，避免把原图（可达 64MiB）的流拉起来又不消费。
+        if (!await bucket.head(key)) return error('\u539f\u56fe\u4e0d\u5b58\u5728\uff0c\u4e0d\u80fd\u4fdd\u5b58\u7f29\u7565\u56fe\u3002', 404);
         const bytes = await readThumbnailBytes(request);
         await putImageThumbnail(bucket, key, bytes);
         return json({ ok: true });
@@ -1563,29 +1553,53 @@ async function readSmallJsonObject(bucket, key, maxBytes = SYNC_CONTROL_MAX_BYTE
 }
 
 async function getMigrationState(bucket) {
+    // 迁移标记是 etagDoesNotMatch:'*' 写一次的不可变对象：同一次上传会话
+    // 里可能刚写完，之后在 isolate 生命周期内永不变化，按 key 缓存后
+    // 每个同步请求省一次 R2 get。
+    const cached = migrationStateCache.get(bucket);
+    if (cached) return cached;
     const stored = await readSmallJsonObject(bucket, MIGRATION_MARKER_KEY, 4096);
     if (!stored) return null;
     const value = stored.value;
     if (!value || value.format !== 'rp-sync-migration-v13') {
         throw new SyncRequestError('同步迁移标记损坏。', 409);
     }
-    return {
+    const migration = {
         legacyEtag: typeof value.legacyEtag === 'string' ? value.legacyEtag : null,
         createdAt: Number(value.createdAt || 0)
     };
+    migrationStateCache.set(bucket, migration);
+    return migration;
 }
+
+// isolate 级缓存：迁移标记不可变；根清单按 etag 索引（etag 是 R2 写入时
+// 生成的内容签名，根切换必然换 etag），命中时同时省去 get、normalize 与
+// 根 checksum 的 SHA-256 重算。仅缓存校验通过的清单，坏数据不会驻留。
+const migrationStateCache = new WeakMap();
+const manifestStateCache = new Map();
+const MANIFEST_STATE_CACHE_MAX = 8;
+// 内容寻址 Bloom 的已验字节缓存：键是自校验的 checksum。
+const verifiedBloomCache = new Map();
+const VERIFIED_BLOOM_CACHE_MAX = 4;
 
 async function getManifestState(bucket) {
     const migration = await getMigrationState(bucket);
     if (!migration) return { manifest: null, etag: null, resetRequired: true };
-    const head = await bucket.head(MANIFEST_KEY);
-    if (!head) return { manifest: null, etag: null, resetRequired: false };
-    const etag = head.etag || null;
-    if (migration.legacyEtag && etag === migration.legacyEtag) {
-        return { manifest: null, etag, resetRequired: false, legacy: true };
+    // 正常态 legacyEtag 为 null（非 legacy 库），head 只为与 legacy etag
+    // 比对而存在，可直接跳过；legacy 态仍先 head 比对再读正文。
+    if (migration.legacyEtag) {
+        const head = await bucket.head(MANIFEST_KEY);
+        if (!head) return { manifest: null, etag: null, resetRequired: false };
+        if (head.etag === migration.legacyEtag) {
+            return { manifest: null, etag: head.etag, resetRequired: false, legacy: true };
+        }
     }
     const stored = await readSmallJsonObject(bucket, MANIFEST_KEY, 16 * 1024);
-    const manifest = normalizeManifestRoot(stored?.value);
+    if (!stored) return { manifest: null, etag: null, resetRequired: false };
+    const etag = stored.etag || null;
+    const cachedState = etag ? manifestStateCache.get(etag) : null;
+    if (cachedState) return { ...cachedState, etag };
+    const manifest = normalizeManifestRoot(stored.value);
     if (!manifest) throw new SyncRequestError('现有云端根清单无效，已停止读写以保护数据。', 409);
     const expected = await sha256Text(buildManifestRootChecksumSource(
         manifest.totalBytes,
@@ -1598,7 +1612,14 @@ async function getManifestState(bucket) {
     if (expected !== manifest.checksum) {
         throw new SyncRequestError('现有云端根清单校验失败，已停止读写以保护数据。', 409);
     }
-    return { manifest, etag: stored.etag || etag, resetRequired: false };
+    const state = { manifest, resetRequired: false };
+    if (etag) {
+        if (manifestStateCache.size >= MANIFEST_STATE_CACHE_MAX) {
+            manifestStateCache.delete(manifestStateCache.keys().next().value);
+        }
+        manifestStateCache.set(etag, state);
+    }
+    return { ...state, etag };
 }
 
 async function getManifest(bucket) {
@@ -1708,7 +1729,11 @@ async function readManifestPage(bucket, root, pageIndex) {
     if (expectedHash !== page.pageHash) {
         throw new SyncRequestError('服务器同步清单页校验失败。', 409);
     }
-    if (manifestPageCache.size >= MANIFEST_PAGE_CACHE_MAX) manifestPageCache.clear();
+    if (manifestPageCache.size >= MANIFEST_PAGE_CACHE_MAX) {
+        // 淘汰最早插入的一项而不是整表 clear：长寿命 isolate 混合多轮
+        // 上传/恢复时，整清会成批丢弃仍热的页缓存。
+        manifestPageCache.delete(manifestPageCache.keys().next().value);
+    }
     manifestPageCache.set(cacheKey, page);
     return page;
 }
@@ -1872,12 +1897,17 @@ async function handleUploadPack(request, bucket, url) {
     }
     const envelopeError = binaryUploadEnvelopeError(request, length, '上传数据包', '上传数据包长度与声明不一致。');
     if (envelopeError) return envelopeError;
-    if (!await bucket.head(createUploadSessionKey(uploadId))) {
+    // 会话存在性与 pack 幂等检查是两个互不依赖的纯读，并行发出省一个
+    // 串行往返；判定顺序保持先会话、再 pack 元数据一致短路。
+    const [sessionHead, existing] = await Promise.all([
+        bucket.head(createUploadSessionKey(uploadId)),
+        bucket.head(createPackKey(checksum))
+    ]);
+    if (!sessionHead) {
         if (request.body.cancel) await request.body.cancel();
         return error('上传会话不存在或已过期。', 409);
     }
     const key = createPackKey(checksum);
-    const existing = await bucket.head(key);
     if (existing && Number(existing.size) === length
         && Number(existing.customMetadata?.entryCount) === entryCount) {
         if (request.body.cancel) await request.body.cancel();
@@ -2103,15 +2133,27 @@ async function handleUploadManifestPage(bucket, body) {
         }
         unique.set(pack.checksum, pack);
     }
-    const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
-    if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) {
-        return error('上传过滤器尚未完成。', 409);
+    // Bloom 是内容寻址对象（checksum 即内容 SHA-256），同一次上传会话内
+    // 恒定不变；页级只需要“包含关系”判定，按 checksum 在 isolate 内缓存
+    // 已验字节，每个缺失页重提/多页上传不再重复 get + 32KiB hash。
+    // finalize 在持锁后仍按约束重新读取并校验 Bloom（readBloomFilter 不缓存）。
+    let bloomCache = verifiedBloomCache.get(session.bloomChecksum);
+    if (!bloomCache) {
+        const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
+        if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) {
+            return error('上传过滤器尚未完成。', 409);
+        }
+        const bloom = new Uint8Array(await new Response(bloomObject.body).arrayBuffer());
+        if (bloom.byteLength !== GC_BLOOM_BYTES || await sha256Bytes(bloom) !== session.bloomChecksum) {
+            return error('上传过滤器校验失败。', 409);
+        }
+        if (verifiedBloomCache.size >= VERIFIED_BLOOM_CACHE_MAX) {
+            verifiedBloomCache.delete(verifiedBloomCache.keys().next().value);
+        }
+        verifiedBloomCache.set(session.bloomChecksum, bloom);
+        bloomCache = bloom;
     }
-    const bloom = new Uint8Array(await new Response(bloomObject.body).arrayBuffer());
-    if (bloom.byteLength !== GC_BLOOM_BYTES || await sha256Bytes(bloom) !== session.bloomChecksum) {
-        return error('上传过滤器校验失败。', 409);
-    }
-    if ([...unique.keys()].some(checksum => !bloomHasChecksum(bloom, checksum))) {
+    if ([...unique.keys()].some(checksum => !bloomHasChecksum(bloomCache, checksum))) {
         return error('上传过滤器缺少当前清单分片。', 409);
     }
     const checked = await runConcurrent([...unique.values()], 6, async pack => {
@@ -2423,7 +2465,7 @@ async function serveStatic(request, env) {
     if (!assetResponse || assetResponse.status !== 200) return assetResponse;
     // 同步客户端的全部代码都在这三个部署文件里。409 版本门的
     // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
-    // HTML 与 app.js 已是 no-store；这三个文件约 215KB 且每次部署
+    // HTML 与 app.js 已是 no-store；这三个文件约 234KB 且每次部署
     // etag 必然变化，no-cache 协商缓存让未变化请求直接 304，
     // 部署后也不会回放旧客户端。
     const headers = new Headers(assetResponse.headers);

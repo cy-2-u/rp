@@ -198,6 +198,124 @@ function sanitizeProjectName(name) {
     .replace(/-+$/g, '');
 }
 
+function projectDomain(projectResult, fallbackName) {
+  const r = projectResult || {};
+  let s = r.subdomain;
+  if (s && typeof s === 'object' && typeof s.name === 'string') s = s.name;
+  if (typeof s === 'string' && s.includes('.pages.dev')) return s;
+  if (Array.isArray(r.domains) && r.domains.length) return r.domains[0];
+  return fallbackName + '.pages.dev';
+}
+
+// 魔改版标记：生产配置里同时有同步密码变量与 R2 绑定（只有本部署器会写入，
+// 手搭项目没有）。只检查键名是否存在，不读取、不回传任何变量值。
+function isModProject(projectResult) {
+  const prod = projectResult && projectResult.deployment_configs && projectResult.deployment_configs.production;
+  return Boolean(prod
+    && prod.env_vars && prod.env_vars[PASSWORD_VAR]
+    && prod.r2_buckets && prod.r2_buckets[R2_BINDING]);
+}
+
+async function fetchDeployFiles() {
+  try {
+    const fetched = await Promise.all([
+      fetch(RAW_BASE + WORKER_FILE),
+      ...ASSETS.map(a => fetch(RAW_BASE + a.path)),
+    ]);
+    const bad = fetched.find(r => !r.ok);
+    if (bad) return { error: `拉取部署文件失败（HTTP ${bad.status}），请稍后再试。` };
+    const workerBytes = new Uint8Array(await fetched[0].arrayBuffer());
+    if (!workerBytes.length) return { error: '拉取 _worker.js 为空。' };
+    const assetFiles = await Promise.all(ASSETS.map(async (a, i) => {
+      const bytes = new Uint8Array(await fetched[i + 1].arrayBuffer());
+      if (!bytes.length) throw new Error(`拉取 ${a.path} 为空。`);
+      return { path: a.path, ext: a.ext, type: a.type, bytes };
+    }));
+    return { workerBytes, assetFiles };
+  } catch (e) {
+    return { error: e && e.message ? e.message : '拉取部署文件失败。' };
+  }
+}
+
+async function uploadDeployment(token, accountId, projectName, workerBytes, assetFiles) {
+  const assetHashes = new Map(assetFiles.map(f => ['/' + f.path, pageHash(f.bytes, f.ext)]));
+
+  const jwtRes = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}/upload-token`);
+  if (!jwtRes.ok || !jwtRes.result || !jwtRes.result.jwt) {
+    return { error: '获取上传令牌失败：' + cfErrorText(jwtRes.errors) };
+  }
+  const jwt = jwtRes.result.jwt;
+  const check = await cfApi(token, `/pages/assets/check-missing`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...assetHashes.values()] }),
+  });
+  if (!check.ok) return { error: '检查资产失败：' + cfErrorText(check.errors) };
+  const missing = new Set(Array.isArray(check.result) ? check.result : []);
+  const needUpload = assetFiles.filter(f => missing.has(assetHashes.get('/' + f.path)));
+  if (needUpload.length) {
+    const up = await cfApi(token, `/pages/assets/upload`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+      body: JSON.stringify(needUpload.map(f => ({
+        key: assetHashes.get('/' + f.path),
+        value: bytesToBase64(f.bytes),
+        metadata: { contentType: f.type },
+        base64: true,
+      }))),
+    });
+    if (!up.ok) return { error: '上传资产失败：' + cfErrorText(up.errors) };
+  }
+  await cfApi(token, `/pages/assets/upsert-hashes`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...assetHashes.values()] }),
+  });
+  const boundary = '----rphubdeploy' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const enc = new TextEncoder();
+  const chunks = [];
+  const pushText = (s) => chunks.push(enc.encode(s));
+  pushText(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n`);
+  pushText(JSON.stringify(Object.fromEntries(assetHashes)) + '\r\n');
+  pushText(`--${boundary}\r\nContent-Disposition: form-data; name="commit_dirty"\r\n\r\ntrue\r\n`);
+  const innerBoundary = '----rphubbundle' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  pushText(`--${boundary}\r\nContent-Disposition: form-data; name="_worker.bundle"; filename="_worker.bundle"\r\nContent-Type: multipart/form-data; boundary=${innerBoundary}\r\n\r\n`);
+  pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n{"main_module":"_worker.js"}\r\n`);
+  pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="_worker.js"; filename="_worker.js"\r\nContent-Type: application/javascript+module\r\n\r\n`);
+  chunks.push(workerBytes);
+  pushText(`\r\n--${innerBoundary}--\r\n`);
+  pushText(`--${boundary}--\r\n`);
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const body = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { body.set(c, off); off += c.byteLength; }
+  let dep = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 2000));
+    dep = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}/deployments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
+      body,
+    });
+    if (dep.ok && dep.result && dep.result.id) break;
+    // 与 wrangler 一致：仅对瞬态错误重试（网络失败/5xx/8000000 UNKNOWN_ERROR）
+    const code = dep.errors && dep.errors[0] && dep.errors[0].code;
+    if (dep.status !== 0 && dep.status < 500 && code !== 8000000) break;
+  }
+  if (!dep.ok || !dep.result || !dep.result.id) return { error: '创建部署失败：' + cfErrorText(dep.errors) };
+  return { id: dep.result.id };
+}
+
+async function pollDeployment(token, accountId, projectName, depId) {
+  for (let i = 0; i < 6; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    const st = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}/deployments/${depId}`);
+    if (!st.ok || !st.result || !st.result.latest_stage) continue;
+    const ls = st.result.latest_stage;
+    if (ls.name === 'deploy' && ls.status === 'success') return null;
+    if (ls.status === 'failure') return '部署未能上线，请到 dashboard 查看该项目日志。';
+  }
+  return null;
+}
+
 const RATE = new Map();
 function rateLimited(ip) {
   const now = Date.now();
@@ -259,140 +377,39 @@ async function handleDeploy(request, origin) {
     }
   }
 
-  let workerBytes, assetFiles;
-  try {
-    const fetched = await Promise.all([
-      fetch(RAW_BASE + WORKER_FILE),
-      ...ASSETS.map(a => fetch(RAW_BASE + a.path)),
-    ]);
-    const bad = fetched.find(r => !r.ok);
-    if (bad) return json({ ok: false, error: `拉取部署文件失败（HTTP ${bad.status}），请稍后再试。` }, 200, origin);
-    workerBytes = new Uint8Array(await (fetched[0].arrayBuffer()));
-    if (!workerBytes.length) return json({ ok: false, error: '拉取 _worker.js 为空。' }, 200, origin);
-    assetFiles = await Promise.all(ASSETS.map(async (a, i) => {
-      const bytes = new Uint8Array(await fetched[i + 1].arrayBuffer());
-      if (!bytes.length) throw new Error(`拉取 ${a.path} 为空。`);
-      return { path: a.path, ext: a.ext, type: a.type, bytes };
-    }));
-  } catch (e) {
-    return json({ ok: false, error: e && e.message ? e.message : '拉取部署文件失败。' }, 200, origin);
-  }
+  const files = await fetchDeployFiles();
+  if (files.error) return json({ ok: false, error: files.error }, 200, origin);
 
-  const assetHashes = new Map(assetFiles.map(f => ['/' + f.path, pageHash(f.bytes, f.ext)]));
-
-  async function uploadOnce() {
-    const jwtRes = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/upload-token`);
-    if (!jwtRes.ok || !jwtRes.result || !jwtRes.result.jwt) {
-      return { error: '获取上传令牌失败：' + cfErrorText(jwtRes.errors) };
-    }
-    const jwt = jwtRes.result.jwt;
-    const check = await cfApi(token, `/pages/assets/check-missing`, {
-      method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hashes: [...assetHashes.values()] }),
-    });
-    if (!check.ok) return { error: '检查资产失败：' + cfErrorText(check.errors) };
-    const missing = new Set(Array.isArray(check.result) ? check.result : []);
-    const needUpload = assetFiles.filter(f => missing.has(assetHashes.get('/' + f.path)));
-    if (needUpload.length) {
-      const up = await cfApi(token, `/pages/assets/upload`, {
-        method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
-        body: JSON.stringify(needUpload.map(f => ({
-          key: assetHashes.get('/' + f.path),
-          value: bytesToBase64(f.bytes),
-          metadata: { contentType: f.type },
-          base64: true,
-        }))),
-      });
-      if (!up.ok) return { error: '上传资产失败：' + cfErrorText(up.errors) };
-    }
-    await cfApi(token, `/pages/assets/upsert-hashes`, {
-      method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hashes: [...assetHashes.values()] }),
-    });
-    const boundary = '----rphubdeploy' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    const enc = new TextEncoder();
-    const chunks = [];
-    const pushText = (s) => chunks.push(enc.encode(s));
-    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n`);
-    pushText(JSON.stringify(Object.fromEntries(assetHashes)) + '\r\n');
-    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="commit_dirty"\r\n\r\ntrue\r\n`);
-    const innerBoundary = '----rphubbundle' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    pushText(`--${boundary}\r\nContent-Disposition: form-data; name="_worker.bundle"; filename="_worker.bundle"\r\nContent-Type: multipart/form-data; boundary=${innerBoundary}\r\n\r\n`);
-    pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n{"main_module":"_worker.js"}\r\n`);
-    pushText(`--${innerBoundary}\r\nContent-Disposition: form-data; name="_worker.js"; filename="_worker.js"\r\nContent-Type: application/javascript+module\r\n\r\n`);
-    chunks.push(workerBytes);
-    pushText(`\r\n--${innerBoundary}--\r\n`);
-    pushText(`--${boundary}--\r\n`);
-    let total = 0;
-    for (const c of chunks) total += c.byteLength;
-    const body = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) { body.set(c, off); off += c.byteLength; }
-    let dep = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt) await new Promise(r => setTimeout(r, 2000));
-        dep = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/deployments`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary },
-            body,
-        });
-        if (dep.ok && dep.result && dep.result.id) break;
-        // 与 wrangler 一致：仅对瞬态错误重试（网络失败/5xx/8000000 UNKNOWN_ERROR）
-        const code = dep.errors && dep.errors[0] && dep.errors[0].code;
-        if (dep.status !== 0 && dep.status < 500 && code !== 8000000) break;
-    }
-    if (!dep.ok || !dep.result || !dep.result.id) return { error: '创建部署失败：' + cfErrorText(dep.errors) };
-    return { id: dep.result.id };
-  }
-
-  async function poll(depId) {
-    for (let i = 0; i < 6; i++) {
-      await new Promise(r => setTimeout(r, 1500));
-      const st = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}/deployments/${depId}`);
-      if (!st.ok || !st.result || !st.result.latest_stage) continue;
-      const ls = st.result.latest_stage;
-      if (ls.name === 'deploy' && ls.status === 'success') return null;
-      if (ls.status === 'failure') return '部署未能上线，请到 dashboard 查看该项目日志。';
-    }
-    return null;
-  }
-
-  async function applyConfig() {
-    const body = JSON.stringify({
+  const deployDomain = projectDomain(project.result, projectNameFinal);
+  const applyConfig = () => cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       deployment_configs: {
         production: {
           env_vars: { [PASSWORD_VAR]: { type: 'plain_text', value: password } },
           r2_buckets: { [R2_BINDING]: { name: R2_NAME } },
         },
       },
-    });
-    return cfApi(token, `/accounts/${accountId}/pages/projects/${projectNameFinal}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body,
-    });
-  }
+    }),
+  });
+  const finish = async (mode) => {
+    const dep = await uploadDeployment(token, accountId, projectNameFinal, files.workerBytes, files.assetFiles);
+    if (dep.error) return json({ ok: false, error: dep.error }, 200, origin);
+    const pollErr = await pollDeployment(token, accountId, projectNameFinal, dep.id);
+    if (pollErr) return json({ ok: false, error: pollErr }, 200, origin);
+    return json({ ok: true, url: `https://${deployDomain}`, projectName: projectNameFinal, subdomain: deployDomain, mode }, 200, origin);
+  };
 
   const r2Detect = await cfApi(token, `/accounts/${accountId}/r2/buckets/${R2_NAME}`);
   const r2Exists = r2Detect.ok;
-  const deployDomain = (() => {
-    const r = project.result || {};
-    let s = r.subdomain;
-    if (s && typeof s === 'object' && typeof s.name === 'string') s = s.name;
-    if (typeof s === 'string' && s.includes('.pages.dev')) return s;
-    if (Array.isArray(r.domains) && r.domains.length) return r.domains[0];
-    return projectNameFinal + '.pages.dev';
-  })();
 
   if (r2Exists) {
-
     const patched = await applyConfig();
     if (!patched.ok) return json({ ok: false, error: '更新配置失败：' + cfErrorText(patched.errors) }, 200, origin);
-    const dep = await uploadOnce();
-    if (dep.error) return json({ ok: false, error: dep.error }, 200, origin);
-    await poll(dep.id);
-    return json({ ok: true, url: `https://${deployDomain}`, projectName: projectNameFinal, subdomain: deployDomain, mode: 'update' }, 200, origin);
+    return finish('update');
   }
 
-  const dep1 = await uploadOnce();
+  const dep1 = await uploadDeployment(token, accountId, projectNameFinal, files.workerBytes, files.assetFiles);
   if (dep1.error) return json({ ok: false, error: dep1.error }, 200, origin);
 
   const created = await cfApi(token, `/accounts/${accountId}/r2/buckets`, {
@@ -412,11 +429,82 @@ async function handleDeploy(request, origin) {
   const patched = await applyConfig();
   if (!patched.ok) return json({ ok: false, error: '配置绑定失败：' + cfErrorText(patched.errors) }, 200, origin);
 
-  const dep2 = await uploadOnce();
-  if (dep2.error) return json({ ok: false, error: dep2.error }, 200, origin);
-  const pollErr = await poll(dep2.id);
+  return finish('full');
+}
+
+async function handleProjectConfig(request, origin) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  const token = String((body && body.token) || '').trim();
+  const projectName = sanitizeProjectName(body && body.projectName);
+  if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
+  if (!projectName) return json({ ok: false, error: '缺少项目名。' }, 200, origin);
+
+  const acc = await cfApi(token, '/accounts');
+  if (!acc.ok || !Array.isArray(acc.result) || acc.result.length === 0) {
+    return json({ ok: false, error: '令牌无效或没有可访问的账号。' }, 200, origin);
+  }
+  const accountId = acc.result[0].id;
+
+  const probe = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}`);
+  if (!probe.ok) return json({ ok: false, error: '读取项目配置失败：' + cfErrorText(probe.errors) }, 200, origin);
+  return json({ ok: true, isMod: isModProject(probe.result) }, 200, origin);
+}
+
+async function handleProjects(request, origin) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  const token = String((body && body.token) || '').trim();
+  if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
+
+  const acc = await cfApi(token, '/accounts');
+  if (!acc.ok || !Array.isArray(acc.result) || acc.result.length === 0) {
+    return json({ ok: false, error: '令牌无效或没有可访问的账号。' }, 200, origin);
+  }
+  const accountId = acc.result[0].id;
+
+  const list = await cfApi(token, `/accounts/${accountId}/pages/projects`);
+  if (!list.ok || !Array.isArray(list.result)) {
+    return json({ ok: false, error: '读取项目列表失败：' + cfErrorText(list.errors) }, 200, origin);
+  }
+  const projects = list.result.map(p => ({
+    name: p && p.name ? String(p.name) : '',
+    domain: projectDomain(p, p && p.name ? String(p.name) : ''),
+    isMod: isModProject(p),
+  })).filter(p => p.name);
+  return json({ ok: true, projects }, 200, origin);
+}
+
+async function handleUpdate(request, origin) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  const token = String((body && body.token) || '').trim();
+  const projectName = sanitizeProjectName(body && body.projectName);
+  if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
+  if (!projectName) return json({ ok: false, error: '缺少项目名。' }, 200, origin);
+
+  const acc = await cfApi(token, '/accounts');
+  if (!acc.ok || !Array.isArray(acc.result) || acc.result.length === 0) {
+    return json({ ok: false, error: '令牌无效或没有可访问的账号。' }, 200, origin);
+  }
+  const accountId = acc.result[0].id;
+
+  const probe = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}`);
+  if (!probe.ok) return json({ ok: false, error: '读取项目配置失败：' + cfErrorText(probe.errors) }, 200, origin);
+  // 更新前再校验一次魔改版标记，防止前端绕过确认直接刷非魔改版项目
+  if (!isModProject(probe.result)) {
+    return json({ ok: false, error: '该项目不是魔改版部署，已停止更新。' }, 200, origin);
+  }
+
+  const files = await fetchDeployFiles();
+  if (files.error) return json({ ok: false, error: files.error }, 200, origin);
+
+  const deployDomain = projectDomain(probe.result, projectName);
+  const dep = await uploadDeployment(token, accountId, projectName, files.workerBytes, files.assetFiles);
+  if (dep.error) return json({ ok: false, error: dep.error }, 200, origin);
+  const pollErr = await pollDeployment(token, accountId, projectName, dep.id);
   if (pollErr) return json({ ok: false, error: pollErr }, 200, origin);
-  return json({ ok: true, url: `https://${deployDomain}`, projectName: projectNameFinal, subdomain: deployDomain, mode: 'full' }, 200, origin);
+  return json({ ok: true, url: `https://${deployDomain}`, projectName }, 200, origin);
 }
 
 export default {
@@ -447,6 +535,23 @@ export default {
       if (len > 4096) return json({ ok: false, error: '请求体过大。' }, 413, origin);
       try {
         return await handleDeploy(request, origin);
+      } catch (e) {
+        return json({ ok: false, error: '部署器内部错误，请稍后再试。' }, 500, origin);
+      }
+    }
+
+    if (request.method === 'POST' && (url.pathname === '/api/projects' || url.pathname === '/api/project-check' || url.pathname === '/api/update')) {
+      const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+      if (rateLimited(ip)) return json({ ok: false, error: '请求太频繁，稍后再试。' }, 429, origin);
+      const len = Number(request.headers.get('content-length') || 0);
+      if (len > 4096) return json({ ok: false, error: '请求体过大。' }, 413, origin);
+      try {
+        const path = url.pathname;
+        return path === '/api/projects'
+          ? await handleProjects(request, origin)
+          : path === '/api/project-check'
+            ? await handleProjectConfig(request, origin)
+            : await handleUpdate(request, origin);
       } catch (e) {
         return json({ ok: false, error: '部署器内部错误，请稍后再试。' }, 500, origin);
       }
