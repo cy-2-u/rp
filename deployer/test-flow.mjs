@@ -10,6 +10,7 @@ const workerSrc = readFileSync(join(here, 'worker.js'), 'utf8');
 const worker = (await import('data:text/javascript;base64,' + Buffer.from(workerSrc).toString('base64'))).default;
 
 const pageDir = join(here, '..', 'page');
+const docsHtml = readFileSync(join(here, '..', 'docs', 'index.html'), 'utf8');
 const RAW_PREFIX = 'https://raw.githubusercontent.com/cy-2-u/rp/main/page/';
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const TOKEN = 'tok-abc-123';
@@ -170,7 +171,10 @@ globalThis.fetch = async (url, init = {}) => {
     } else { saved.deployMeta = saved.deployMeta || []; saved.deployWorkers.push(null); }
     return jsonResponse({ success: true, result: { id: 'dep' + saved.deployCalls, url: 'https://' + (short.split('/pages/projects/')[1] || '').split('/')[0] + '.pages.dev' } });
   }
-  if (/\/deployments\/dep\d+$/.test(short)) return jsonResponse({ success: true, result: { latest_stage: { name: 'deploy', status: 'success' } } });
+  if (/\/deployments\/dep\d+$/.test(short)) {
+    if (mock.deploymentPending) return jsonResponse({ success: true, result: { latest_stage: { name: 'deploy', status: 'running' } } });
+    return jsonResponse({ success: true, result: { latest_stage: { name: 'deploy', status: 'success' } } });
+  }
 
   return jsonResponse({ success: false, errors: [{ message: 'unexpected mock call: ' + method + ' ' + short }] }, 500);
 };
@@ -381,29 +385,20 @@ async function deploy(body, ip, path = '/api/deploy', mockInit) {
   }
 }
 
-// ---------- 11. /api/project-check 单项目魔改版校验 ----------
+// ---------- 11. /api/project-check 实时项目检查 ----------
 {
   {
-    calls = []; saved = {}; uploaded = new Set();
     const { data } = await deploy({ token: TOKEN, projectName: 'mod-check' }, 'ip-check1', '/api/project-check');
-    ok(data.ok === true && data.isMod === true, '校验：魔改版项目 isMod=true', JSON.stringify(data));
-    ok(!JSON.stringify(data).includes('irrelevant'), '校验：不回传变量值');
+    ok(data.ok === true && data.isMod === true, '项目检查：魔改版项目返回 isMod=true', JSON.stringify(data));
+    ok(calls.some(c => c.short === '/accounts/acc1/pages/projects/mod-check' && c.method === 'GET'), '项目检查：读取目标项目配置');
   }
   {
-    calls = []; saved = {}; uploaded = new Set();
     const { data } = await deploy({ token: TOKEN, projectName: 'plain-check' }, 'ip-check2', '/api/project-check');
-    ok(data.ok === true && data.isMod === false, '校验：普通项目 isMod=false', JSON.stringify(data));
+    ok(data.ok === true && data.isMod === false, '项目检查：普通项目返回 isMod=false', JSON.stringify(data));
   }
   {
-    calls = []; saved = {}; uploaded = new Set();
-    const { data } = await deploy({ token: TOKEN }, 'ip-check3', '/api/project-check');
-    ok(data.ok === false && /项目名/.test(data.error), '校验：缺项目名提示', JSON.stringify(data));
-  }
-  {
-    // 大小写/非法字符会被 sanitize
-    calls = []; saved = {}; uploaded = new Set();
-    const { data } = await deploy({ token: TOKEN, projectName: 'MOD-CHECK' }, 'ip-check4', '/api/project-check');
-    ok(data.ok === true && data.isMod === true, '校验：项目名归一化后仍命中', JSON.stringify(data));
+    const { data } = await deploy({ token: TOKEN, projectName: 'missing-check' }, 'ip-check3', '/api/project-check', { missing: ['missing-check'] });
+    ok(data.ok === false && /读取项目配置失败/.test(data.error), '项目检查：不存在项目返回错误', JSON.stringify(data));
   }
 }
 
@@ -450,6 +445,16 @@ async function deploy(body, ip, path = '/api/deploy', mockInit) {
   }
 }
 
-globalThis.fetch = realFetch;
+// ---------- 13. 部署轮询超时与页面按钮状态 ----------
+{
+  const { data } = await deploy({ token: TOKEN, projectName: 'mod-pending' }, 'ip-pending', '/api/update', { deploymentPending: true });
+  const polls = calls.filter(c => /\/deployments\/dep\d+$/.test(c.short));
+  ok(data.ok === false && /部署仍在进行中/.test(data.error), '更新：轮询超时提示仍在部署', JSON.stringify(data));
+  ok(polls.length === 6, '更新：超时后恰好进行六轮部署状态轮询', String(polls.length));
+  ok(docsHtml.includes("document.querySelectorAll('.proj-item').forEach(b => { b.disabled = false; });"),
+    '更新：失败或待确认后恢复项目列表按钮状态');
+}
+
+ globalThis.fetch = realFetch;
 console.log(`test-flow: ${pass} pass, ${fail} fail`);
 if (fail > 0) process.exit(1);

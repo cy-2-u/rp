@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { test } from 'node:test';
 
+const bundle = json => '/* RPHUB_ADAPTER_CONFIG\n' + json + '\n*/\nwindow.RPHubExternal = external;';
 // All fetches and R2 operations are local mocks; never contact an upstream.
 const source = await readFile(new URL('../_worker.js', import.meta.url), 'utf8');
 function load(overrides = {}) {
@@ -156,6 +157,42 @@ test('thumbnail accepts exactly 2 MiB and rejects empty bodies', async () => {
     assert.equal((await context.readThumbnailBytes(make(2 * 1024 * 1024))).byteLength, 2 * 1024 * 1024);
     await assert.rejects(context.readThumbnailBytes(make(0)));
 });
+test('generated image key is returned and its GET replay reads the same R2 object', async () => {
+    let upstreamCalls = 0;
+    const { context } = load({ fetch: async () => {
+        upstreamCalls += 1;
+        return new Response(Buffer.from('stable-image'), { headers: { 'content-type': 'image/png' } });
+    } });
+    const objects = new Map();
+    const reads = [];
+    const store = {
+        async get(objectKey) {
+            reads.push(objectKey);
+            const bytes = objects.get(objectKey);
+            return bytes ? { body: bytes, size: bytes.byteLength, httpMetadata: { contentType: 'image/png' } } : null;
+        },
+        async put(objectKey, bytes) { objects.set(objectKey, new Uint8Array(bytes)); }
+    };
+    const env = { RP_SYNC_R2: store };
+    const bodyOf = async response => Buffer.from(await response.arrayBuffer()).toString();
+    const generated = await context.handleImageRender(new Request(
+        'https://offline.invalid/api/rp-image?token=fake&tag=stable&character_name=A..B', { method: 'POST' }
+    ), env);
+    assert.equal(generated.status, 200);
+    const key = decodeURIComponent(generated.headers.get('x-rp-image-key'));
+    assert.match(key, /^rp-images\/characters\/A\.\.B\/[a-f0-9]{64}$/);
+    assert.ok(objects.has(key), 'response identity must be the persisted R2 object key');
+    assert.equal(await bodyOf(generated), 'stable-image');
+    const replay = await context.handleImageRender(new Request(
+        `https://offline.invalid/api/rp-image?key=${encodeURIComponent(key)}`
+    ), env);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get('x-rp-image-key'), encodeURIComponent(key));
+    assert.equal(await bodyOf(replay), 'stable-image');
+    assert.equal(upstreamCalls, 1, 'key replay must not invoke generation again');
+    assert.deepEqual(reads.slice(-2), [`rp-images/_deleted/A..B/${key.split('/').pop()}.json`, key]);
+});
+
 test('image accepts exactly 64 MiB, stores once and clears deadline', async () => {
     const { context, timers } = load({ fetch: async () => new Response(new Uint8Array(64 * 1024 * 1024), { headers: { 'content-type': 'image/png' } }) });
     const store = bucket(); store.get = async () => null;
@@ -243,9 +280,8 @@ test('author proxy strips local credentials and retains ordinary headers', async
 // --- ynai 第三方中转（占位 token + 本地 mock，永不接触真实上游） ---
 const YNAI_TOKEN = 'YNAI-placeholder-token';
 const YNAI_ADAPTER = JSON.stringify({
-    schema: 1,
+    schema: 2,
     id: 'rp-hub',
-    author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
     image: {
         ynai: {
             base: 'https://nai.rinko.ai',
@@ -257,15 +293,14 @@ const YNAI_ADAPTER = JSON.stringify({
 });
 test('ynai endpoints follow the cloud adapter config', async () => {
     const adapterJson = JSON.stringify({
-        schema: 1,
+        schema: 2,
         id: 'rp-hub',
-        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
         image: { ynai: { base: 'https://relay.example', modelsPath: '/v9/models', generatePath: '/v9/images/generations' } }
     });
     let captured;
     const { context } = load({ fetch: async url => {
         const u = String(url);
-        if (u.startsWith('file:')) return new Response(adapterJson, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('file:')) return new Response(bundle(adapterJson), { headers: { 'content-type': 'application/json' } });
         captured = { url: u };
         return new Response(JSON.stringify({ object: 'list', data: [{ id: 'm1' }] }), { headers: { 'content-type': 'application/json' } });
     } });
@@ -278,7 +313,7 @@ test('ynai keys route generation to the relay with the OpenAI images shape', asy
     let captured;
     const { context, timers } = load({ fetch: async (url, options) => {
         const u = String(url);
-        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('file:')) return new Response(bundle(YNAI_ADAPTER), { headers: { 'content-type': 'application/json' } });
         captured = { url: u, options };
         return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('ynai-png-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
     } });
@@ -353,7 +388,7 @@ test('ynai oversized decoded image returns 413 without writing R2', async () => 
     const encoded = Buffer.alloc(16 * 1024 * 1024).toString('base64') + 'AAA';
     const { context } = load({ fetch: async url => {
         if (String(url).startsWith('file:')) {
-            return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+            return new Response(bundle(YNAI_ADAPTER), { headers: { 'content-type': 'application/json' } });
         }
         return new Response(JSON.stringify({ data: [{ b64_json: encoded }] }), {
             headers: { 'content-type': 'application/json' }
@@ -372,7 +407,7 @@ test('ynai model list requires YNAI token and cloud config, proxies the relay li
     let calls = 0, modelListCaptured;
     const { context } = load({ fetch: async (url, options) => {
         const u = String(url);
-        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('file:')) return new Response(bundle(YNAI_ADAPTER), { headers: { 'content-type': 'application/json' } });
         if (!u.includes('nai.rinko.ai')) return new Response('not found', { status: 404 });
         calls += 1; modelListCaptured = { url: u, options };
         return new Response(JSON.stringify({ object: 'list', data: [{ id: 'model-a' }, { id: 'model-b' }, { id: null }] }), { headers: { 'content-type': 'application/json' } });
@@ -396,9 +431,8 @@ test('ynai invalid cloud config shape reports 503 without contacting the relay',
     // 配置存在但形状非法（缺 generatePath）与配置缺失同等对待：显式 503，
     // 不做代码兜底、不触发任何中转外呼。
     const brokenAdapter = JSON.stringify({
-        schema: 1,
+        schema: 2,
         id: 'rp-hub',
-        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
         image: { ynai: { base: 'https://nai.rinko.ai', modelsPath: '/v1/models' } }
     });
     let relayCalls = 0;
@@ -431,7 +465,7 @@ test('key-switching lifecycle: sta1n → ynai → sta1n keeps every era image di
     const relayCalls = [], sta1nCalls = [];
     const { context } = load({ fetch: async (url, options) => {
         const u = String(url);
-        if (u.startsWith('file:')) return new Response(YNAI_ADAPTER, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('file:')) return new Response(bundle(YNAI_ADAPTER), { headers: { 'content-type': 'application/json' } });
         if (u.includes('nai.rinko.ai')) {
             relayCalls.push(u);
             return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('relay-image-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
@@ -549,15 +583,14 @@ test('ynai model default follows the cloud adapter while sta1n keeps the builtin
 });
 test('ynai generation without an explicit model uses the cloud defaultModel end to end', async () => {
     const adapterJson = JSON.stringify({
-        schema: 1,
+        schema: 2,
         id: 'rp-hub',
-        author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } },
         image: { ynai: { base: 'https://nai.rinko.ai', modelsPath: '/v1/models', generatePath: '/v1/images/generations', defaultModel: 'relay-default-9' } }
     });
     let captured;
     const { context } = load({ fetch: async (url, options) => {
         const u = String(url);
-        if (u.startsWith('file:')) return new Response(adapterJson, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('file:')) return new Response(bundle(adapterJson), { headers: { 'content-type': 'application/json' } });
         captured = { url: u, options };
         return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('png-bytes').toString('base64') }] }), { headers: { 'content-type': 'application/json' } });
     } });
@@ -568,7 +601,7 @@ test('ynai generation without an explicit model uses the cloud defaultModel end 
     assert.equal(JSON.parse(captured.options.body).model, 'relay-default-9', '生成请求使用云端默认模型');
 });
 test('direct adapter source returning garbage 200 falls back to the R2 last-good copy', async () => {
-    const lastGood = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
+    const lastGood = JSON.stringify({ schema: 2, id: 'rp-hub' });
     let putCalls = 0;
     const { context } = load({ fetch: async url => {
         const u = String(url);
@@ -578,7 +611,7 @@ test('direct adapter source returning garbage 200 falls back to the R2 last-good
         throw new Error(`unexpected fetch: ${u}`);
     } });
     const store = {
-        async get() { return new Response(lastGood, { headers: { 'content-type': 'application/json' } }); },
+        async get() { return new Response(bundle(lastGood), { headers: { 'content-type': 'application/json' } }); },
         async put() { putCalls += 1; }
     };
     const adapter = await context.loadAdapter({ RP_SYNC_R2: store });
@@ -593,30 +626,32 @@ test('adapter load fails cleanly when the direct source returns non-JSON and no 
     assert.equal(lastGoodReads, 1, '失败后已尝试 R2 last-good');
 });
 test('adapter load succeeds against the direct GitHub source only', async () => {
-    const valid = JSON.stringify({ schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } });
+    const valid = JSON.stringify({ schema: 2, id: 'rp-hub' });
     const contacted = [];
     const { context } = load({ fetch: async url => {
         const u = String(url);
         contacted.push(u);
-        if (u.startsWith('https://raw.githubusercontent.com')) return new Response(valid, { headers: { 'content-type': 'application/json' } });
+        if (u.startsWith('https://raw.githubusercontent.com')) return new Response(bundle(valid), { headers: { 'content-type': 'application/json' } });
         return new Response('mirror host must not be contacted', { status: 200 });
     } });
     const adapter = await context.loadAdapter({});
     assert.equal(adapter.id, 'rp-hub');
     assert.equal(contacted.length, 1, '只访问 raw.githubusercontent.com，不访问任何镜像域名');
 });
-test('validateAdapter keeps the author script path inside the rewritable candidate set', () => {
+test('adapter metadata is normalized to supported fields', () => {
     const { context } = load();
-    const base = { schema: 1, id: 'rp-hub', author: { script: { replacements: [{ name: 'x', find: 'a', replace: 'b' }] } } };
-    assert.doesNotThrow(() => context.validateAdapter(base), '缺省 path 合法');
-    assert.doesNotThrow(() => context.validateAdapter({
-        ...base,
-        author: { script: { path: '/assets/js/app.js', replacements: base.author.script.replacements } }
-    }));
-    assert.throws(
-        () => context.validateAdapter({ ...base, author: { script: { path: '/other/app.js', replacements: base.author.script.replacements } } }),
-        /适配清单脚本路径无效/
-    );
+    const adapter = context.validateAdapter({ schema: 2, id: 'rp-hub', futureFlag: true });
+    assert.equal(adapter.schema, 2);
+    assert.equal(adapter.futureFlag, undefined);
+    assert.throws(() => context.validateAdapter({ schema: 2, id: '' }));
+});
+test('invalid adapter source falls back without overwriting last-good', async () => {
+    const good = bundle(JSON.stringify({ schema: 2, id: 'last-good' }));
+    const { context } = load({ fetch: async () => new Response(bundle('{"schema":2}')) });
+    let writes = 0;
+    const adapter = await context.loadAdapter({ RP_SYNC_R2: { get: async () => new Response(good), put: async () => { writes++; } } });
+    assert.equal(adapter.id, 'last-good');
+    assert.equal(writes, 0);
 });
 test('legacy sta1n replay keys are stable with or without the provider param', () => {
     const { context } = load();

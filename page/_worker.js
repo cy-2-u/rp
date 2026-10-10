@@ -1,25 +1,7 @@
 const AUTHOR_BASE = 'https://sta1n156.github.io/RP-Hub/';
 
 // 生产适配地址固定；file:// 仅供本地测试 fetch mock 使用。
-const DEFAULT_ADAPTER_URL = 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json';
-
-function authorSourcePattern(snippet) {
-    const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const gap = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?=[\r\n]|$))*`;
-    const tokens = snippet.match(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|===|=>|\.{3}|[^\s]/g);
-    const pattern = tokens.map(token => {
-        if (/^['"]/.test(token)) {
-            const text = token.slice(1, -1);
-            return text.includes('\\') || /['"]/.test(text)
-                ? escape(token)
-                : `(?:'${escape(text)}'|"${escape(text)}")`;
-        }
-        return /^[A-Za-z_$]/.test(token)
-            ? `(?<![\\w$])${escape(token)}(?![\\w$])`
-            : escape(token);
-    }).join(gap);
-    return new RegExp(pattern, 'g');
-}
+const DEFAULT_ADAPTER_URL = 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.js';
 
 const ADAPTER_URL_ENV = 'RPHUB_ADAPTER_URL';
 const ADAPTER_PATH = '/__rphub/adapter.json';
@@ -28,13 +10,12 @@ const ADAPTER_CACHE_TTL_MS = 30 * 1000;
 const adapterCache = new Map();
 const adapterLoads = new Map();
 const adapterSources = new WeakMap();
-const compiledReplacements = new WeakMap();
 // 成功清单缓存 30 秒；失败也短暂缓存（仅网络源），适配源抖动时不让
 // 每个作者资源请求都重付一次直连拉取的超时。
 const ADAPTER_FAILURE_TTL_MS = 5 * 1000;
 
 // ---- 云端配置与作者页面均直连 GitHub（不经过任何第三方镜像/加速反代） ----
-const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good.json';
+const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good-script-v1.js';
 const AUTHOR_FETCH_TIMEOUT_MS = 8 * 1000;
 const ADAPTER_FETCH_TIMEOUT_MS = 10 * 1000;
 let adapterLastGoodPersisted = null;
@@ -47,10 +28,6 @@ async function fetchAdapterText(url, timeoutMs) {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = String(await response.text()).replace(/^\uFEFF/, '');
-    // 只采纳 JSON 合法的响应：网络设备/网关在故障时可能返回 200 + HTML
-    // 错误页，无校验时它会被当成适配清单交给解析器。非法内容按失败处理，
-    // 由 loadAdapterFresh 落到 R2 last-good 兜底。
-    JSON.parse(text);
     return text;
 }
 
@@ -63,53 +40,64 @@ async function fetchAuthorUpstream(path, init, search) {
     return fetch(url, { ...init, signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS), redirect: 'follow' });
 }
 
-// 替换规则的 expectedMatches 缺省值在 validateAdapter 与 rewriteAuthorScript
-// 两处使用，必须保持同一解释。
-function expectedMatchesOf(item) {
-    return item.expectedMatches === undefined ? 1 : Number(item.expectedMatches);
-}
-
 function validateAdapter(adapter) {
-    if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter)) {
-        throw new Error('适配清单格式无效。');
-    }
-    if (Number(adapter.schema) !== 1 || typeof adapter.id !== 'string' || !adapter.id.trim()) {
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (!object(adapter) || typeof adapter.id !== 'string' || !adapter.id.trim()) {
         throw new Error('适配清单版本无效。');
     }
-    const replacements = adapter.author?.script?.replacements;
-    if (!Array.isArray(replacements) || replacements.length === 0) {
-        throw new Error('适配清单缺少脚本替换规则。');
-    }
-    // author.script.path 是云端可改的作者主脚本路径（serveAuthor 据此判定
-    // 改写目标），形状必须落在候选集内，否则静默不生效。
-    const scriptPath = adapter.author?.script?.path;
-    if (scriptPath !== undefined && !/^\/assets\/js\/[^/]+\.js$/.test(scriptPath)) {
-        throw new Error('适配清单脚本路径无效。');
-    }
-    replacements.forEach((item, index) => {
-        if (!item || typeof item.name !== 'string' || typeof item.find !== 'string'
-            || typeof item.replace !== 'string' || !item.find.trim()) {
-            throw new Error(`适配清单替换规则无效：${index}。`);
+    const strings = (value, fields) => {
+        if (!object(value) || Object.entries(value).some(([key, item]) => !fields.includes(key) || typeof item !== 'string')) {
+            throw new Error('适配清单字段无效。');
         }
-        const expected = expectedMatchesOf(item);
-        if (!Number.isInteger(expected) || expected < 0 || expected > 8) {
-            throw new Error(`适配清单匹配数量无效：${item.name}。`);
-        }
-    });
-    const sourceChecks = adapter.author?.sourceChecks;
-    if (sourceChecks !== undefined && !Array.isArray(sourceChecks)) {
-        throw new Error('适配清单源码检查无效。');
-    }
-    for (const check of sourceChecks || []) {
-        if (!check || typeof check.path !== 'string' || !Array.isArray(check.contains)
-            || check.contains.some(value => typeof value !== 'string')) {
-            throw new Error('适配清单源码检查无效。');
+        return { ...value };
+    };
+    const ui = {};
+    const uiFields = {
+        navigation: ['mode', 'content', 'section', 'sectionHeading', 'grid', 'item', 'insertBeforeLabel', 'user', 'buttonClass', 'iconClass'],
+        settings: ['labelSelector', 'labelText', 'occurrence', 'anchorParentSelector', 'insert', 'modelLabel', 'rowClass', 'textClass', 'toggleWrapClass', 'toggleClass'],
+        chat: ['input', 'row', 'area', 'container'],
+        images: ['card', 'row', 'reroll']
+    };
+    if (adapter.ui !== undefined) {
+        if (!object(adapter.ui)) throw new Error('适配清单 UI 配置无效。');
+        for (const [name, value] of Object.entries(adapter.ui)) {
+            if (!uiFields[name]) throw new Error('适配清单 UI 配置无效。');
+            ui[name] = strings(value, uiFields[name]);
         }
     }
-    if (adapter.ui !== undefined && (typeof adapter.ui !== 'object' || Array.isArray(adapter.ui))) {
-        throw new Error('适配清单 UI 配置无效。');
+    const image = {};
+    if (adapter.image !== undefined) {
+        if (!object(adapter.image)) throw new Error('适配清单图片配置无效。');
+        for (const [name, value] of Object.entries(adapter.image)) {
+            if (name !== 'ynai') throw new Error('适配清单图片配置无效。');
+            image[name] = strings(value, ['base', 'modelsPath', 'generatePath', 'defaultModel']);
+            const base = new URL(value.base);
+            if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash
+                || base.pathname !== '/') throw new Error('适配清单图片地址无效。');
+            for (const key of ['modelsPath', 'generatePath']) {
+                if (typeof value[key] !== 'string' || !/^\/(?!\/)[^?#\\]+$/.test(value[key])) {
+                    throw new Error('适配清单图片路径无效。');
+                }
+            }
+        }
     }
-    return adapter;
+    const features = {};
+    if (adapter.features !== undefined) {
+        if (!object(adapter.features)) throw new Error('适配清单功能配置无效。');
+        for (const [key, value] of Object.entries(adapter.features)) {
+            if (!['sync', 'images', 'navigation', 'settings', 'scroll', 'preserveSettings'].includes(key) || typeof value !== 'boolean') {
+                throw new Error('适配清单功能配置无效。');
+            }
+            features[key] = value;
+        }
+    }
+    const capabilities = adapter.capabilities === undefined
+        ? { runtime: 'vue3-setup-v1', root: '#app' }
+        : strings(adapter.capabilities, ['runtime', 'root']);
+    if (capabilities.runtime !== undefined && capabilities.runtime !== 'vue3-setup-v1') {
+        throw new Error('适配清单运行时协议无效。');
+    }
+    return { schema: adapter.schema, id: adapter.id, ui, image, features, capabilities };
 }
 
 function resolveAdapterUrl(env) {
@@ -118,12 +106,8 @@ function resolveAdapterUrl(env) {
 }
 
 function adapterPublicView(adapter) {
-    return {
-        schema: Number(adapter.schema),
-        id: String(adapter.id),
-        ui: adapter.ui || {},
-        image: adapter.image || {}
-    };
+    return { schema: adapter.schema, id: adapter.id, ui: adapter.ui, image: adapter.image,
+        features: adapter.features, capabilities: adapter.capabilities };
 }
 
 async function loadAdapter(env) {
@@ -138,13 +122,8 @@ async function loadAdapter(env) {
     const loading = (async () => {
         try {
             const loaded = await loadAdapterFresh(env, url);
-            // 复用旧 adapter 对象时必须顺带清空它的 sourceCheckCaches：改写
-            // 缓存（rewriteCaches）以 adapter 对象身份为键、由 sourceCheckResults
-            // 顺带填充——两处靠“同一对象 + 清空源检查缓存”隐式耦合，拆改需
-            // 保持该契约（例如把缓存收拢进 adapter 模块时一并处理）。
             const adapter = cached?.value && adapterSources.get(cached.value) === adapterSources.get(loaded)
                 ? cached.value : loaded;
-            if (adapter === cached?.value) sourceCheckCaches.delete(adapter);
             adapterCache.set(url.href, { value: adapter, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
             return adapter;
         } catch (err) {
@@ -160,67 +139,36 @@ async function loadAdapter(env) {
     return loading;
 }
 
+function parseAdapterSource(source) {
+    if (textEncoder.encode(source).byteLength > ADAPTER_MAX_BYTES) throw new Error('适配清单超过大小上限。');
+    const match = source.match(/^\/\* RPHUB_ADAPTER_CONFIG\s*([\s\S]*?)\*\//);
+    if (!match || !source.includes('window.RPHubExternal = external;')) throw new Error('外部适配脚本契约无效。');
+    return validateAdapter(JSON.parse(match[1]));
+}
+
 async function loadAdapterFresh(env, url) {
-    let source = null;
-    let fromLastGood = false;
-    if (url.protocol === 'file:') {
-        const response = await fetch(url, { headers: { accept: 'application/json,text/plain' } });
-        if (!response.ok) throw new Error(`适配清单读取失败：HTTP ${response.status}`);
-        source = String(await response.text()).replace(/^\uFEFF/, '');
-    } else {
-        try {
-            source = await fetchAdapterText(url, ADAPTER_FETCH_TIMEOUT_MS);
-        } catch (_) {
-            source = null;
-        }
-        if (source === null) {
-            const lastGood = await env?.[R2_BINDING]?.get(ADAPTER_LASTGOOD_KEY);
-            if (lastGood) {
-                source = String(await lastGood.text()).replace(/^\uFEFF/, '');
-                fromLastGood = true;
-            }
-        }
-        if (source === null) throw new Error('适配清单读取失败：所有源均不可用。');
-    }
-    if (textEncoder.encode(source).byteLength > ADAPTER_MAX_BYTES) {
-        throw new Error('适配清单超过大小上限。');
-    }
+    let source;
     let adapter;
+    let fromLastGood = false;
     try {
-        adapter = validateAdapter(JSON.parse(source));
+        source = await fetchAdapterText(url, ADAPTER_FETCH_TIMEOUT_MS);
+        adapter = parseAdapterSource(source);
     } catch (error) {
-        throw error instanceof Error ? error : new Error('适配清单解析失败。');
+        if (url.protocol === 'file:') throw error;
+        const lastGood = await env?.[R2_BINDING]?.get(ADAPTER_LASTGOOD_KEY);
+        if (!lastGood) throw new Error('适配清单读取失败：没有可用配置。');
+        source = String(await lastGood.text()).replace(/^\uFEFF/, '');
+        adapter = parseAdapterSource(source);
+        fromLastGood = true;
     }
     if (!fromLastGood && url.protocol !== 'file:' && source !== adapterLastGoodPersisted && env?.[R2_BINDING]) {
         try {
-            await env[R2_BINDING].put(ADAPTER_LASTGOOD_KEY, source, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+            await env[R2_BINDING].put(ADAPTER_LASTGOOD_KEY, source, { httpMetadata: { contentType: 'application/javascript; charset=utf-8' } });
             adapterLastGoodPersisted = source;
         } catch (_) { /* 兜底缓存写入失败不影响服务 */ }
     }
     adapterSources.set(adapter, source);
     return adapter;
-}
-
-function rewriteAuthorScript(source, adapter) {
-    let output = String(source || '');
-    const replacements = adapter?.author?.script?.replacements;
-    if (!Array.isArray(replacements) || replacements.length === 0) {
-        throw new Error('适配清单缺少脚本替换规则。');
-    }
-    let rules = compiledReplacements.get(adapter);
-    if (!rules) {
-        rules = replacements.map(item => ({ ...item, pattern: authorSourcePattern(item.find) }));
-        compiledReplacements.set(adapter, rules);
-    }
-    for (const item of rules) {
-        let matches = 0;
-        output = output.replace(item.pattern, () => { matches += 1; return item.replace; });
-        const expected = expectedMatchesOf(item);
-        if (matches !== expected) {
-            throw new Error(`作者代码未匹配：${item.name}（${matches}/${expected}）`);
-        }
-    }
-    return output;
 }
 
 const DATASET_ID = 'main';
@@ -773,9 +721,16 @@ async function handleImageRender(request, env) {
     // ynai 请求提前解析一次云端配置：defaultModel 要在签名计算前参与
     // 模型默认值（缓存键必须与实际使用的模型一致），生成阶段直接复用，
     // 不再二次加载。
-    const ynaiConfig = isYnaiImageToken(token) ? resolveYnaiConfig(await tryLoadAdapter(env)) : null;
+    const imageKey = url.searchParams.get('key');
+    if (imageKey && (generateOnMiss || !isValidImageObjectKey(imageKey))) return error('图片读取路径无效。', 400);
+    const ynaiConfig = !imageKey && isYnaiImageToken(token) ? resolveYnaiConfig(await tryLoadAdapter(env)) : null;
     const params = buildImageParams(url, token, ynaiConfig?.defaultModel || null);
-    const primary = await buildImageLookupCandidate(params);
+    const primary = imageKey ? {
+        key: imageKey,
+        deletedKey: createImageDeletedKey(getImageCharacterFromKey(imageKey), getImageChecksumFromKey(imageKey)),
+        params: { character_name: getImageCharacterFromKey(imageKey) }
+    } : await buildImageLookupCandidate(params);
+    const identityHeaders = { 'x-rp-image-key': encodeURIComponent(primary.key) };
     // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
     // 证明未删除。两个 get 并行发出（浏览热路径少一个 R2 往返），命中
     // 判定仍按墓碑优先。
@@ -788,7 +743,7 @@ async function handleImageRender(request, env) {
         try { await cached?.body?.cancel?.(); } catch (_) { }
         try { await deleted?.body?.cancel?.(); } catch (_) { }
         return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
-            'cache-control': 'public, max-age=3600'
+            ...identityHeaders, 'cache-control': 'public, max-age=3600'
         });
     }
     // 非删除路径：命中原图（最常见的浏览路径）只花 2 个 R2 get（原图 +
@@ -798,11 +753,11 @@ async function handleImageRender(request, env) {
             // HEAD 的 Response 不携带正文：显式取消 R2 流，不留 给 GC。
             try { await cached.body?.cancel?.(); } catch (_) { }
             return imageResponse(null, cached.httpMetadata?.contentType, {
-                'content-length': String(cached.size || 0)
+                ...identityHeaders, 'content-length': String(cached.size || 0)
             });
         }
         return imageResponse(cached.body, cached.httpMetadata?.contentType, {
-            'content-length': String(cached.size || 0)
+            ...identityHeaders, 'content-length': String(cached.size || 0)
         });
     }
 
@@ -830,6 +785,7 @@ async function handleImageRender(request, env) {
             }
             try {
                 const bytes = await readBoundedImageBytes(upstreamResponse, IMAGE_MAX_BYTES, '图片过大', signal);
+                if (!bytes.byteLength) return error('生图服务返回了空图片。', 502);
                 return { bytes, contentType };
             } catch (err) {
                 if (err.status === 413) return error(err.message, 413);
@@ -845,7 +801,7 @@ async function handleImageRender(request, env) {
     });
 
     return imageResponse(bytes, contentType, {
-        'content-length': String(bytes.byteLength)
+        ...identityHeaders, 'content-length': String(bytes.byteLength)
     });
 }
 
@@ -1084,8 +1040,9 @@ function visibleImages(){var q=filter.value.trim().toLowerCase();var out=[];(dat
 function allImageKeys(){var out=[];(data&&data.characters||[]).forEach(function(c){(c.images||[]).forEach(function(img){out.push(img.key);});});return out;}
 function characterImageKeys(name){var out=[];(data&&data.characters||[]).forEach(function(c){if(c.name!==name)return;(c.images||[]).forEach(function(img){out.push(img.key);});});return out;}
 function resetHiddenAll(){hiddenKeys=new Set(allImageKeys());}
-function setAllHidden(hidden){hiddenKeys=hidden?new Set(allImageKeys()):new Set();render();}
-function setCharacterHidden(name,hidden){characterImageKeys(name).forEach(function(key){if(hidden)hiddenKeys.add(key);else hiddenKeys.delete(key);});render();}
+function refreshVisibleTileBlur(){library.querySelectorAll('.photo').forEach(function(tile){tile.classList.toggle('blurred',hiddenKeys.has(tile.dataset.key));});}
+function setAllHidden(hidden){hiddenKeys=hidden?new Set(allImageKeys()):new Set();refreshVisibleTileBlur();}
+function setCharacterHidden(name,hidden){characterImageKeys(name).forEach(function(key){if(hidden)hiddenKeys.add(key);else hiddenKeys.delete(key);});refreshVisibleTileBlur();}
 function toggleKeyHidden(key){if(hiddenKeys.has(key))hiddenKeys.delete(key);else hiddenKeys.add(key);return hiddenKeys.has(key);}
 function photoTile(key){var tiles=library.querySelectorAll('.photo');for(var i=0;i<tiles.length;i++){if(tiles[i].dataset.key===key)return tiles[i];}return null;}
 function showContextMenu(x,y,key){contextMenu.innerHTML='<button data-act="view">\u67e5\u770b\u5927\u56fe</button><button data-act="toggle">'+(hiddenKeys.has(key)?'\u663e\u793a\u6b64\u56fe':'\u9690\u85cf\u6b64\u56fe')+'</button>';contextMenu.dataset.key=key;contextMenu.classList.remove('hidden');var rect=contextMenu.getBoundingClientRect();var left=Math.min(x,window.innerWidth-rect.width-6);var top=Math.min(y,window.innerHeight-rect.height-6);contextMenu.style.left=Math.max(6,left)+'px';contextMenu.style.top=Math.max(6,top)+'px';}
@@ -1329,13 +1286,10 @@ async function writeImageTombstone(bucket, key) {
 }
 
 async function deleteImageObjectFiles(bucket, objects) {
-    // R2 单次 delete 上限 1000 键；两处调用方每请求上限分别为 40/20 个
-    // 目标（含缩略图各一批），整批直删即可。
-    const objectKeys = objects.map(object => object.key);
-    const thumbKeys = objects.map(object => object.thumbKey).filter(Boolean);
-    await Promise.allSettled([objectKeys, thumbKeys]
-        .filter(keys => keys.length)
-        .map(keys => bucket.delete(keys)));
+    const keys = objects.flatMap(object => [object.key, object.thumbKey].filter(Boolean));
+    for (let start = 0; start < keys.length; start += 1000) {
+        await bucket.delete(keys.slice(start, start + 1000));
+    }
 }
 
 async function handleImageAdmin(request, env, url, ctx) {
@@ -1917,11 +1871,11 @@ function binaryUploadEnvelopeError(request, expectedLength, noun, mismatchMessag
 }
 
 async function handleUploadPack(request, bucket, url) {
-    const uploadId = String(url.searchParams.get('uploadId') || '');
+    const uploadId = String(url.searchParams.get('uploadId') || '').toLowerCase();
     const checksum = String(url.searchParams.get('checksum') || '').toLowerCase();
     const length = Number(url.searchParams.get('length'));
     const entryCount = Number(url.searchParams.get('entryCount'));
-    if (!/^[a-f0-9-]{16,64}$/.test(uploadId)) return error('上传会话无效。', 400);
+    if (!/^[a-f0-9]{64}$/.test(uploadId)) return error('上传会话无效。', 400);
     if (!/^[a-f0-9]{64}$/.test(checksum)) return error('上传数据包校验码无效。', 400);
     if (!Number.isInteger(length) || length <= 0 || length > MAX_PACK_BYTES) {
         return error('上传数据包大小异常。', 413);
@@ -1931,29 +1885,49 @@ async function handleUploadPack(request, bucket, url) {
     }
     const envelopeError = binaryUploadEnvelopeError(request, length, '上传数据包', '上传数据包长度与声明不一致。');
     if (envelopeError) return envelopeError;
-    // 会话存在性与 pack 幂等检查是两个互不依赖的纯读，并行发出省一个
-    // 串行往返；判定顺序保持先会话、再 pack 元数据一致短路。
-    const [sessionHead, existing] = await Promise.all([
-        bucket.head(createUploadSessionKey(uploadId)),
-        bucket.head(createPackKey(checksum))
-    ]);
-    if (!sessionHead) {
+
+    const storedSession = await readUploadSession(bucket, uploadId);
+    if (!storedSession) {
         if (request.body.cancel) await request.body.cancel();
         return error('上传会话不存在或已过期。', 409);
     }
-    const key = createPackKey(checksum);
-    if (existing && Number(existing.size) === length
-        && Number(existing.customMetadata?.entryCount) === entryCount) {
+    let page = storedSession.session.nextPage < storedSession.session.pageCount
+        ? await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage)
+        : null;
+    let declared = page?.packs.find(pack => pack.checksum === checksum);
+    if (!declared && storedSession.session.nextPage > 0) {
+        page = await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage - 1);
+        declared = page?.packs.find(pack => pack.checksum === checksum);
+    }
+    if (!declared || declared.length !== length || declared.entryCount !== entryCount) {
         if (request.body.cancel) await request.body.cancel();
-        return new Response(null, { status: 204 });
+        return error('上传数据包不属于当前上传清单页。', 409);
+    }
+
+    const key = createPackKey(checksum);
+    const existing = await bucket.head(key);
+    if (existing) {
+        if (Number(existing.size) === length
+            && Number(existing.customMetadata?.entryCount) === entryCount) {
+            if (request.body.cancel) await request.body.cancel();
+            return new Response(null, { status: 204 });
+        }
+        if (request.body.cancel) await request.body.cancel();
+        return error('内容寻址数据包已存在但元数据不同。', 409);
     }
     const stored = await bucket.put(key, request.body, {
         sha256: checksumBytes(checksum),
         httpMetadata: { contentType: 'application/octet-stream' },
-        customMetadata: { entryCount: String(entryCount) }
+        customMetadata: { entryCount: String(entryCount) },
+        onlyIf: { etagDoesNotMatch: '*' }
     });
-    if (!stored) return error('上传数据包写入失败。', 503);
-    return new Response(null, { status: 204 });
+    if (stored) return new Response(null, { status: 204 });
+    const raced = await bucket.head(key);
+    if (raced && Number(raced.size) === length
+        && Number(raced.customMetadata?.entryCount) === entryCount) {
+        return new Response(null, { status: 204 });
+    }
+    return error('内容寻址数据包已被其他元数据占用。', 409);
 }
 
 function normalizeUploadSession(value) {
@@ -2013,17 +1987,36 @@ function uploadSessionInfo(session) {
     };
 }
 
+async function readUploadManifestPage(bucket, session, pageIndex) {
+    const stored = await readSmallJsonObject(bucket, createManifestPageKey(session.checksum, pageIndex));
+    if (!stored) return null;
+    const page = normalizeManifestPage(stored.value, session, pageIndex);
+    if (!page) throw new SyncRequestError('上传清单页损坏。', 409);
+    const expectedHash = await sha256Text(buildManifestPageChecksumSource(
+        pageIndex,
+        page.previousPageHash,
+        page.packs
+    ));
+    if (expectedHash !== page.pageHash
+        || (pageIndex === session.nextPage && page.previousPageHash !== session.previousPageHash)
+        || (pageIndex === session.nextPage - 1 && page.pageHash !== session.previousPageHash)
+        || (pageIndex === session.pageCount - 1 && page.pageHash !== session.pageRoot)) {
+        throw new SyncRequestError('上传清单页校验失败。', 409);
+    }
+    return page;
+}
+
 async function handleBeginUpload(bucket, body) {
     const lock = await acquireMutationLock(bucket);
     if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
     try {
-        return await beginUploadLocked(bucket, body);
+        return await beginUploadLocked(bucket, body, lock);
     } finally {
         await releaseMutationLock(bucket, lock);
     }
 }
 
-async function beginUploadLocked(bucket, body) {
+async function beginUploadLocked(bucket, body, lock) {
     const checksum = String(body.checksum || '').toLowerCase();
     const bloomChecksum = String(body.bloomChecksum || '').toLowerCase();
     const pageRoot = String(body.pageRoot || '').toLowerCase();
@@ -2108,10 +2101,11 @@ async function beginUploadLocked(bucket, body) {
         createdAt: now,
         updatedAt: now
     };
-    const stored = await bucket.put(createUploadSessionKey(checksum), JSON.stringify(session), {
+    if (!await promoteMutationLock(bucket, lock)) return error('同步维护锁已被其他请求接管，请重试。', 409);
+    const stored = await mutateUnderLock(lock, () => bucket.put(createUploadSessionKey(checksum), JSON.stringify(session), {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         onlyIf: existing ? { etagMatches: existing.etag } : { etagDoesNotMatch: '*' }
-    });
+    }));
     if (!stored) {
         const raced = await readUploadSession(bucket, checksum);
         if (!raced) return error('上传会话创建失败。', 503);
@@ -2190,24 +2184,21 @@ async function handleUploadManifestPage(bucket, body) {
     if ([...unique.keys()].some(checksum => !bloomHasChecksum(bloomCache, checksum))) {
         return error('上传过滤器缺少当前清单分片。', 409);
     }
-    const checked = await runConcurrent([...unique.values()], 6, async pack => {
-        const object = await bucket.head(createPackKey(pack.checksum));
-        return object && Number(object.size) === pack.length
-            && Number(object.customMetadata?.entryCount) === pack.entryCount
-            ? null
-            : pack.checksum;
-    });
-    const missingPacks = checked.filter(Boolean);
-    if (missingPacks.length) {
-        return json({ ok: true, ...uploadSessionInfo(session), missingPacks });
-    }
-
     const pageHash = await sha256Text(buildManifestPageChecksumSource(
         pageIndex, session.previousPageHash, packs
     ));
     if (pageIndex === session.pageCount - 1 && pageHash !== session.pageRoot) {
         return error('上传清单页根校验失败。', 409);
     }
+    const verifiedBytes = session.verifiedBytes + packs.reduce((sum, pack) => sum + pack.length, 0);
+    const verifiedEntries = session.verifiedEntries + packs.reduce((sum, pack) => sum + pack.entryCount, 0);
+    const verifiedPacks = session.verifiedPacks + packs.length;
+    const complete = pageIndex + 1 === session.pageCount;
+    if (verifiedBytes > session.totalBytes || verifiedEntries > session.entryCount || verifiedPacks > session.packCount) {
+        return error('上传清单合计超出根声明。', 409);
+    }
+    if (complete && (verifiedBytes !== session.totalBytes || verifiedEntries !== session.entryCount
+        || verifiedPacks !== session.packCount)) return error('上传清单合计不一致。', 409);
     const pageObject = {
         format: MANIFEST_PAGE_FORMAT,
         checksum: session.checksum,
@@ -2228,12 +2219,21 @@ async function handleUploadManifestPage(bucket, body) {
             return error('上传清单页已存在但内容不同。', 409);
         }
     }
-    const verifiedBytes = session.verifiedBytes + packs.reduce((sum, pack) => sum + pack.length, 0);
-    const verifiedEntries = session.verifiedEntries + packs.reduce((sum, pack) => sum + pack.entryCount, 0);
-    const verifiedPacks = session.verifiedPacks + packs.length;
-    const complete = pageIndex + 1 === session.pageCount;
-    if (complete && (verifiedBytes !== session.totalBytes || verifiedEntries !== session.entryCount
-        || verifiedPacks !== session.packCount)) return error('上传清单合计不一致。', 409);
+
+    const checked = await runConcurrent([...unique.values()], 6, async pack => {
+        const object = await bucket.head(createPackKey(pack.checksum));
+        return object && Number(object.size) === pack.length
+            && Number(object.customMetadata?.entryCount) === pack.entryCount
+            ? null
+            : pack.checksum;
+    });
+    const missingPacks = checked.filter(Boolean);
+    if (missingPacks.length) {
+        // 页面声明先于缺包响应持久化；nextPage 与 verified* 仍保持不变，
+        // upload-pack 才能在重试/丢响应时按当前页精确校验授权。
+        return json({ ok: true, ...uploadSessionInfo(session), missingPacks });
+    }
+
     const next = {
         ...session,
         nextPage: pageIndex + 1,
@@ -2272,22 +2272,55 @@ async function handleUploadBloom(request, bucket, url) {
 async function acquireMutationLock(bucket) {
     const now = Date.now();
     const current = await readSmallJsonObject(bucket, MUTATION_LOCK_KEY, 4096);
+    const currentPhase = String(current?.value?.phase || 'preparing');
+    if (currentPhase === 'mutating') return null;
     if (current && Number(current.value?.expiresAt || 0) > now) return null;
     const owner = crypto.randomUUID();
-    const value = JSON.stringify({ owner, expiresAt: now + 30_000 });
+    const value = JSON.stringify({ owner, phase: 'preparing', expiresAt: now + 30_000 });
     const saved = await bucket.put(MUTATION_LOCK_KEY, value, {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         onlyIf: current?.etag ? { etagMatches: current.etag } : { etagDoesNotMatch: '*' }
     });
     if (!saved) return null;
-    const etag = saved.etag || (await bucket.head(MUTATION_LOCK_KEY))?.etag || null;
-    return { owner, etag };
+    const etag = saved.etag || null;
+    return etag ? { owner, etag, phase: 'preparing', preserve: false } : null;
+}
+
+async function promoteMutationLock(bucket, lock) {
+    if (!lock?.owner || !lock.etag || lock.phase === 'mutating') return Boolean(lock?.phase === 'mutating');
+    const saved = await mutateUnderLock(lock, () => bucket.put(MUTATION_LOCK_KEY, JSON.stringify({
+        owner: lock.owner,
+        phase: 'mutating',
+        expiresAt: 0
+    }), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8' },
+        onlyIf: { etagMatches: lock.etag }
+    }));
+    if (!saved) return false;
+    if (!saved.etag) { lock.preserve = true; return false; }
+    lock.etag = saved.etag;
+    lock.phase = 'mutating';
+    lock.preserve = false;
+    return true;
+}
+
+async function mutateUnderLock(lock, action) {
+    try { return await action(); }
+    catch (error) {
+        // R2 拒绝响应不能证明写入未发生；临界区结果未知时禁止后继维护进入。
+        lock.preserve = true;
+        throw error;
+    }
 }
 
 async function releaseMutationLock(bucket, lock) {
-    if (!lock?.etag) return;
+    if (!lock?.etag || lock.preserve) return;
     try {
-        await bucket.put(MUTATION_LOCK_KEY, JSON.stringify({ owner: null, expiresAt: 0 }), {
+        await bucket.put(MUTATION_LOCK_KEY, JSON.stringify({
+            owner: null,
+            phase: 'released',
+            expiresAt: 0
+        }), {
             httpMetadata: { contentType: 'application/json; charset=utf-8' },
             onlyIf: { etagMatches: lock.etag }
         });
@@ -2347,12 +2380,21 @@ async function handleFinalizeUpload(bucket, body) {
             snapshotFormat: STREAM_SNAPSHOT_FORMAT,
             schemaVersion: STREAM_SNAPSHOT_SCHEMA_VERSION
         };
-        const committed = await bucket.put(MANIFEST_KEY, JSON.stringify(root), {
-            httpMetadata: { contentType: 'application/json; charset=utf-8' },
-            onlyIf: session.baseEtag
-                ? { etagMatches: session.baseEtag }
-                : { etagDoesNotMatch: '*' }
-        });
+        if (!await promoteMutationLock(bucket, lock)) {
+            return error('同步维护锁已被其他请求接管，请重试。', 409);
+        }
+        let committed;
+        try {
+            committed = await bucket.put(MANIFEST_KEY, JSON.stringify(root), {
+                httpMetadata: { contentType: 'application/json; charset=utf-8' },
+                onlyIf: session.baseEtag
+                    ? { etagMatches: session.baseEtag }
+                    : { etagDoesNotMatch: '*' }
+            });
+        } catch (error) {
+            lock.preserve = true;
+            throw error;
+        }
         if (!committed) return error('服务器同步版本已变化，请重新检查后上传。', 409);
         try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
         return json({ ok: true, remote: buildRemoteInfo(root) });
@@ -2386,8 +2428,7 @@ async function handleGcStep(bucket) {
         if (!root) return json({ ok: true, done: true, deletedCount: 0 });
         const bloom = await readBloomFilter(bucket, root);
         const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
-        const cursor = storedState?.value?.rootChecksum === root.checksum
-            && typeof storedState.value.cursor === 'string'
+        const cursor = typeof storedState?.value?.cursor === 'string' && storedState.value.cursor
             ? storedState.value.cursor
             : undefined;
         const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
@@ -2414,15 +2455,19 @@ async function handleGcStep(bucket) {
             cursor: nextCursor,
             updatedAt: Date.now()
         };
-        if (candidates.length) {
-            // 先使旧验证失效，再删除；中断时保留原游标，下次可重试同一页。
-            await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, cursor }), {
+        if (!await promoteMutationLock(bucket, lock)) {
+            return error('同步维护锁已被其他请求接管，请重试。', 409);
+        }
+        await mutateUnderLock(lock, async () => {
+            if (candidates.length) {
+                await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, cursor }), {
+                    httpMetadata: { contentType: 'application/json; charset=utf-8' }
+                });
+                await bucket.delete(candidates);
+            }
+            await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
                 httpMetadata: { contentType: 'application/json; charset=utf-8' }
             });
-            await bucket.delete(candidates);
-        }
-        await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
-            httpMetadata: { contentType: 'application/json; charset=utf-8' }
         });
         return json({ ok: true, done: !nextCursor, deletedCount: candidates.length });
     } finally {
@@ -2520,57 +2565,6 @@ function serveSyncRestorePage() {
     });
 }
 
-// sourceChecks markers are verified against the live upstream before the
-// adapter is applied; results are cached for the adapter object's lifetime
-// (at most one 30s window per isolate). A failed check means the adapter no
-// longer matches the author's page, so the whole magic set falls back to the
-// unmodified author content — same all-or-nothing rule as replacement misses.
-const sourceCheckCaches = new WeakMap();
-
-function normalizeSourceCheckPath(value) {
-    const path = String(value || '');
-    return path === '/' ? '/index.html' : path;
-}
-
-async function sourceCheckResults(adapter, knownContent = null) {
-    const scriptPath = String(adapter.author?.script?.path || '/assets/js/app.js');
-    const checks = [...(adapter.author?.sourceChecks || [])];
-    if (!checks.some(check => normalizeSourceCheckPath(check.path) === scriptPath)) {
-        checks.push({ path: scriptPath, contains: [] });
-    }
-    let cache = sourceCheckCaches.get(adapter);
-    if (!cache) {
-        cache = new Map();
-        sourceCheckCaches.set(adapter, cache);
-    }
-    const results = await Promise.all(checks.map(check => {
-        const path = normalizeSourceCheckPath(check.path);
-        const known = knownContent && normalizeSourceCheckPath(knownContent.path) === path;
-        if (!known && cache.has(path)) return cache.get(path);
-        const checking = (async () => {
-            try {
-                const previous = path === scriptPath ? rewriteCaches.get(adapter) : null;
-                const response = known ? null : await fetchAuthorUpstream(check.path, previous?.etag
-                    ? { headers: { 'if-none-match': previous.etag } } : undefined);
-                const text = known ? knownContent.text
-                    : response.status === 304 && previous ? previous.source
-                        : response.ok ? await response.text() : null;
-                if (text === null || !(check.contains || []).every(marker => text.includes(marker))) return false;
-                if (path === scriptPath) {
-                    const body = previous?.source === text ? previous.body : rewriteAuthorScript(text, adapter);
-                    rewriteCaches.set(adapter, { source: text, body, etag: knownContent?.etag || response?.headers.get('etag') || null });
-                }
-                return true;
-            } catch (_) {
-                return false;
-            }
-        })();
-        cache.set(path, checking);
-        return checking;
-    }));
-    return results.every(Boolean);
-}
-
 async function tryLoadAdapter(env) {
     try {
         return await loadAdapter(env);
@@ -2579,30 +2573,30 @@ async function tryLoadAdapter(env) {
     }
 }
 
-function rewriteAuthorHtml(response, pathname, adapterReady) {
+function escapeHtmlScriptJson(value) {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026');
+}
+
+function rewriteAuthorHtml(response, pathname, adapter = null) {
     const isMain = pathname === '/' || pathname === '/index.html';
-    // 注入面保持最小：主页 3 节点（dirty-tracker、magic-extension、bootstrap），
-    // 其他作者 HTML 页只有 dirty-tracker。面板样式由 bootstrap 启动时自行
-    // 注入 <style>（与锁页样式同一来源），不再单独注入 styles.css 节点。
-    // 适配配置不内联进页面——magic-extension 自行拉取 /__rphub/adapter.json
-    // （该路径已是扩展测试的既有供给方式），页面响应因此少一个脚本节点与
-    // 整份适配 JSON。
-    // journal 已升级的数据库仍需要版本兼容与写追踪，不能随 UI 适配撤掉。
-    const injection = `<script src="/DB/dirty-tracker.js"></script>`
-        + (isMain && adapterReady ? `<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>` : '');
+    // 配置固定在本次导航中，后续资源请求不再决定当前页面的增强模式。
+    const injection = '<script src="/DB/dirty-tracker.js"></script>'
+        + (isMain && adapter
+            ? '<script>window.RPHUB_PAGE_ADAPTER=' + escapeHtmlScriptJson(adapterPublicView(adapter)) + ';</script>'
+                + '<script>' + adapterSources.get(adapter).replace(/<\/script/gi, '<\\/script') + '</script>'
+                + '<script src="/magic-extension.js"></script><script src="/DB/bootstrap.js"></script>'
+            : '');
     const headers = new Headers(response.headers);
     headers.set('content-type', 'text/html; charset=utf-8');
     headers.set('cache-control', 'no-store');
     headers.delete('content-length');
     headers.delete('content-encoding');
     headers.delete('etag');
-    const htmlResponse = new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers
-    });
+    const htmlResponse = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
     return new HTMLRewriter()
-        .on('meta[name="rphub-update-api"]', { element(element) { element.remove(); } })
         .on('head', { element(element) { element.append(injection, { html: true }); } })
         .transform(htmlResponse);
 }
@@ -2613,11 +2607,6 @@ async function serveAdapterConfig(request, env) {
     }
     try {
         const adapter = await loadAdapter(env);
-        // The config endpoint is also a verification boundary: do not expose
-        // an adapter that has not passed every source check.
-        if (!await sourceCheckResults(adapter)) {
-            throw new Error('适配清单与作者页面不匹配。');
-        }
         const response = json(adapterPublicView(adapter));
         return request.method === 'HEAD'
             ? new Response(null, { status: response.status, headers: response.headers })
@@ -2630,28 +2619,8 @@ async function serveAdapterConfig(request, env) {
     }
 }
 
-// Rewritten app.js is cached per adapter instance and upstream etag; the
-// WeakMap drops entries automatically once a refreshed adapter manifest
-// replaces the previous object.
-const rewriteCaches = new WeakMap();
-
-function rewrittenAppJsResponse(body) {
-    return new Response(body, {
-        status: 200,
-        headers: {
-            'content-type': 'application/javascript; charset=utf-8',
-            'cache-control': 'no-store'
-        }
-    });
-}
-
 async function serveAuthor(request, env) {
     const requestUrl = new URL(request.url);
-    if (requestUrl.pathname === '/assets/js/update-check.js') {
-        return new Response('window.RPHubUpdateCheck={useUpdateCheck(){}};', {
-            headers: { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-store' }
-        });
-    }
     let upstreamPath = requestUrl.pathname;
     if (upstreamPath === '/') upstreamPath = '/index.html';
     if (upstreamPath === '/character') upstreamPath = '/character/index.html';
@@ -2663,24 +2632,9 @@ async function serveAuthor(request, env) {
     upstreamHeaders.delete('authorization');
     upstreamHeaders.delete(SYNC_PASSWORD_HEADER);
 
-    // 作者主脚本路径来自云端适配清单（author.script.path，缺省回退内置值）。
-    // 只有 /assets/js/*.js 候选请求才加载清单（30 秒缓存 + 失败短路），
-    // 其余请求不为此付出子请求。
-    let adapter = null;
-    let cachedRewrite = null;
-    let isAppJs = false;
-    if (/^\/assets\/js\/[^/]+\.js$/i.test(requestUrl.pathname)) {
-        adapter = await tryLoadAdapter(env);
-        const scriptPath = String(adapter?.author?.script?.path || '/assets/js/app.js');
-        if (requestUrl.pathname === scriptPath) {
-            isAppJs = true;
-            cachedRewrite = adapter ? rewriteCaches.get(adapter) || null : null;
-        }
-    }
-    if (isAppJs && cachedRewrite?.etag) {
-        upstreamHeaders.set('if-none-match', cachedRewrite.etag);
-        upstreamHeaders.delete('if-modified-since');
-    } else if (isAppJs || !/\.[a-z0-9]+$/i.test(requestUrl.pathname) || requestUrl.pathname.endsWith('.html')) {
+    const isAuthorScript = /\.js$/i.test(requestUrl.pathname);
+    const isPage = !/\.[a-z0-9]+$/i.test(requestUrl.pathname) || requestUrl.pathname.endsWith('.html');
+    if (isAuthorScript || isPage) {
         upstreamHeaders.delete('if-none-match');
         upstreamHeaders.delete('if-modified-since');
     }
@@ -2691,37 +2645,17 @@ async function serveAuthor(request, env) {
         redirect: 'follow'
     }, requestUrl.search);
     const contentType = response.headers.get('content-type') || '';
-    if (request.method === 'HEAD' || response.status === 204) return response;
-    if (isAppJs && response.status === 304) {
-        return cachedRewrite && await sourceCheckResults(adapter)
-            ? rewrittenAppJsResponse(cachedRewrite.body)
-            : cachedRewrite ? rewrittenAppJsResponse(cachedRewrite.source) : response;
-    }
-    if (!response.ok) return response;
-    if (isAppJs) {
-        const source = await response.text();
-        let body = source;
-        if (adapter && await sourceCheckResults(adapter, {
-            path: requestUrl.pathname, text: source, etag: response.headers.get('etag')
-        })) {
-            body = rewriteCaches.get(adapter).body;
-        }
-        return rewrittenAppJsResponse(body);
-    }
     const isHtml = contentType.toLowerCase().includes('text/html');
-    if (isHtml) {
-        const pageText = await response.text();
-        const pageAdapter = await tryLoadAdapter(env);
-        const adapterReady = Boolean(pageAdapter)
-            && await sourceCheckResults(pageAdapter, { path: upstreamPath, text: pageText });
-        const pageResponse = new Response(pageText, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers
-        });
-        return rewriteAuthorHtml(pageResponse, requestUrl.pathname, adapterReady);
+    const headers = new Headers(response.headers);
+    if (isAuthorScript || isPage || isHtml) headers.set('cache-control', 'no-store');
+    if (request.method === 'HEAD' || [204, 205, 304].includes(response.status)) {
+        return new Response(null, { status: response.status, statusText: response.statusText, headers });
     }
-    return response;
+    const proxied = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    if (!response.ok || !isHtml) return proxied;
+    const adapter = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html'
+        ? await tryLoadAdapter(env) : null;
+    return rewriteAuthorHtml(proxied, requestUrl.pathname, adapter);
 }
 
 export default {

@@ -7,16 +7,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const read = relative => fs.readFile(path.join(root, relative), 'utf8');
-const defaultAdapterUrl = pathToFileURL(path.join(root, 'adapter', 'rp-hub.json')).href;
+const defaultAdapterUrl = pathToFileURL(path.join(root, 'adapter', 'rp-hub.js')).href;
 const configuredAdapterUrl = process.env.RPHUB_ADAPTER_URL?.trim() || defaultAdapterUrl;
-// 作者原版源码定位：环境变量优先，其次仓库同级的 RP-Hub-main 目录
-// （clone 作者仓库到本仓库旁边即可跑测试）。不再回退任何本机私有路径，
-// 两者都缺失时直接报清晰错误——公开仓库的测试必须可移植。
 const upstreamRoot = process.env.RPHUB_UPSTREAM_DIR?.trim()
     || [path.join(path.dirname(root), 'RP-Hub-main')].find(candidate => existsSync(candidate));
-if (!upstreamRoot) {
-    throw new Error('无法定位作者原版源码：请设置环境变量 RPHUB_UPSTREAM_DIR 指向 RP-Hub 仓库目录，或将 RP-Hub-main 克隆到本仓库旁。');
-}
+const upstreamFile = relative => upstreamRoot ? path.join(upstreamRoot, relative)
+    : path.join(root, '.sync-tests/fixtures/author', path.basename(relative));
+
+const adapterMetadata = text => JSON.parse(text.match(/^\/\* RPHUB_ADAPTER_CONFIG\s*([\s\S]*?)\*\//)[1]);
 
 function localAdapterPath() {
     const url = new URL(configuredAdapterUrl);
@@ -62,39 +60,21 @@ async function loadWorker(fetchImpl = globalThis.fetch) {
 }
 
 async function testAdapterFromFileUrl() {
-    const workerSource = await read('_worker.js');
-    const start = workerSource.indexOf('const AUTHOR_BASE');
-    const end = workerSource.indexOf('const DATASET_ID');
-    const api = new Function(`${workerSource.slice(start, end)}; return { validateAdapter, rewriteAuthorScript, resolveAdapterUrl };`)();
-    assert.deepEqual(
-        { href: api.resolveAdapterUrl({}).href, protocol: api.resolveAdapterUrl({}).protocol },
-        { href: 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.json', protocol: 'https:' },
-        'production must use the hardcoded adapter URL without any env var'
-    );
-    assert.equal(api.resolveAdapterUrl({ RPHUB_ADAPTER_URL: configuredAdapterUrl }).protocol, 'file:',
-        'local file:// adapter URLs must still override the hardcoded default');
-    const adapter = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
-    const author = await readFromUpstream('assets/js/app.js');
-    api.validateAdapter(adapter);
-    const rewritten = api.rewriteAuthorScript(author, adapter);
-    assert.notEqual(rewritten, author, 'adapter should rewrite the current author bundle');
-    assert.match(rewritten, /image_renders/);
-    assert.doesNotThrow(() => new Function(rewritten), 'rewritten author bundle must remain valid JavaScript');
-    assert.throws(() => api.validateAdapter({
-        ...adapter,
-        author: { ...adapter.author, sourceChecks: {} }
-    }), /源码检查无效/);
-    assert.throws(() => api.validateAdapter({
-        ...adapter,
-        author: {
-            ...adapter.author,
-            script: { ...adapter.author.script, replacements: [{ name: 'empty', find: ' ', replace: '' }] }
-        }
-    }), /替换规则无效/);
+    const source = await read('_worker.js');
+    const api = new Function(source.replace('export default {', 'const unusedWorker = {')
+        + '; return { validateAdapter, parseAdapterSource, resolveAdapterUrl };')();
+    assert.equal(api.resolveAdapterUrl({}).href, 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.js');
+    assert.equal(api.resolveAdapterUrl({ RPHUB_ADAPTER_URL: configuredAdapterUrl }).protocol, 'file:');
+    const script = await fs.readFile(localAdapterPath(), 'utf8');
+    const adapter = api.parseAdapterSource(script);
+    assert.equal(adapter.schema, 2);
+    assert.doesNotThrow(() => new Function(script));
+    assert.throws(() => api.validateAdapter({ ...adapter, ui: { chat: { input: 1 } } }));
+    assert.doesNotMatch(source, /rewriteAuthorScript|bindAuthorAppLoader|sourceCheckResults/);
 }
 
 async function readFromUpstream(relative) {
-    return fs.readFile(path.join(upstreamRoot, relative), 'utf8');
+    return fs.readFile(upstreamFile(relative), 'utf8');
 }
 
 async function loadUploadEngine() {
@@ -178,59 +158,23 @@ async function testUploadEngineCleanup() {
     assert.equal(closed, true, 'failed uploads must close the source iterator');
 }
 
-async function testAppJsRewriteCache() {
-    const appJsSource = await readFromUpstream('assets/js/app.js');
-    const etag = { value: '"app-v1"' };
-    let upstreamFetches = 0;
-    let upstreamBodyDownloads = 0;
-    const fetchMock = async (input, init) => {
-        const url = new URL(String(input));
-        if (url.protocol === 'file:') {
-            const body = await fs.readFile(fileURLToPath(url));
-            return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
-        }
-        if (url.pathname.endsWith('/assets/js/app.js')) {
-            upstreamFetches += 1;
-            const ifNoneMatch = new Headers(init?.headers || {}).get('if-none-match');
-            if (ifNoneMatch && ifNoneMatch === etag.value) return new Response(null, { status: 304 });
-            upstreamBodyDownloads += 1;
-            return new Response(appJsSource, {
-                status: 200,
-                headers: { etag: etag.value, 'content-type': 'application/javascript' }
-            });
-        }
-        // sourceChecks 强制校验需要 index.html 与 ui-components.js 命中作者源码。
-        const relative = url.pathname.replace(/^\/RP-Hub\//, '');
-        try {
-            const body = await fs.readFile(path.join(upstreamRoot, relative));
-            return new Response(body, { status: 200 });
-        } catch (_) {
-            return new Response('missing', { status: 404 });
-        }
-    };
-    const worker = await loadWorker(fetchMock);
-    const env = { RPHUB_ADAPTER_URL: configuredAdapterUrl };
-    const appUrl = 'https://local.test/assets/js/app.js';
-
-    const first = await worker.fetch(new Request(appUrl), env, {});
-    assert.equal(first.status, 200);
-    const firstBody = await first.text();
-    assert.match(firstBody, /image_renders/);
-    assert.equal(upstreamFetches, 1);
-
-    const second = await worker.fetch(new Request(appUrl), env, {});
-    assert.equal(second.status, 200);
-    const secondBody = await second.text();
-    assert.equal(secondBody, firstBody, 'second request must reuse the cached rewrite');
-    assert.match(secondBody, /image_renders/);
-    assert.equal(upstreamFetches, 2, 'freshness must be revalidated with a conditional request');
-    assert.equal(upstreamBodyDownloads, 1, 'unchanged upstream must not be downloaded again');
-
-    etag.value = '"app-v2"';
-    const third = await worker.fetch(new Request(appUrl), env, {});
-    assert.equal(third.status, 200);
-    assert.match(await third.text(), /image_renders/);
-    assert.equal(upstreamBodyDownloads, 2, 'changed upstream must be fetched and rewritten again');
+async function testAuthorScriptPassthrough() {
+    const author = await readFromUpstream('assets/js/app.js');
+    const calls = [];
+    const worker = await loadWorker(async (input, init) => {
+        calls.push({ input: String(input), init });
+        assert.equal(new Headers(init.headers).has('if-none-match'), false);
+        return new Response(init.method === 'HEAD' ? null : author, { headers: { 'content-type': 'application/javascript' } });
+    });
+    for (const method of ['GET', 'HEAD', 'GET']) {
+        const response = await worker.fetch(new Request('https://local.test/assets/js/app.js?v=123', {
+            method, headers: { 'if-none-match': 'stale' }
+        }), {}, {});
+        assert.equal(await response.text(), method === 'HEAD' ? '' : author);
+        assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(call => call.input.endsWith('app.js?v=123')));
 }
 
 async function testBootstrapUsesBoundedEngine() {
@@ -243,20 +187,13 @@ async function testBootstrapUsesBoundedEngine() {
 }
 
 async function testFixedImageSettingUsesAdapterClasses() {
-    const source = await read('magic-extension.js');
-    assert.match(source, /cfg\.rowClass/, 'fixed image row class must come from adapter config');
-    assert.match(source, /settings-toggle-row/, 'fixed image row fallback must follow the author settings row class');
-    assert.doesNotMatch(source, /settings-toggle--indigo/, 'the removed author toggle variant must not linger');
-    const adapter = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
-    const settings = adapter.ui.settings;
-    assert.equal(settings.rowClass, 'settings-toggle-row group');
-    assert.equal(settings.textClass, 'text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors');
-    assert.equal(settings.toggleWrapClass, 'relative inline-flex flex-none items-center');
-    assert.equal(settings.toggleClass, 'settings-toggle');
-    assert.ok(
-        adapter.author.sourceChecks.some(check => check.path === '/index.html' && check.contains.includes('settings-toggle-row')),
-        'the settings row class must be guarded by a source check'
-    );
+    const source = await read('adapter/rp-hub.js');
+    const feature = await read('magic-extension.js');
+    assert.match(source, /cfg\.rowClass/);
+    assert.match(source, /renderedSelect !== select/);
+    assert.doesNotMatch(feature, /app-navigation|settings-toggle-row|chat-input-scrollbar/);
+    const adapter = adapterMetadata(source);
+    assert.equal(adapter.ui.settings.rowClass, 'settings-toggle-row group');
 }
 
 async function testAdapterConfigEndpoint() {
@@ -268,18 +205,18 @@ async function testAdapterConfigEndpoint() {
         }
         const relative = url.pathname.replace(/^\/RP-Hub\//, '');
         try {
-            const body = await fs.readFile(path.join(upstreamRoot, relative));
+            const body = await fs.readFile(upstreamFile(relative));
             return new Response(body, { status: 200 });
         } catch (_) {
             return new Response('missing', { status: 404 });
         }
     };
     const worker = await loadWorker(fetchMock);
-    const adapter = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
+    const adapter = adapterMetadata(await fs.readFile(localAdapterPath(), 'utf8'));
     const env = { RPHUB_ADAPTER_URL: configuredAdapterUrl };
     const ok = await worker.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
     assert.equal(ok.status, 200);
-    assert.deepEqual(await ok.json(), { schema: adapter.schema, id: adapter.id, ui: adapter.ui, image: adapter.image || {} });
+    assert.deepEqual(await ok.json(), adapter);
     const head = await worker.fetch(new Request('https://local.test/__rphub/adapter.json', { method: 'HEAD' }), env, {});
     assert.equal(head.status, 200);
     assert.equal(await head.text(), '');
@@ -635,6 +572,7 @@ async function testCatchAllProxy() {
         ['assets/js/app.js', authorAppJs],
         ['assets/js/ui-components.js', authorUiComponents],
         ['brand-new-page.html', '<html><head></head><body>added after deploy</body></html>'],
+        ['assets/js/update-check.js', 'originalUpdateCheck();'],
         ['favicon.ico', 'icon-bytes']
     ]);
     const upstreamCalls = [];
@@ -691,8 +629,8 @@ async function testCatchAllProxy() {
     assert.equal(upstreamCalls.length, 0, 'the internal restore document must never reach the author upstream');
 
     const updateCheck = await worker.fetch(new Request('https://local.test/assets/js/update-check.js'), env, {});
-    assert.match(await updateCheck.text(), /useUpdateCheck\(\)\{\}/);
-    assert.equal(upstreamCalls.length, 0, 'the update-check stub must never reach the author');
+    assert.equal(await updateCheck.text(), 'originalUpdateCheck();');
+    assert.equal(upstreamCalls.length, 1, 'update-check is proxied unchanged');
 
     const future = await worker.fetch(new Request('https://local.test/brand-new-page.html'), env, {});
     assert.equal(future.status, 200, 'author pages added after deploy must be proxied automatically');
@@ -700,11 +638,11 @@ async function testCatchAllProxy() {
     assert.match(futureText, /added after deploy/);
     assert.ok(futureText.includes('<script src="/DB/dirty-tracker.js"></script>'), 'healthy non-main pages keep the base tracker');
     assert.doesNotMatch(futureText, /DB\/bootstrap\.js/, 'non-main pages must not load the sync panel');
-    assert.equal(upstreamCalls.length, 4, 'the first HTML request performs the complete cached source check');
+    assert.equal(upstreamCalls.length, 2, 'non-main HTML requires only one upstream request');
 
     const home = await worker.fetch(new Request('https://local.test/'), env, {});
     const homeText = await home.text();
-    assert.equal(upstreamCalls.length, 5, 'the main page adds one author HTML request after checks');
+    assert.equal(upstreamCalls.length, 3, 'main HTML needs no source-check fetches');
     const injectionMarkers = [
         '<script src="/DB/dirty-tracker.js"></script>',
         '<script src="/magic-extension.js"></script>',
@@ -838,6 +776,7 @@ async function testImageAdminPageRuntime() {
     sandbox.window.matchMedia = () => ({ matches: false });
     sandbox.window.scrollY = 0;
     sandbox.window.scrollTo = () => { };
+    sandbox.window.addEventListener = () => { };
     sandbox.globalThis = sandbox;
     const element = id => documentStub.getElementById(id);
     const settle = () => new Promise(resolve => setTimeout(resolve, 5));
@@ -858,19 +797,13 @@ async function testImageAdminPageRuntime() {
     await sandbox.enter();
     assert.ok(element('auth').classList.contains('hidden'), 'the right password must hide the login box');
     await waitFor(() => sandbox.data !== null, 'library data after login');
-    assert.equal(sandbox.data.characters[0].images.length, 40, 'first response must not drain the full directory');
-    assert.ok(sandbox.libraryCursor);
-    assert.match(element('stats').textContent, /尚有更多/);
-    let pages = 1;
-    while (sandbox.libraryCursor) {
-        assert.ok(pages++ < 30, 'pagination must make progress');
-        await sandbox.load(true);
-    }
-    assert.equal(pages, 28);
-    assert.equal(sandbox.data.characters.reduce((n, c) => n + c.images.length, 0), 1085);
+    assert.equal(sandbox.data.characters.reduce((n, c) => n + c.images.length, 0), 1085,
+        'a single library load must return every image');
     assert.deepEqual(Array.from(sandbox.data.characters, character => character.name), ['Alice', 'Bob']);
     assert.match(element('stats').textContent, /^1085 张图片/, 'stats must describe the loaded images');
     assert.match(element('library').innerHTML, /Alice/);
+    assert.equal(sandbox.hiddenKeys.size, 1085, 'all loaded images start hidden');
+    assert.match(element('library').innerHTML, /blurred/, 'hidden tiles render the blur class');
 
     // 页面加载完成后再写 3 张新图（模拟另一台设备继续生图）：
     // 清空本组必须把它们也删掉，服务端按当前 R2 状态展开。
@@ -1014,73 +947,33 @@ async function testImageAdminPageRuntime() {
     bucket.put = originalBucketPut;
 }
 
-async function testSourceCheckEnforcement() {
-    const appJsSource = await readFromUpstream('assets/js/app.js');
-    // 健康场景用真实作者 index.html / ui-components.js：作者改结构时，
-    // 这里会像替换规则一样在本地测试中变红，提示更新清单标记。
-    const healthyIndexHtml = await readFromUpstream('index.html');
-    const healthyUiComponents = await readFromUpstream('assets/js/ui-components.js');
-    const makeFetchMock = ({ indexHtml = healthyIndexHtml, uiComponents = healthyUiComponents, adapterText = null } = {}) => async input => {
-        const url = new URL(String(input));
-        if (url.protocol === 'file:') {
-            const body = adapterText ?? await fs.readFile(fileURLToPath(url));
-            return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
-        }
-        const relative = url.pathname.replace(/^\/RP-Hub\//, '');
-        if (relative === 'index.html') {
-            return new Response(indexHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
-        }
-        if (relative === 'assets/js/ui-components.js') return new Response(uiComponents, { status: 200 });
-        if (relative === 'assets/js/app.js') return new Response(appJsSource, { status: 200 });
-        return new Response('missing', { status: 404 });
-    };
+async function testPagePinnedAdapter() {
+    const author = await readFromUpstream('assets/js/app.js');
+    const html = await readFromUpstream('index.html');
+    let healthy = false;
+    const worker = await loadWorker(async input => {
+        const url = new URL(input);
+        if (url.protocol === 'file:') return new Response(healthy ? await fs.readFile(localAdapterPath(), 'utf8') : 'invalid');
+        return new Response(url.pathname.endsWith('app.js') ? author : html, {
+            headers: { 'content-type': url.pathname.endsWith('.js') ? 'application/javascript' : 'text/html' }
+        });
+    });
     const env = { RPHUB_ADAPTER_URL: configuredAdapterUrl };
-
-    const healthy = await loadWorker(makeFetchMock());
-    const healthyPage = await healthy.fetch(new Request('https://local.test/'), env, {});
-    const healthyPageBody = await healthyPage.text();
-    // 适配配置不再内联；扩展启动时自行拉取 /__rphub/adapter.json。
-    assert.doesNotMatch(healthyPageBody, /RPHUB_MAGIC_ADAPTER/, 'the adapter config must not be inlined into author pages');
-    assert.match(healthyPageBody, /\/DB\/dirty-tracker\.js/);
-    assert.match(healthyPageBody, /\/magic-extension\.js/);
-    assert.match(healthyPageBody, /\/DB\/bootstrap\.js/);
-    const healthyConfig = await healthy.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
-    assert.equal(healthyConfig.status, 200);
-    const healthyAppJs = await healthy.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
-    const healthyAppJsBody = await healthyAppJs.text();
-    assert.match(healthyAppJsBody, /RPH_MAGIC_IMAGE_TASK/, 'all markers matching must apply the rewrite');
-
-    const staleIndex = await loadWorker(makeFetchMock({
-        indexHtml: '<html><head></head><body>author redesigned the page</body></html>'
-    }));
-    const stalePage = await staleIndex.fetch(new Request('https://local.test/'), env, {});
-    const stalePageBody = await stalePage.text();
-    assert.doesNotMatch(stalePageBody, /RPHUB_MAGIC_ADAPTER/, 'a failed page marker must drop all custom injection');
-    assert.match(stalePageBody, /\/DB\/dirty-tracker\.js/, 'storage compatibility and journaling must survive UI adapter failure');
-    assert.doesNotMatch(stalePageBody, /\/magic-extension\.js|\/DB\/bootstrap\.js/, 'a failed page marker must not load custom features');
-    const staleConfig = await staleIndex.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {});
-    assert.equal(staleConfig.status, 503, 'the adapter config endpoint must refuse a stale adapter');
-    const staleAppJs = await staleIndex.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
-    assert.equal(await staleAppJs.text(), appJsSource, 'a failed source check must return the author script unchanged');
-
-    const staleComponents = await loadWorker(makeFetchMock({
-        uiComponents: 'author rewrote the navigation components'
-    }));
-    const componentsPage = await staleComponents.fetch(new Request('https://local.test/'), env, {});
-    assert.doesNotMatch(await componentsPage.text(), /RPHUB_MAGIC_ADAPTER=/, 'any failed source check must keep the page unchanged');
-    const componentsAppJs = await staleComponents.fetch(new Request('https://local.test/assets/js/app.js'), env, {});
-    assert.equal(await componentsAppJs.text(), appJsSource, 'a failed ui-components check must skip the rewrite too');
-
-    const invalidReplacement = JSON.parse(await fs.readFile(localAdapterPath(), 'utf8'));
-    invalidReplacement.author.script.replacements.push({ name: 'mismatch', find: 'ABSENT_AUTHOR_MARKER_123456789', replace: 'unused' });
-    const mismatch = await loadWorker(makeFetchMock({ adapterText: JSON.stringify(invalidReplacement) }));
-    const page = await mismatch.fetch(new Request('https://local.test/'), env, {});
-    const html = await page.text();
-    assert.match(html, /\/DB\/dirty-tracker\.js/);
-    assert.doesNotMatch(html, /\/magic-extension\.js|\/DB\/bootstrap\.js/);
-    assert.equal((await mismatch.fetch(new Request('https://local.test/__rphub/adapter.json'), env, {})).status, 503);
-    assert.equal(await (await mismatch.fetch(new Request('https://local.test/assets/js/app.js'), env, {})).text(), appJsSource,
-        'replacement mismatch must fail the source check before any UI enhancement is injected');
+    const failedPage = await (await worker.fetch(new Request('https://local.test/'), env, {})).text();
+    assert.match(failedPage, /DB\/dirty-tracker/);
+    assert.doesNotMatch(failedPage, /magic-extension|DB\/bootstrap/);
+    healthy = true;
+    assert.equal(await (await worker.fetch(new Request('https://local.test/assets/js/app.js'), env, {})).text(), author);
+    const page = await (await worker.fetch(new Request('https://local.test/'), env, {})).text();
+    assert.match(page, /window\.RPHubExternal = external/);
+    assert.match(page, /magic-extension/);
+    const loader = html.slice(html.lastIndexOf('<script>'));
+    assert.ok(page.endsWith(loader), 'author document.write loader remains byte-for-byte unchanged');
+    assert.ok(!page.includes(author), 'author application is never embedded in HTML');
+    const adapterIndex = page.indexOf('window.RPHubExternal = external');
+    assert.ok(adapterIndex < page.indexOf('<script src="/magic-extension.js">'));
+    const isolated = await loadWorker(async input => new Response(String(input).endsWith('app.js') ? author : 'invalid'));
+    assert.equal(await (await isolated.fetch(new Request('https://local.test/assets/js/app.js'), env, {})).text(), author);
 }
 
 await testImageAdminApi();
@@ -1088,10 +981,10 @@ await testImageAdminInlineScriptSyntax();
 await testImageAdminPageRuntime();
 await testImageRenderApi();
 await testCatchAllProxy();
-await testSourceCheckEnforcement();
+await testPagePinnedAdapter();
 await testAdapterFromFileUrl();
 await testAdapterConfigEndpoint();
-await testAppJsRewriteCache();
+await testAuthorScriptPassthrough();
 await testBoundedUploadEngine();
 await testUploadEngineCleanup();
 await testBootstrapUsesBoundedEngine();

@@ -446,7 +446,7 @@ async function testMetadataBloomAndOrderingRejections(worker) {
         const snapshot = await buildSnapshot(1, { prefix: 'missing-bloom', bloom: zeroBloom });
         await begin(api, snapshot);
         await uploadBloom(api, snapshot);
-        await uploadPack(api, snapshot.checksum, snapshot.packs[0]);
+        assert.equal((await uploadPack(api, snapshot.checksum, snapshot.packs[0])).status, 409, 'undeclared upload is rejected');
         const page = await submitPage(api, snapshot, 0);
         assert.equal(page.response.status, 409);
         assert.match(page.body.error, /过滤器缺少/);
@@ -464,8 +464,18 @@ async function testMetadataBloomAndOrderingRejections(worker) {
         });
         const page = await submitPage(api, snapshot, 0);
         assert.deepEqual(page.body.missingPacks, [snapshot.packs[0].checksum], 'wrong custom metadata must count as missing');
-        await uploadPack(api, snapshot.checksum, snapshot.packs[0]);
-        assert.equal((await submitPage(api, snapshot, 0)).response.status, 200);
+        assert.equal((await uploadPack(api, snapshot.checksum, snapshot.packs[0])).status, 409);
+        assert.equal(bucket.objects.get(packKey(snapshot.packs[0].checksum)).customMetadata.entryCount, '2', 'existing metadata is immutable');
+        assert.deepEqual((await submitPage(api, snapshot, 0)).body.missingPacks, [snapshot.packs[0].checksum]);
+    }
+
+    {
+        const bucket = createR2Mock();
+        const api = makeApi(worker, bucket);
+        await initialize(api);
+        const snapshot = await buildSnapshot(1, { prefix: 'damaged-bloom' });
+        await prepareSnapshot(api, snapshot);
+        assert.equal(JSON.parse(Buffer.from(bucket.objects.get(sessionKey(snapshot.checksum)).bytes)).nextPage, 1);
         const bloomObject = bucket.objects.get(bloomKey(snapshot.bloomChecksum));
         bloomObject.bytes[0] ^= 1;
         const final = await api.post({ action: 'finalize-upload', uploadId: snapshot.checksum });

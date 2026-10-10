@@ -601,6 +601,7 @@ async function runUpdate(name, token){
   } finally {
     updating = false;
     updateBtn.disabled = false;
+    document.querySelectorAll('.proj-item').forEach(b => { b.disabled = false; });
   }
 }
 

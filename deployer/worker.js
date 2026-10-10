@@ -313,7 +313,7 @@ async function pollDeployment(token, accountId, projectName, depId) {
     if (ls.name === 'deploy' && ls.status === 'success') return null;
     if (ls.status === 'failure') return '部署未能上线，请到 dashboard 查看该项目日志。';
   }
-  return null;
+  return '部署仍在进行中，请稍后在 Pages 控制台确认状态。';
 }
 
 const RATE = new Map();

@@ -11,6 +11,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const pageDir = path.join(root, 'page');
 const outFile = path.join(root, 'page.zip');
+const tempFile = path.join(root, `page.zip.${process.pid}.tmp`);
 
 const FILES = [
   ['_worker.js', '_worker.js'],
@@ -91,10 +92,10 @@ eocd.writeUInt16LE(FILES.length, 8);
 eocd.writeUInt16LE(FILES.length, 10);
 eocd.writeUInt32LE(centralSize, 12);
 eocd.writeUInt32LE(centralStart, 16);
-fs.writeFileSync(outFile, Buffer.concat([...localParts, ...centralBufs, eocd]));
+fs.writeFileSync(tempFile, Buffer.concat([...localParts, ...centralBufs, eocd]));
 
-// 3) 回读校验：条目名必须全是正斜杠且在归档根级，内容解压后逐字节一致
-const zip = fs.readFileSync(outFile);
+// 3) 回读校验临时归档，失败时不碰现有 page.zip
+const zip = fs.readFileSync(tempFile);
 const centralEntries = [];
 for (let i = 0; i < zip.length - 4; i++) {
   if (zip[i] === 0x50 && zip[i + 1] === 0x4b && zip[i + 2] === 0x01 && zip[i + 3] === 0x02) {
@@ -104,6 +105,7 @@ for (let i = 0; i < zip.length - 4; i++) {
       crc: zip.readUInt32LE(i + 16),
       csize: zip.readUInt32LE(i + 20),
       usize: zip.readUInt32LE(i + 24),
+      localOffset: zip.readUInt32LE(i + 42),
     });
   }
 }
@@ -116,9 +118,24 @@ for (const e of centralEntries) {
   const raw = fs.readFileSync(path.join(pageDir, src));
   ok(zlib.crc32(raw) >>> 0 === e.crc, `CRC 一致: ${e.name}`);
   ok(raw.length === e.usize, `原始大小一致: ${e.name}`);
+  const localOffset = e.localOffset;
+  const nameLength = zip.readUInt16LE(localOffset + 26);
+  const extraLength = zip.readUInt16LE(localOffset + 28);
+  const dataOffset = localOffset + 30 + nameLength + extraLength;
+  const compressed = zip.subarray(dataOffset, dataOffset + e.csize);
+  try {
+    const inflated = zlib.inflateRawSync(compressed);
+    ok(Buffer.compare(raw, inflated) === 0, `解压内容一致: ${e.name}`);
+  } catch (error) {
+    ok(false, `解压内容一致: ${e.name}`, error.message);
+  }
 }
 
 console.log(failed === 0
   ? `make-page-zip: 全部通过，page.zip ${zip.length} 字节`
   : `make-page-zip: ${failed} 项失败`);
-if (failed > 0) process.exit(1);
+if (failed > 0) {
+  fs.rmSync(tempFile, { force: true });
+  process.exit(1);
+}
+fs.renameSync(tempFile, outFile);

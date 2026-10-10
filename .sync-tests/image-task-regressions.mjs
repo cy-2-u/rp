@@ -24,9 +24,16 @@ function harness(
     authorTaskFactory = null
 ) {
     const requests = [];
+    const hooks = new Map();
     let fixedEnabled = fixed;
     const authorCalls = [];
-    const window = {};
+    const window = { RPHubExternal: {
+        version: 1, config: null, installUi() {}, register(name, handler) { hooks.set(name, handler); },
+        describeCard(card) {
+            const row = card?.closest?.('[data-chat-index]');
+            return row ? { messageIndex: Number(row.dataset.chatIndex), occurrenceIndex: [...row.querySelectorAll('.generated-image-card')].indexOf(card) } : null;
+        }
+    } };
     const extraStorage = new Map();
     const storage = {
         getItem: key => key === 'rp_hub_magic_fixed_image'
@@ -53,13 +60,13 @@ function harness(
             assert.equal(options.method, 'POST');
             return new Promise((resolve, reject) => requests.push({
                 url, reject,
-                succeed: () => resolve({ ok: true, body: { cancel: async () => {} } }),
+                succeed: () => resolve({ ok: true, headers: new Headers({ 'x-rp-image-key': encodeURIComponent('rp-images/characters/Offline/' + 'a'.repeat(64)) }), body: { cancel: async () => {} } }),
                 fail: () => resolve({ ok: false, status: 503, json: async () => ({ error: 'offline failure' }) })
             }));
         }
     });
-    // Expose only cache state in this VM to force cache eviction and inspect ownership.
-    const marker = '    window.RPH_MAGIC_IMAGE_TASK = options => {';
+    // Expose state for isolated lifecycle assertions and capture the registered task hook.
+    const marker = "    external.register('image-request', imageTask);";
     assert.equal(source.split(marker).length, 2);
     vm.runInContext(source.replace(marker,
         '    window.testState = { imageStores, imageSlotTasks };\n' + marker), context);
@@ -93,15 +100,15 @@ function harness(
             storyScopeId,
             characterId, characterName: 'Offline', render() {}
         };
-        // 'legacy' 模拟旧适配清单：不传 autoImageGen 字段。
-        if (autoImageGen !== 'legacy') options.autoImageGen = autoImageGen;
+        // 未提供 autoImageGen 时，按适配层缺失状态的默认行为测试。
+        if (autoImageGen !== 'missing') options.autoImageGen = autoImageGen;
         if (authorTaskFactory) {
             options.startGeneratedImageTask = (requestUrl, fresh) => {
                 authorCalls.push([requestUrl, fresh]);
                 return authorTaskFactory(requestUrl, fresh);
             };
         }
-        const task = window.RPH_MAGIC_IMAGE_TASK(options);
+        const task = hooks.get('image-request')(options);
         task.cards.add(card);
         task.testCard = card;
         return task;
@@ -113,9 +120,11 @@ function harness(
         assert.equal(requests.length, count, 'expected a real mocked POST, not a cached done task');
     }
 const state = () => window.testState.imageStores.get('offline-character');
+const getState = id => window.testState.imageStores.get(String(id));
 const evict = () => window.testState.imageSlotTasks.clear();
+const deleteCharacter = id => hooks.get('character-deleted')(id);
 const setFixed = value => { fixedEnabled = value; };
-return { start, requests, waitForRequests, state, evict, setFixed, window, authorCalls };
+return { start, requests, waitForRequests, state, getState, evict, deleteCharacter, setFixed, window, authorCalls };
 }
 
 for (const fixed of [false, true]) {
@@ -145,6 +154,24 @@ test('successful transient survives slot cache eviction without regenerating', a
     assert.equal((await h.start().promise).status, 'done');
     assert.equal(h.requests.length, 1);
     assert.equal(h.state().transientRecords.size, 1);
+});
+
+test('stable generated image key persists and is used for record replay', async () => {
+    const h = harness(true);
+    const task = h.start();
+    await h.waitForRequests(1);
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    await h.window.RPH_MAGIC_FLUSH_IMAGES();
+    const record = h.state().records[0];
+    const stableKey = `rp-images/characters/Offline/${'a'.repeat(64)}`;
+    assert.equal(record.imageKey, stableKey);
+    h.evict();
+    const replay = h.start();
+    assert.equal((await replay.promise).status, 'done');
+    assert.equal(h.requests.length, 1, 'stable-key replay must not regenerate');
+    assert.equal(new URL(replay.requestUrl, 'https://offline.invalid').searchParams.get('key'), stableKey);
+    assert.equal(new URL(replay.job.imageUrl, 'https://offline.invalid').searchParams.get('key'), stableKey);
 });
 
 test('old failure cannot delete newer successful reroll at the identical record key', async () => {
@@ -220,7 +247,7 @@ test('two independent tabs merge persistent records', async () => {
     assert.equal(verifier.state().records.length, 2);
 });
 
-test('loading trims persistent history to the configured limit', async () => {
+test('loading retains the complete fixed-image history beyond 256 records', async () => {
     const database = new IDBFactory();
     const seed = harness(true, undefined, database);
     const task = seed.start({ prompt: 'seed', messageId: 'seed-message' });
@@ -251,9 +278,19 @@ test('loading trims persistent history to the configured limit', async () => {
     db.close();
     const loaded = harness(true, undefined, database);
     await loaded.start({ prompt: 'prompt-299', messageId: 'old-299' }).promise;
-    assert.equal(loaded.state().records.length, 256);
+    assert.equal(loaded.state().records.length, 300);
 });
 
+test('deleting a character retires pending image tasks before their response arrives', async () => {
+    const h = harness(true);
+    const task = h.start({ characterId: 'delete-me' });
+    await h.waitForRequests(1);
+    await h.deleteCharacter('delete-me');
+    h.requests[0].succeed();
+    assert.equal((await task.promise).status, 'done');
+    assert.equal(h.getState('delete-me'), undefined);
+    assert.equal(h.requests.length, 1);
+});
 test('author-switch-off message without a record generates nothing and hides the card', async () => {
     const h = harness(false);
     const task = h.start({ autoImageGen: false });
@@ -293,7 +330,7 @@ test('author-switch-off still shows previously saved images', async () => {
     const task = h.start({ autoImageGen: false });
     const job = await task.promise;
     assert.equal(job.status, 'done');
-    assert.equal(job.imageUrl, firstJob.imageUrl);
+    assert.equal(job.imageUrl, new URL(firstJob.imageUrl, 'https://offline.invalid').href);
     assert.equal(task.testCard.testClasses.has('magic-image-suppressed'), false);
     assert.equal(h.requests.length, 1);
 });
@@ -326,9 +363,9 @@ test('author-switch-off reroll on a record-less slot hides the card too', async 
     assert.equal(h.requests.length, 0);
 });
 
-test('legacy adapter without autoImageGen still generates', async () => {
+test('missing autoImageGen state still generates by default', async () => {
     const h = harness(false);
-    const task = h.start({ autoImageGen: 'legacy' });
+    const task = h.start({ autoImageGen: 'missing' });
     await h.waitForRequests(1);
     h.requests[0].succeed();
     assert.equal((await task.promise).status, 'done');
@@ -367,7 +404,7 @@ test('fixed-off replays a previously saved record without generating', async () 
     h.setFixed(false);
     h.evict();
     const replay = await h.start().promise;
-    assert.equal(replay.imageUrl, saved.imageUrl);
+    assert.equal(replay.imageUrl, new URL(saved.imageUrl, 'https://offline.invalid').href);
     assert.equal(h.requests.length, 1);
     assert.equal(h.state().records.length, 1);
 });

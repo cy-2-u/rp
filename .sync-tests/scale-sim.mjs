@@ -545,7 +545,7 @@ installBrowserGlobals({
     fetchShim
 });
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-globalThis.RPHubAuthorSaveData = async () => { };
+globalThis.RPHubExternal = { version: 1, flush: async () => {} };
 
 // 开屏门禁的锁页可能先于同步面板挂在 body 上，按类名定位面板，
 // 不依赖 children 顺序（MODS 一.8）。
@@ -655,10 +655,14 @@ console.log(`phase 1 (first ${SCALE_MB}MB upload): ok`);
 const phase2Mark = { requests: requests.length, packs: uploadedPackCount() };
 await push('phase 2 no-change upload');
 const phase2PackCount = uploadedPackCount() - phase2Mark.packs;
+const phase2Requests = requests.slice(phase2Mark.requests);
 assert.equal(phase2PackCount, 0, 'a no-change push must upload zero packs');
-assert.equal(requests.length - phase2Mark.requests, 1, 'a no-change push is a single prepare-upload probe (client short-circuits on matching checksum)');
+assert.equal(phase2Requests.filter(entry => entry.kind === 'prepare-upload').length, 1,
+    'a no-change push must make one prepare-upload probe before short-circuiting');
+assert.equal(phase2Requests.filter(entry => !['prepare-upload', 'gc-step'].includes(entry.kind)).length, 0,
+    'a no-change push must not upload, finalize or rewrite manifest pages');
 assert.equal(bucket.peek(MANIFEST_KEY).size, manifestObject.size, 'no-change push must not rewrite the manifest');
-console.log('phase 2 (no-change push): ok - 0 packs, 1 request');
+console.log('phase 2 (no-change push): ok - 0 packs, 1 prepare-upload probe');
 
 // --------------------------------- phase 3a: 100 same-length edits ----
 

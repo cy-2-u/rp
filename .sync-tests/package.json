@@ -10,9 +10,16 @@
     "restore-sim": "node restore-sim.mjs",
     "scale-sim": "node --max-old-space-size=8192 --expose-gc scale-sim.mjs",
     "audit-regressions": "node audit-regressions.mjs && node worker-regressions.mjs && node image-task-regressions.mjs",
-    "test": "npm run sync-v13-smoke && npm run sync-v13-budget && npm run runtime-smoke && npm run restore-sim && npm run audit-regressions"
+    "test": "npm run sync-v13-smoke && npm run sync-v13-budget && npm run runtime-smoke && npm run restore-sim && npm run audit-regressions && npm run sync-consistency-regressions && npm run cache-entry-buffer-regression && npm run external-author-integration",
+    "external-author-integration": "node external-author-integration.mjs",
+    "sync-consistency-regressions": "node sync-consistency-regressions.mjs",
+    "cache-entry-buffer-regression": "node cache-entry-buffer-regression.mjs"
   },
   "devDependencies": {
-    "fake-indexeddb": "6.2.5"
+    "dompurify": "^3.2.7",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "^26.1.0",
+    "marked": "^15.0.12",
+    "vue": "^3.5.24"
   }
 }

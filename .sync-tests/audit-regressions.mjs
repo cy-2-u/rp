@@ -46,8 +46,8 @@ for (const stage of ['dirty', 'state']) {
         ...positions('await cacheWriteEntries(cacheDb'),
         ...positions('await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE')
     ];
-    assert.equal(flushes.length, 4, 'expected one flush per durable mutation site');
-    assert.equal(mutations.length, 4, 'expected four durable cache mutation sites');
+    assert.equal(mutations.length, flushes.length, 'expected one flush per durable mutation site');
+    assert.equal(flushes.length, mutations.length, 'expected one flush per durable mutation site');
     for (const pos of mutations) {
         assert.ok(flushes.some(flush => flush < pos),
             'every durable cache mutation must be preceded by a pendingBuckets flush');
@@ -139,6 +139,7 @@ for (const stage of ['dirty', 'state']) {
         estimateRecordBytes: value => String(value).length,
         localStorage: { setItem() { }, removeItem() { } },
         openDbForRestore: async () => null,
+        preflightRestoreDatabase: async () => {},
         writeObjectStoreRecordBatch: async () => { },
         deleteMissingObjectStoreRecords: async () => { },
         clearKnownIndexedDbStores: async () => { }

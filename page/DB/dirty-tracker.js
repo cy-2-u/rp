@@ -24,7 +24,7 @@
     const isAppKey = key => key.startsWith('rp_hub_') || key.startsWith('ai_chargen_');
 
     const showRestorePause = () => {
-        if (!document.body || document.getElementById('rp-sync-restore-pause')) return;
+        if (RESTORE_PAGE || !document.body || document.getElementById('rp-sync-restore-pause')) return;
         const overlay = document.createElement('div');
         overlay.id = 'rp-sync-restore-pause';
         overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:grid;place-content:center;text-align:center;padding:24px;background:#f8fafcf2;color:#334155;font:16px/1.8 sans-serif';
@@ -39,6 +39,7 @@
         throw new DOMException('云端恢复期间暂停本页面写入。', 'InvalidStateError');
     };
     const checkRestoreState = () => {
+        if (RESTORE_PAGE) return;
         if (localStorage.getItem(RESTORE_ACTIVE_KEY)) {
             restorePaused = true;
             showRestorePause();
@@ -47,6 +48,7 @@
         }
     };
     const checkInterruptedRestore = async () => {
+        if (RESTORE_PAGE) return;
         checkRestoreState();
         const active = localStorage.getItem(RESTORE_ACTIVE_KEY);
         if (!active || !navigator.locks?.query) return;

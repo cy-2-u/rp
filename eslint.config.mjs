@@ -22,7 +22,7 @@ const webGlobals = {
     crypto: 'readonly', console: 'readonly',
     setTimeout: 'readonly', clearTimeout: 'readonly',
     performance: 'readonly', structuredClone: 'readonly',
-    Event: 'readonly', EventTarget: 'readonly', DOMException: 'readonly'
+    Event: 'readonly', EventTarget: 'readonly', CustomEvent: 'readonly', DOMException: 'readonly'
 };
 
 const workerGlobals = {
@@ -55,14 +55,14 @@ const nodeTestGlobals = {
     ReadableStream: 'readonly', WritableStream: 'readonly',
     Uint8Array: 'readonly', ArrayBuffer: 'readonly',
     crypto: 'readonly', atob: 'readonly', btoa: 'readonly',
-    DOMException: 'readonly',
+    DOMException: 'readonly', structuredClone: 'readonly',
     // fake-indexeddb 在测试环境里提供的 IndexedDB 全局
     IDBKeyRange: 'readonly'
 };
 
 export default [
     {
-        ignores: ['node_modules/**', '.zcode/**', 'page/**', 'docs/**', '**/*.json']
+        ignores: ['node_modules/**', '.zcode/**', 'page/**', 'docs/**', '.sync-tests/fixtures/**', '**/*.json']
     },
     {
         files: ['_worker.js', 'deployer/worker.js'],
@@ -70,7 +70,7 @@ export default [
         rules: gate
     },
     {
-        files: ['magic-extension.js', 'DB/**/*.js'],
+        files: ['magic-extension.js', 'DB/**/*.js', 'adapter/**/*.js'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'script', globals: clientGlobals },
         rules: gate
     },

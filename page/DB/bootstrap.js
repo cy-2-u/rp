@@ -125,38 +125,12 @@
     });
 })(globalThis);
 (function () {
-    const saves = new Set();
-    const debounce = (fn, delay) => {
-        const state = { timer: null, args: null, running: Promise.resolve() };
-        saves.add(state);
-        const run = () => {
-            clearTimeout(state.timer);
-            state.timer = null;
-            const args = state.args;
-            if (!args) return state.running;
-            state.args = null;
-            state.running = state.running.catch(() => undefined).then(() => fn(...args))
-                .catch(error => { state.args ||= args; throw error; });
-            state.running.catch(() => undefined);
-            return state.running;
-        };
-        state.flush = run;
-        return (...args) => {
-            state.args = args;
-            clearTimeout(state.timer);
-            state.timer = setTimeout(run, delay);
-        };
-    };
     window.RPH_SYNC_PERSISTENCE = {
-        debounce,
-        async flushDebounced() {
-            for (const state of saves) await state.flush();
-        },
         async manualSave() {
-            if (typeof window.RPHubAuthorSaveData !== 'function') throw new Error('作者保存接口未就绪，请刷新后重试。');
-            await window.RPHubAuthorSaveData();
+            const external = window.RPHubExternal;
+            if (external?.version !== 1 || typeof external.flush !== 'function') throw new Error('作者保存接口未就绪，请刷新后重试。');
+            await external.flush();
             if (window.RPH_MAGIC_FLUSH_IMAGES) await window.RPH_MAGIC_FLUSH_IMAGES();
-            await this.flushDebounced();
             await window.RPH_SYNC_TRACKER.flush();
         }
     };
@@ -714,9 +688,7 @@ function createAutoSaveScheduler(options = {}) {
         gap: 8px;
     }
 
-    // 自动保存区保持与桌面一致的“开关居左、间隔居右”单行布局：常规手机
-    // 宽度（≥320px）放得下；极端窄屏时允许换行，margin-left:auto 让间隔
-    // 组靠右，不会像旧的 column 堆叠那样全部挤在左侧。
+    /* 极窄屏允许换行，间隔输入仍靠右。 */
     .rp-sync-auto-save__row {
         flex-wrap: wrap;
         row-gap: 10px;
@@ -726,8 +698,7 @@ function createAutoSaveScheduler(options = {}) {
         margin-left: auto;
     }
 
-    // 窄屏底行两段文案可能放不下：允许换行，右侧徽标掉到状态下一行靠左，
-    // 与桌面"同一行左右对称"的差异只发生在 320px 级别的极端窄屏。
+    /* 底行过窄时将结果徽标移到下一行。 */
     .rp-sync-auto-save__footer {
         flex-wrap: wrap;
         row-gap: 2px;
@@ -992,6 +963,43 @@ function createAutoSaveScheduler(options = {}) {
             request.onerror = () => reject(request.error || new Error('IndexedDB open failed.'));
             request.onsuccess = () => resolve(request.result);
         });
+    }
+
+    function assertRestoreStoreSchema(db, stores) {
+        const existing = stores.filter(store => db.objectStoreNames.contains(store.name));
+        if (!existing.length) return;
+        const tx = db.transaction(existing.map(store => store.name), 'readonly');
+        for (const definition of existing) {
+            const store = tx.objectStore(definition.name);
+            if (JSON.stringify(store.keyPath ?? null) !== JSON.stringify(definition.keyPath ?? null)
+                || store.autoIncrement !== Boolean(definition.autoIncrement)) {
+                throw new Error(`本地数据库 ${db.name}/${store.name} 的结构与云端快照不兼容，恢复已停止，本地数据未覆盖。`);
+            }
+        }
+    }
+
+    async function preflightRestoreDatabase(dbDef) {
+        if (typeof indexedDB.databases === 'function') {
+            const databases = await indexedDB.databases();
+            if (!databases.some(db => db.name === dbDef.name)) return;
+        }
+        const db = await new Promise((resolve, reject) => {
+            const request = indexedDB.open(dbDef.name);
+            let missing = false;
+            request.onupgradeneeded = () => {
+                missing = true;
+                request.transaction.abort();
+            };
+            request.onerror = event => {
+                event.preventDefault();
+                if (missing) resolve(null);
+                else reject(request.error || new Error('恢复前数据库结构检查失败。'));
+            };
+            request.onsuccess = () => resolve(request.result);
+        });
+        if (!db) return;
+        try { assertRestoreStoreSchema(db, dbDef.stores); }
+        finally { db.close(); }
     }
 
     function createObjectStoreFromSnapshot(db, storeDef) {
@@ -1501,7 +1509,9 @@ function createAutoSaveScheduler(options = {}) {
                     : '1';
         // 恢复路径直接透传服务器数据包里的行字节（本就是同一规范序列化器
         // 产出、上传时经 sha256 验证的），省掉对全量数据再跑一遍序列化。
-        const bytes = canonicalBytes || serializeSnapshotObject(value);
+        // 但行字节通常是 1MiB pack 的 subarray；在这里复制到精确长度的
+        // 自有缓冲区，避免 IndexedDB structured clone 把整包 backing buffer 一并持久化。
+        const bytes = canonicalBytes ? new Uint8Array(canonicalBytes) : serializeSnapshotObject(value);
         if (bytes.byteLength > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('单条本地数据超过 64MiB 同步上限。');
         return { id, group, sourceKey, sortKey: `${sourceKey}|${sequence}`, bucketKey: snapshotEntryBucket(value, id, sourceKey), bytes };
     }
@@ -1510,8 +1520,12 @@ function createAutoSaveScheduler(options = {}) {
     // 直接与缓存字节逐位比较即可，省掉先 JSON.parse 再重新序列化一遍。
     function snapshotBytesEqual(value, cachedBytes) {
         const bytes = serializeSnapshotObject(value);
-        return bytes.byteLength === cachedBytes.byteLength
-            && bytes.every((byte, index) => byte === cachedBytes[index]);
+        return bytesEqual(bytes, cachedBytes);
+    }
+
+    function bytesEqual(bytes, other) {
+        return bytes.byteLength === other.byteLength
+            && bytes.every((byte, index) => byte === other[index]);
     }
 
     // 读出缓存 header 里记录的版本号；解析失败或非法时返回 null，调用方回退当前版本。
@@ -1562,8 +1576,15 @@ function createAutoSaveScheduler(options = {}) {
                 buffer.set(bytes.subarray(offset, offset + length), used);
                 used += length;
                 offset += length;
+                // 缓冲写满先落盘再续写余量。跨包条目只在"写到它的行分隔符
+                // 那一包"才计数（parsePackSnapshot 也只在该包 count+=1），
+                // 因此这里不能提前 entryCount —— 满包若暂不计，flush 记录的
+                // 就是本包真正完整包含的条目数。
                 if (used === buffer.byteLength) await flush();
             }
+            // 行分隔符写入前先保证还有一个字节的空位：条目正文刚好填满缓冲时，
+            // 分隔符会越界（Uint8Array 静默丢弃），恢复侧就数不到这条记录。
+            if (used === buffer.byteLength) await flush();
             buffer[used++] = 10;
             entryCount += 1;
             if (used === buffer.byteLength || entryCount === CONFIG.maxPackEntries) await flush();
@@ -1687,8 +1708,9 @@ function createAutoSaveScheduler(options = {}) {
                 // 复用，省一次事务；其余路径照旧自读。
                 if (!previous) previous = await cacheReadEntry(cacheDb, id);
                 remaining.delete(id);
-                if (!previous || !snapshotBytesEqual(value, previous.bytes)) {
-                    const entry = buildCacheEntry(value);
+                const bytes = serializeSnapshotObject(value);
+                if (!previous || !bytesEqual(bytes, previous.bytes)) {
+                    const entry = buildCacheEntry(value, bytes);
                     if (previous) touchBucket(previous.bucketKey);
                     touchBucket(entry.bucketKey);
                     await flushPendingBuckets();
@@ -1699,49 +1721,41 @@ function createAutoSaveScheduler(options = {}) {
         };
         const replaceArraySource = async (database, store, key, value, sourceKey) => {
             const remaining = new Set(await cacheSourceKeys(cacheDb, sourceKey));
-            for (let page = 0; page <= Math.floor(value.length / ARRAY_BUCKET_ENTRIES); page += 1) {
-                const start = page * ARRAY_BUCKET_ENTRIES;
-                const values = new Map();
-                const add = item => values.set(snapshotEntryId(item), item);
-                if (page === 0) add({ type: 'recordArrayStart', database, store, key });
-                for (let index = start; index < Math.min(value.length, start + ARRAY_BUCKET_ENTRIES); index += 1) {
-                    add({ type: 'recordArrayItem', database, store, key, index, value: value[index] === undefined ? null : value[index] });
+            const values = (function* () {
+                yield { type: 'recordArrayStart', database, store, key };
+                for (let index = 0; index < value.length; index++) {
+                    yield { type: 'recordArrayItem', database, store, key, index, value: value[index] === undefined ? null : value[index] };
                 }
-                if (start + ARRAY_BUCKET_ENTRIES > value.length) add({ type: 'recordArrayEnd', database, store, key, length: value.length });
-                const first = values.values().next().value;
-                const bucketKey = snapshotEntryBucket(first, snapshotEntryId(first), sourceKey);
-                for await (const previous of iterateCachedBucket(cacheDb, bucketKey)) {
-                    const item = values.get(previous.id);
-                    if (item && snapshotBytesEqual(item, previous.bytes)) {
-                        values.delete(previous.id);
-                        remaining.delete(previous.id);
-                    }
-                }
-                const previousEntries = new Map();
-                for (const entry of await readCacheEntries(cacheDb, [...values.keys()])) {
-                    if (entry) previousEntries.set(entry.id, entry);
-                }
-                let writes = [];
-                let bytes = 0;
-                for (const [id, item] of values) {
-                    remaining.delete(id);
-                    const previous = previousEntries.get(id);
+                yield { type: 'recordArrayEnd', database, store, key, length: value.length };
+            })();
+            let batch = [];
+            let batchBytes = 0;
+            const flush = async () => {
+                if (!batch.length) return;
+                const previousEntries = await readCacheEntries(cacheDb, batch.map(entry => entry.id));
+                const writes = [];
+                for (let index = 0; index < batch.length; index += 1) {
+                    const entry = batch[index];
+                    const previous = previousEntries[index];
+                    remaining.delete(entry.id);
+                    if (previous && bytesEqual(entry.bytes, previous.bytes)) continue;
                     if (previous) touchBucket(previous.bucketKey);
-                    const entry = buildCacheEntry(item);
                     touchBucket(entry.bucketKey);
                     writes.push(entry);
-                    bytes += entry.bytes.byteLength;
-                    if (bytes >= CONFIG.cacheWriteBytes || writes.length >= CONFIG.readBatchSize) {
-                        await flushPendingBuckets();
-                        await cacheWriteEntries(cacheDb, writes);
-                        writes = [];
-                        bytes = 0;
-                    }
                 }
                 await flushPendingBuckets();
                 await cacheWriteEntries(cacheDb, writes);
+                batch = [];
+                batchBytes = 0;
                 await yieldIfNeeded();
+            };
+            for (const item of values) {
+                const entry = buildCacheEntry(item);
+                batch.push(entry);
+                batchBytes += entry.bytes.byteLength;
+                if (batch.length >= CONFIG.restoreBatchSize || batchBytes >= CONFIG.cacheWriteBytes) await flush();
             }
+            await flush();
             await removeEntries(remaining);
         };
         for (const key of dirty.localStorage) {
@@ -1974,6 +1988,7 @@ function createAutoSaveScheduler(options = {}) {
 
     async function* downloadPacksToStaging(remote, packManifest, stagingDb) {
         await clearDownloadStagingStore(stagingDb);
+        const cacheDb = await openLocalSyncCache().catch(() => null);
         // 滑动窗口：始终维持 downloadPackConcurrency 个在途下载，按清单顺序
         // 产出（恢复解析要求分片顺序）。旧版批间串行——批内全部完成才开始
         // 下一批，网络往返无法重叠。
@@ -1985,15 +2000,19 @@ function createAutoSaveScheduler(options = {}) {
             if (nextToFetch >= packManifest.length) return;
             const index = nextToFetch++;
             const pack = packManifest[index];
-            const pending = postSyncBinary({
-                action: 'pull-pack',
-                version: remote.version,
-                pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
-                packIndex: index % MANIFEST_PAGE_PACKS,
-                checksum: pack.checksum,
-                length: pack.length,
-                entryCount: pack.entryCount
-            }, { timeoutMs: CONFIG.packTransferTimeoutMs }).then(async bytes => {
+            const pending = (async () => {
+                const cached = cacheDb ? await cachePack(cacheDb, pack.checksum).catch(() => null) : null;
+                if (cached?.byteLength === pack.length && await sha256Bytes(cached) === pack.checksum) return cached;
+                return postSyncBinary({
+                    action: 'pull-pack',
+                    version: remote.version,
+                    pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
+                    packIndex: index % MANIFEST_PAGE_PACKS,
+                    checksum: pack.checksum,
+                    length: pack.length,
+                    entryCount: pack.entryCount
+                }, { timeoutMs: CONFIG.packTransferTimeoutMs });
+            })().then(async bytes => {
                 if (bytes.byteLength !== pack.length) {
                     throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
                 }
@@ -2028,8 +2047,9 @@ function createAutoSaveScheduler(options = {}) {
             }
             await writeDownloadStagingObjects(stagingDb, staged);
         } finally {
-            // 下游异常提前退出时，放弃在途下载（运行时回收），不产生未处理拒绝。
+            // 下游异常提前退出时，放弃在途下载并关闭可能打开的缓存连接。
             for (const pending of inflight.values()) pending.catch(() => { });
+            cacheDb?.close();
         }
     }
 
@@ -2136,6 +2156,7 @@ function createAutoSaveScheduler(options = {}) {
                 autoIncrement: Boolean(storeDef.autoIncrement)
             }));
 
+            if (this.validateOnly && stores.length) await preflightRestoreDatabase({ name: line.name, stores });
             const db = !this.validateOnly && stores.length > 0
                 ? await openDbForRestore({ name: line.name, stores })
                 : null;
@@ -2832,6 +2853,13 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
+    let gcMaintenance = null;
+    function scheduleGcMaintenance() {
+        if (gcMaintenance) return;
+        gcMaintenance = wait(0).then(() => withCrossTabSyncLock(runGcMaintenance))
+            .catch(() => {}).finally(() => { gcMaintenance = null; });
+    }
+
     async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
         let currentBaseVersion = baseVersion;
         let currentBaseChecksum = baseChecksum;
@@ -2875,12 +2903,7 @@ function createAutoSaveScheduler(options = {}) {
             pageCount: snapshot.pageCount,
             pageRoot: snapshot.pageRoot
         }, { timeoutMs: CONFIG.commitTimeoutMs });
-        if (begin.committed) {
-            try {
-                await runGcMaintenance();
-            } catch (_) { }
-            return begin.remote;
-        }
+        if (begin.committed) return begin.remote;
         const uploadId = begin.uploadId;
         await postUploadBloom(uploadId, bloom);
         // 本地分片缓存连接按需懒开、整个上传会话复用：旧实现每缺片页各开
@@ -2929,9 +2952,6 @@ function createAutoSaveScheduler(options = {}) {
             retryCount: 1,
             timeoutMs: CONFIG.commitTimeoutMs
         });
-        try {
-            await runGcMaintenance();
-        } catch (_) { }
         return finalized.remote;
     }
 
@@ -3550,34 +3570,9 @@ function createAutoSaveScheduler(options = {}) {
     }
 
     async function handleSyncButtonClick() {
+        await accessGateDone;
         if (state.syncing || checkingPassword) return;
-        openModal();
-        setActionButtonsDisabled(true);
-        updateProgress(0, '正在连接…');
-        checkingPassword = true;
-        try {
-            const auth = await getAuthStatus();
-            if (!auth.authRequired || auth.authenticated) {
-                updateProgress(0, '请选择同步方向。');
-                setActionButtonsDisabled(false);
-                return;
-            }
-
-            clearStoredSyncPassword();
-            closeModal();
-            openPasswordModal('请输入同步密码后继续。');
-        } catch (error) {
-            if (error.status === 401) {
-                clearStoredSyncPassword();
-                closeModal();
-                openPasswordModal('请输入同步密码后继续。');
-                return;
-            }
-
-            showSyncError(error);
-        } finally {
-            checkingPassword = false;
-        }
+        openSyncPanel();
     }
 
     function ensureModal() {
@@ -3827,6 +3822,7 @@ function createAutoSaveScheduler(options = {}) {
             if (alreadyUpToDate) {
                 updateProgress(100, automatic ? '数据相同，已是最新' : '已是最新');
                 recordLastSync(true);
+                scheduleGcMaintenance();
                 if (automatic) {
                     autoSaveLastError = '';
                     setAutoSaveStatus('数据相同，已是最新。');
@@ -3835,6 +3831,7 @@ function createAutoSaveScheduler(options = {}) {
             }
             updateProgress(100, automatic ? '自动保存完成' : '已完成');
             recordLastSync(true);
+            scheduleGcMaintenance();
             if (automatic) {
                 autoSaveLastError = '';
                 setAutoSaveStatus('自动保存完成。');
@@ -3842,7 +3839,13 @@ function createAutoSaveScheduler(options = {}) {
             return { alreadyUpToDate: false };
         } catch (error) {
             recordLastSync(false);
-            if (!automatic) showSyncError(error);
+            if (!automatic) {
+                showSyncError(error);
+                if (error.status === 401) {
+                    clearStoredSyncPassword();
+                    openPasswordModal('同步密码已失效，请重新输入。');
+                }
+            }
             // 自动保存失败文案统一由 runAutomaticUpload 的 catch 写入一次，
             // 这里不再重复 setAutoSaveStatus（过去两层各写一遍、文案还不一致）。
             if (!automatic) return { error };

@@ -366,6 +366,7 @@ await benchmark({
         bucket.reset();
         bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
         const pack = fixture.packs[0];
+        bucket.seed(keys.page(fixture.snapshot.checksum, 0), JSON.stringify(fixture.page));
         bucket.stagePack(pack.checksum, pack.bytes);
         const url = new URL('https://local.test/api/rp-sync');
         url.searchParams.set('action', 'upload-pack');
@@ -384,7 +385,9 @@ await benchmark({
 await benchmark({
     name: 'upload-manifest-page (32 packs)',
     status: 200,
-    minSubrequests: 36,
+    // 首个样本付 Bloom get+hash（1），WARMUPS 后 Bloom 命中 isolate 缓存；
+    // 稳态 = 1 session get + 32 pack head + 1 page put = 34。
+    minSubrequests: 34,
     setup(bucket) {
         bucket.reset();
         bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
@@ -415,8 +418,10 @@ await benchmark({
 await benchmark({
     name: 'pull-manifest-page (32 packs)',
     status: 200,
-    // 清单页在 isolate 内按 (根校验码, 页码) 缓存：稳态样本不再重读页对象。
-    minSubrequests: 3,
+    // 清单页在 isolate 内按 (根校验码, 页码) 缓存：稳态样本不再重读页对象；
+    // 迁移标记与根清单也按 key/etag 缓存，首个样本后根清单读取同样省去，
+    // 稳态只剩页缓存未命中时的 1 次页读取（WARMUPS 后通常 0 次）。
+    minSubrequests: 1,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -427,8 +432,8 @@ await benchmark({
 await benchmark({
     name: 'pull-pack (1MiB direct stream)',
     status: 200,
-    // 同上：页缓存命中后 pull-pack 稳态只需 migration+manifest+pack 三次读。
-    minSubrequests: 4,
+    // 同上：migration/manifest/页全部缓存命中后，稳态只剩 pack 本身的 get。
+    minSubrequests: 1,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -449,7 +454,9 @@ await benchmark({
 await benchmark({
     name: 'gc-step (256 listed packs)',
     status: 200,
-    minSubrequests: 11,
+    // migration/manifest 按 key/etag 缓存后，稳态 = 1 list + 1 GC state 读 +
+    // 候选删除（孤儿 pack 每 256 个一次 delete = 1 批）+ 无候选时写游标 1 put。
+    minSubrequests: 4,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -634,10 +641,15 @@ await concurrentBenchmark({
             const bytes = new Uint8Array(1024 * 1024);
             bytes.fill((101 + round * CONCURRENT_UPLOAD_LANES + lane) & 0xff);
             const checksum = await sha256(bytes);
+            const declared = { ...fixture.pagePacks[0], checksum, length: bytes.length };
+            const pageHash = await sha256Text(pageSource(0, CHAIN_SEED, [declared]));
+            const uploadId = await sha256Text('budget-' + checksum);
+            bucket.seed(keys.session(uploadId), JSON.stringify({ ...fixture.session, uploadId, checksum: uploadId, pageCount: 1, packCount: 1, pageRoot: pageHash }));
+            bucket.seed(keys.page(uploadId, 0), JSON.stringify({ ...fixture.page, checksum: uploadId, packs: [declared], pageHash }));
             bucket.stagePack(checksum, bytes);
             const url = new URL('https://local.test/api/rp-sync');
             url.searchParams.set('action', 'upload-pack');
-            url.searchParams.set('uploadId', fixture.snapshot.checksum);
+            url.searchParams.set('uploadId', uploadId);
             url.searchParams.set('checksum', checksum);
             url.searchParams.set('length', String(bytes.byteLength));
             url.searchParams.set('entryCount', '1');
@@ -674,10 +686,15 @@ await concurrentBenchmark({
             const bytes = new Uint8Array(1024 * 1024);
             bytes.fill((201 + round * 4 + lane) & 0xff);
             const checksum = await sha256(bytes);
+            const declared = { ...fixture.pagePacks[0], checksum, length: bytes.length };
+            const pageHash = await sha256Text(pageSource(0, CHAIN_SEED, [declared]));
+            const uploadId = await sha256Text('budget-' + checksum);
+            bucket.seed(keys.session(uploadId), JSON.stringify({ ...fixture.session, uploadId, checksum: uploadId, pageCount: 1, packCount: 1, pageRoot: pageHash }));
+            bucket.seed(keys.page(uploadId, 0), JSON.stringify({ ...fixture.page, checksum: uploadId, packs: [declared], pageHash }));
             bucket.stagePack(checksum, bytes);
             const url = new URL('https://local.test/api/rp-sync');
             url.searchParams.set('action', 'upload-pack');
-            url.searchParams.set('uploadId', fixture.snapshot.checksum);
+            url.searchParams.set('uploadId', uploadId);
             url.searchParams.set('checksum', checksum);
             url.searchParams.set('length', String(bytes.byteLength));
             url.searchParams.set('entryCount', '1');
@@ -704,7 +721,8 @@ await concurrentBenchmark({
                     entryCount: pack.entryCount
                 }),
                 status: 200,
-                minSubrequests: 4
+                // 首轮可能付 migration/manifest/页读取；缓存热身后稳态只剩 pack get。
+                minSubrequests: 1
             });
         }
         return lanes;

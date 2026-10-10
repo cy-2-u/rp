@@ -357,6 +357,11 @@ async function readManifestPackText(bucket, manifest) {
     return Buffer.concat(chunks).toString('utf8');
 }
 
+async function readManifestEntries(bucket, manifest) {
+    const text = await readManifestPackText(bucket, manifest);
+    return text.split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
+
 const waitForUploadDone = (modal, label) => waitFor(() => {
     const text = modal.querySelector('.rp-sync-modal__status').textContent;
     if (modal.classList.contains('is-error')) throw new Error(`${label} failed: ${text}`);
@@ -449,7 +454,7 @@ installBrowserGlobals({
     locks: null
 });
 await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-globalThis.RPHubAuthorSaveData = async () => { };
+globalThis.RPHubExternal = { version: 1, flush: async () => {} };
 
 const modalA = findSyncModal(documentA);
 assert.ok(modalA, 'sync modal should be created on load');
@@ -512,7 +517,8 @@ const restoreMetrics = {
     stagingWrites: [],
     cachePackWrites: [],
     pullInflight: 0,
-    maxPullInflight: 0
+    maxPullInflight: 0,
+    packNetworkRequests: 0
 };
 const snapshotTypes = new Set([
     'localStorage', 'database', 'record', 'recordArrayStart', 'recordArrayItem',
@@ -556,12 +562,13 @@ FDBObjectStore.prototype.put = function (...args) {
     return nativeRestorePut.apply(this, args);
 };
 const fetchShimB = async (input, init) => {
-    const action = recordAction(init);
+    const action = new URL(typeof input === 'string' ? input : input.url, 'https://local.test').searchParams.get('action') || recordAction(init);
     const counted = action === 'pull-manifest-page' || action === 'pull-pack';
     if (counted) {
         restoreMetrics.pullInflight += 1;
         restoreMetrics.maxPullInflight = Math.max(restoreMetrics.maxPullInflight, restoreMetrics.pullInflight);
     }
+    if (action === 'pull-pack') restoreMetrics.packNetworkRequests += 1;
     try {
         return await makeFetchShim('browser B')(input, init);
     } finally {
@@ -643,11 +650,126 @@ assert.ok([...stagingReadBatches, ...stagingWriteBatches, ...restoreMetrics.cach
     .every(batch => batch.count > 0 && batch.count <= 4), 'all pack transactions must stay bounded to four objects');
 assert.ok(restoreMetrics.maxPullInflight >= 1 && restoreMetrics.maxPullInflight <= 4,
     `pull concurrency must stay within four requests, observed ${restoreMetrics.maxPullInflight}`);
+assert.equal(restoreMetrics.packNetworkRequests, manifestV1.packCount,
+    'first restore must fetch every pack when the local cache is empty');
 assert.match(modalB.innerHTML, /rp-sync-restore-actions/);
 assert.doesNotMatch(modalB.innerHTML, /上传到云端|重建本地索引|重新恢复/,
     'restore mode must expose only progress until an error occurs');
 JSON.parse = nativeJsonParse;
+
+const cacheDatabase = await idbOpen(factoryB, 'RPHubSyncCache', undefined, ['packs']);
+const cachedPack = manifestV1.packCount ? await new Promise((resolve, reject) => {
+    const transaction = cacheDatabase.transaction(['packs'], 'readwrite');
+    const store = transaction.objectStore('packs');
+    const request = store.openCursor();
+    request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return resolve(null);
+        if (cursor.value instanceof Uint8Array && cursor.value.byteLength > 1) {
+            resolve({ checksum: String(cursor.key), bytes: new Uint8Array(cursor.value) });
+            return;
+        }
+        cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+}) : null;
+assert.ok(cachedPack, 'restored cache must contain at least one reusable pack');
+cacheDatabase.close();
+
+const runCachedRestoreProbe = async (label, corruptMode) => {
+    const before = restoreMetrics.packNetworkRequests;
+    const cacheDb = await idbOpen(factoryB, 'RPHubSyncCache', undefined, ['packs']);
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = cacheDb.transaction(['packs'], 'readwrite');
+            const store = transaction.objectStore('packs');
+            if (corruptMode === 'length') store.put(new Uint8Array(cachedPack.bytes.byteLength - 1), cachedPack.checksum);
+            if (corruptMode === 'checksum') {
+                const damaged = new Uint8Array(cachedPack.bytes);
+                damaged[0] ^= 1;
+                store.put(damaged, cachedPack.checksum);
+            }
+            transaction.oncomplete = resolve;
+            transaction.onerror = () => reject(transaction.error);
+        });
+    } finally { cacheDb.close(); }
+
+    const probeStorage = new StorageB();
+    const probeDocument = createDocumentStub();
+    const probeLocation = { pathname: '/sync-restore', replaced: null, replace(url) { this.replaced = url; }, assign() { } };
+    installBrowserGlobals({
+        storageClass: StorageB,
+        localStorage: probeStorage,
+        factory: factoryB,
+        document: probeDocument,
+        location: probeLocation,
+        fetchShim: fetchShimB,
+        locks: locksB
+    });
+    await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+    await waitFor(() => {
+        const modal = findSyncModal(probeDocument);
+        if (modal?.classList.contains('is-error')) throw new Error(`${label} failed: ${modal.querySelector('.rp-sync-modal__status').textContent}`);
+        return probeLocation.replaced ? true : null;
+    }, 60000, label);
+    if (corruptMode) {
+        assert.equal(restoreMetrics.packNetworkRequests - before, 1,
+            `${label} must fetch only the rejected cached pack`);
+    } else {
+        assert.equal(restoreMetrics.packNetworkRequests, before,
+            'a second restore must reuse every SHA-256-verified cached pack');
+    }
+};
+
+await runCachedRestoreProbe('verified local pack-cache restore', null);
+console.log('phase 2c (verified local cache hit): ok - zero pack downloads');
+await runCachedRestoreProbe('wrong-length local pack-cache restore', 'length');
+console.log('phase 2c (wrong-length cache falls back to server): ok');
+await runCachedRestoreProbe('wrong-checksum local pack-cache restore', 'checksum');
+console.log('phase 2c (wrong-checksum cache falls back to server): ok');
 console.log(`phase 2 (restore): ok - ${manifestV1.entryCount} entries parsed twice, ${manifestV1.packCount} staged packs read once`);
+
+// A schema mismatch must be rejected during validate-only preflight, before
+// synchronized localStorage or business records are mutated.
+{
+    const factoryD = new FDBFactory();
+    const StorageD = makeStorageClass();
+    const localStorageD = new StorageD();
+    localStorageD.setItem('rp_hub_settings', 'must-remain');
+    localStorageD.setItem('rp_hub_local_only', 'must-remain');
+    const request = factoryD.open('RPHubDB', 1);
+    const databaseD = await new Promise((resolve, reject) => {
+        request.onupgradeneeded = () => request.result.createObjectStore('store', { keyPath: 'id', autoIncrement: true });
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+    await new Promise((resolve, reject) => {
+        const transaction = databaseD.transaction('store', 'readwrite');
+        transaction.objectStore('store').put({ id: 'local', value: 'preserve-me' });
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error);
+    });
+    databaseD.close();
+    const documentD = createDocumentStub();
+    const locationD = { pathname: '/sync-restore', replaced: null, replace(url) { this.replaced = url; }, assign() { } };
+    restorePrototypes(savedPrototypes);
+    installBrowserGlobals({
+        storageClass: StorageD, localStorage: localStorageD, factory: factoryD,
+        document: documentD, location: locationD, fetchShim: fetchShimB, locks: locksB
+    });
+    await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+    let modalD = null;
+    await waitFor(() => {
+        modalD = findSyncModal(documentD);
+        return modalD?.classList.contains('is-error') ? true : null;
+    }, 60000, 'schema mismatch rejection');
+    assert.match(modalD.querySelector('.rp-sync-modal__status').textContent, /结构与云端快照不兼容/);
+    assert.equal(locationD.replaced, null, 'a schema mismatch must not finish restore');
+    assert.equal(localStorageD.getItem('rp_hub_settings'), 'must-remain');
+    assert.equal(localStorageD.getItem('rp_hub_local_only'), 'must-remain');
+    assert.deepEqual(await idbGetAll(factoryD, 'RPHubDB', 'store'), new Map([['local', { id: 'local', value: 'preserve-me' }]]));
+    console.log('phase 2e (schema mismatch leaves localStorage and business records untouched): ok');
+}
 
 // A valid legacy snapshot must restore normally, preserve its old placement in
 // the local cache as version 7, and require the existing explicit rebuild flow
@@ -762,7 +884,7 @@ installBrowserGlobals({
 });
 let rebuildConfirmations = 0;
 setGlobal('confirm', () => { rebuildConfirmations += 1; return true; });
-globalThis.RPHubAuthorSaveData = async () => { };
+globalThis.RPHubExternal = { version: 1, flush: async () => {} };
 await runScripts(['DB/bootstrap.js']);
 const legacyHomeModal = findSyncModal(documentLegacyHome);
 assert.ok(legacyHomeModal, 'normal page must expose the sync panel after legacy restore');
@@ -980,10 +1102,12 @@ FDBDatabase.prototype.transaction = function (names, mode) {
     if (this.name === 'RPHubDB' && mode === 'readonly' && scope.includes('store')) readonlyStoreTxs += 1;
     return nativeDbTransaction.apply(this, arguments);
 };
-async function push(label) {
+async function push(label, { allowFullScan = false } = {}) {
     modalA.querySelector('[data-action="push"]').click();
     await waitForUploadDone(modalA, label);
-    assert.equal(reads.cursors, 0, 'later uploads may not full-scan business stores');
+    const cursorDelta = reads.cursors - (push.lastCursorCount || 0);
+    push.lastCursorCount = reads.cursors;
+    if (!allowFullScan) assert.equal(cursorDelta, 0, 'incremental uploads may not full-scan business stores');
 }
 const packRequestCount = () => requestsA.filter(entry => entry.kind === 'pack').length;
 
@@ -1000,6 +1124,85 @@ assert.ok(!reads.keys.includes('chat_big'), 'unchanged conversations must not be
     assert.equal(deletes, 0, 'object-order no-op must not delete cache entries');
 }
 
+async function readBusinessRecord(name, store, key) {
+    const db = await idbOpen(factoryA, name, undefined, [store]);
+    try {
+        return await new Promise((resolve, reject) => {
+            const request = db.transaction(store).objectStore(store).get(key);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    } finally { db.close(); }
+}
+
+// The upload path compares and rebuilds every item in a changed chat array.
+{
+    const original = await readBusinessRecord('RPHubDB', 'store', 'chat_big');
+    const rewritten = original.map((message, index) => ({ ...message, text: `rewritten-${index}` }));
+    await idbPut(factoryA, 'RPHubDB', 'store', 'chat_big', rewritten);
+    await push('complete array rewrite');
+    let entries = await readManifestEntries(bucket, await readManifest(bucket));
+    let items = entries.filter(entry => entry.type === 'recordArrayItem' && entry.key === 'chat_big');
+    assert.equal(items.length, 300, 'same-length rewrite must include every array item');
+    assert.equal(items[0].value.text, 'rewritten-0');
+    assert.equal(items[299].value.text, 'rewritten-299');
+
+    await idbPut(factoryA, 'RPHubDB', 'store', 'chat_big', rewritten.slice(0, 73));
+    await push('shortened array');
+    entries = await readManifestEntries(bucket, await readManifest(bucket));
+    items = entries.filter(entry => entry.type === 'recordArrayItem' && entry.key === 'chat_big');
+    assert.equal(items.length, 73, 'shortening must remove every trailing item');
+    assert.ok(entries.some(entry => entry.type === 'recordArrayEnd' && entry.key === 'chat_big' && entry.length === 73));
+
+    await idbPut(factoryA, 'RPHubDB', 'store', 'chat_big', []);
+    await push('empty array');
+    entries = await readManifestEntries(bucket, await readManifest(bucket));
+    assert.equal(entries.filter(entry => entry.type === 'recordArrayItem' && entry.key === 'chat_big').length, 0);
+    assert.ok(entries.some(entry => entry.type === 'recordArrayStart' && entry.key === 'chat_big'));
+    assert.ok(entries.some(entry => entry.type === 'recordArrayEnd' && entry.key === 'chat_big' && entry.length === 0));
+
+    await idbPut(factoryA, 'RPHubDB', 'store', 'chat_big', original);
+    localStorageA.setItem('rp_sync_tracking_epoch_v2', 'forced-epoch-mismatch');
+    const beforeRebuild = (await readManifest(bucket)).version;
+    await push('tracking epoch full rebuild', { allowFullScan: true });
+    const rebuilt = await readManifest(bucket);
+    assert.ok(rebuilt.version > beforeRebuild, 'tracking epoch mismatch must rebuild and reconcile the snapshot');
+    entries = await readManifestEntries(bucket, rebuilt);
+    items = entries.filter(entry => entry.type === 'recordArrayItem' && entry.key === 'chat_big');
+    assert.equal(items.length, 300, 'full local rebuild must restore the entire array');
+    assert.equal(items[0].value.text, 'msg-0');
+    assert.equal(items[299].value.text, 'msg-299');
+
+    const cacheStateDb = await idbOpen(factoryA, 'RPHubSyncCache', undefined, ['state']);
+    try {
+        await new Promise((resolve, reject) => {
+            const transaction = cacheStateDb.transaction('state', 'readwrite');
+            transaction.objectStore('state').delete('snapshot');
+            transaction.oncomplete = resolve;
+            transaction.onerror = () => reject(transaction.error);
+        });
+    } finally { cacheStateDb.close(); }
+    const beforeMissingIndexRebuild = rebuilt.version;
+    const beforeMissingIndexPacks = packRequestCount();
+    const beforeMissingIndexCursors = reads.cursors;
+    await push('missing snapshot index full rebuild', { allowFullScan: true });
+    const rebuiltFromMissingIndex = await readManifest(bucket);
+    assert.equal(rebuiltFromMissingIndex.version, beforeMissingIndexRebuild,
+        'identical full rebuild must preserve the existing remote snapshot');
+    assert.equal(rebuiltFromMissingIndex.checksum, rebuilt.checksum);
+    assert.equal(packRequestCount(), beforeMissingIndexPacks, 'identical full rebuild must not upload packs');
+    assert.ok(reads.cursors > beforeMissingIndexCursors, 'missing index must trigger a full local cursor scan');
+    entries = await readManifestEntries(bucket, rebuiltFromMissingIndex);
+    items = entries.filter(entry => entry.type === 'recordArrayItem' && entry.key === 'chat_big');
+    assert.equal(items.length, 300, 'missing snapshot index must rebuild from the complete local array');
+    assert.equal(items[0].value.text, 'msg-0');
+    assert.equal(items[299].value.text, 'msg-299');
+    console.log('phase 3 (full array rewrite, truncate, empty array, epoch and missing-index rebuild): ok');
+}
+
+const stableNoOpBatches = packRequestCount();
+const stableNoOpVersion = (await readManifest(bucket)).version;
+
 // A put with byte-identical content is an invalid change: the journal records
 // it, but neither the snapshot cache nor the upload may be touched.
 await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'hello-2');
@@ -1007,10 +1210,10 @@ await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'hello-2');
     const puts = cacheWrites.puts;
     const deletes = cacheWrites.deletes;
     await push('same-value put');
-    assert.equal(packRequestCount(), noOpBatches, 'same-value put must send zero packs');
+    assert.equal(packRequestCount(), stableNoOpBatches, 'same-value put must send zero packs');
     assert.equal(cacheWrites.puts, puts, 'same-value put must not rewrite cache entries');
     assert.equal(cacheWrites.deletes, deletes, 'same-value put must not delete cache entries');
-    assert.equal((await readManifest(bucket)).version, manifestV2.version, 'same-value put must not commit');
+    assert.equal((await readManifest(bucket)).version, stableNoOpVersion, 'same-value put must not commit');
 }
 // Changing a value and reverting it inside one journal window is also an
 // invalid change: the final bytes equal the cached bytes.
@@ -1020,10 +1223,10 @@ await idbPut(factoryA, 'RPHubDB', 'store', 'chat1', 'hello-2');
     const puts = cacheWrites.puts;
     const deletes = cacheWrites.deletes;
     await push('change and revert');
-    assert.equal(packRequestCount(), noOpBatches, 'change-and-revert must send zero packs');
+    assert.equal(packRequestCount(), stableNoOpBatches, 'change-and-revert must send zero packs');
     assert.equal(cacheWrites.puts, puts, 'change-and-revert must not rewrite cache entries');
     assert.equal(cacheWrites.deletes, deletes, 'change-and-revert must not delete cache entries');
-    assert.equal((await readManifest(bucket)).version, manifestV2.version, 'change-and-revert must not commit');
+    assert.equal((await readManifest(bucket)).version, stableNoOpVersion, 'change-and-revert must not commit');
 }
 
 async function writeTransaction(name, store, action, { abort = false } = {}) {
@@ -1039,7 +1242,7 @@ async function writeTransaction(name, store, action, { abort = false } = {}) {
 }
 await writeTransaction('RPHubDB', 'store', (store, tx) => { store.put('must-not-upload', 'aborted'); tx.abort(); }, { abort: true });
 await push('aborted transaction');
-assert.equal(packRequestCount(), noOpBatches, 'aborted write must not generate packs');
+assert.equal(packRequestCount(), stableNoOpBatches, 'aborted write must not generate packs');
 await writeTransaction('RPHubDB', 'store', store => {
     const request = store.openCursor(IDBKeyRange.only('chat1'));
     request.onsuccess = () => { if (request.result) request.result.update('cursor-value'); };

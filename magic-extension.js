@@ -2,66 +2,14 @@
     if (location.pathname !== '/' && location.pathname !== '/index.html') return;
 
     const FIXED_IMAGE_KEY = 'rp_hub_magic_fixed_image';
-    const LEGACY_REGEX_MIGRATION_KEY = 'rp_hub_magic_regex_migration_v2';
     const YNAI_MODEL_KEY = 'rp_hub_magic_ynai_model';
-    const YNAI_MODEL_LIST_KEY = 'rp_hub_magic_ynai_models';
     // 密钥即路由：YNAI- 前缀密钥走第三方中转（worker 按 provider 转发），其余 sta1n。
     const isYnaiToken = value => String(value || '').trim().toUpperCase().startsWith('YNAI-');
     const IMAGE_STORAGE_PREFIX = 'rp_hub_image_renders_';
-    const IMAGE_RECORD_LIMIT = 256;
     const DEFAULT_STORY_SCOPE_ID = 'main';
     const IMAGE_PARAM_KEYS = ['tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
-    const isUsableAdapter = value => value && typeof value === 'object' && !Array.isArray(value)
-        && value.ok !== false
-        && Number(value.schema) === 1
-        && typeof value.id === 'string'
-        && value.id.trim();
-    let activeAdapter = null;
-    let adapterLoadPromise = null;
-
-    const loadUiAdapter = async () => {
-        if (activeAdapter) return activeAdapter;
-        if (adapterLoadPromise) return adapterLoadPromise;
-        adapterLoadPromise = fetch('/__rphub/adapter.json', { cache: 'no-store' })
-            .then(async response => {
-                if (!response.ok) return null;
-                const value = await response.json().catch(() => null);
-                return isUsableAdapter(value) ? value : null;
-            })
-            .then(value => {
-                activeAdapter = value;
-                return activeAdapter;
-            })
-            .catch(() => {
-                activeAdapter = null;
-                return null;
-            })
-            .then(value => {
-                if (!value) {
-                    // 适配拉取失败（Worker 端清单加载失败、返回限流页等 200 非
-                    // JSON，或 sourceChecks 未过而整体降级）：清空失败句柄并安
-                    // 排延迟重试，首屏没有同步按钮时数秒内自动恢复，不必手动
-                    // 刷新。6 秒对齐 Worker 端 5 秒失败短路过期点。
-                    adapterLoadPromise = null;
-                    if (typeof setTimeout === 'function') {
-                        setTimeout(() => {
-                            loadUiAdapter().then((adapter) => {
-                                if (!adapter) return;
-                                reconcileUi();
-                                migrateLegacyImageRegex().then(changed => { if (changed) location.reload(); });
-                            }).catch(() => { });
-                        }, 6000);
-                    }
-                }
-                return value;
-            });
-        return adapterLoadPromise;
-    };
-    const uiConfig = () => activeAdapter?.ui || {};
-    const navigationConfig = () => uiConfig().navigation || {};
-    const settingsConfig = () => uiConfig().settings || {};
-    const chatConfig = () => uiConfig().chat || {};
-    const textOf = node => String(node?.textContent || '').replace(/\s+/g, ' ').trim();
+    const external = window.RPHubExternal;
+    if (!external || external.version !== 1) return;
 
     const hashText = value => {
         let hash = 2166136261;
@@ -80,6 +28,7 @@
     };
     const isFixedImageEnabled = () => localStorage.getItem(FIXED_IMAGE_KEY) !== '0';
     const imageStores = new Map();
+    const retiredCharacterIds = new Set();
 
     const buildRecordKey = descriptor => [
         encodeURIComponent(normalizeStoryScopeId(descriptor.storyScopeId)),
@@ -108,10 +57,9 @@
     };
 
     const buildDescriptor = (card, message, requestUrl, storyScopeId = DEFAULT_STORY_SCOPE_ID) => {
-        const row = card?.closest?.('[data-chat-index]');
-        const occurrenceIndex = row ? [...row.querySelectorAll('.generated-image-card')].indexOf(card) : -1;
-        if (occurrenceIndex < 0) return null;
-        const messageIndex = Number(row?.dataset.chatIndex);
+        const slot = external.describeCard(card);
+        if (!slot || slot.occurrenceIndex < 0) return null;
+        const { occurrenceIndex, messageIndex } = slot;
         const prompt = String(requestUrl.searchParams.get('tag') || '').trim();
         const descriptor = {
             storyScopeId: normalizeStoryScopeId(storyScopeId),
@@ -145,7 +93,8 @@
             occurrenceIndex: Math.max(0, Number(record.occurrenceIndex) || 0),
             prompt,
             promptHash: String(record.promptHash || hashText(prompt)),
-            paramsSnapshot
+            paramsSnapshot,
+            imageKey: typeof record.imageKey === 'string' ? record.imageKey : ''
         };
         normalized.key = buildRecordKey(normalized);
         return normalized;
@@ -171,7 +120,7 @@
             records.delete(normalized.key);
             records.set(normalized.key, normalized);
         });
-        return [...records.values()].slice(-IMAGE_RECORD_LIMIT);
+        return [...records.values()];
     };
 
     const mergeRecordLists = (base, additions, deletedKeys, characterName = '') => {
@@ -183,7 +132,7 @@
             records.delete(normalized.key);
             records.set(normalized.key, normalized);
         }
-        return [...records.values()].slice(-IMAGE_RECORD_LIMIT);
+        return [...records.values()];
     };
 
     const withImageStoreLock = (state, callback) => {
@@ -196,10 +145,11 @@
 
     const loadImageStore = (characterId, characterName) => {
         const id = String(characterId || '');
-        if (!id) return Promise.resolve(null);
+        if (!id || retiredCharacterIds.has(id)) return Promise.resolve(null);
         if (imageStores.has(id)) return imageStores.get(id).loadPromise;
         const state = {
             id,
+            retired: false,
             characterName: String(characterName || ''),
             records: [],
             transientRecords: new Map(),
@@ -222,12 +172,7 @@
                 const rawRecords = Array.isArray(value)
                     ? value.map(record => normalizeRecord(record, state.characterName)).filter(record => record.prompt)
                     : [];
-                state.records = rawRecords.slice(-IMAGE_RECORD_LIMIT);
-                if (rawRecords.length > state.records.length) {
-                    rawRecords.slice(0, rawRecords.length - state.records.length)
-                        .forEach(record => state.pendingDeleteKeys.add(record.key));
-                    saveImageStore(state).catch(error => { state.saveError = error; });
-                }
+                state.records = rawRecords;
                 return state;
             } finally {
                 db.close();
@@ -241,7 +186,7 @@
     };
 
     const saveImageStore = (state, retry = false) => {
-        if (!state) return Promise.resolve();
+        if (!state || state.retired) return Promise.resolve();
         // 无待写内容且无未结算修订时完全短路：不开库、不排队、不递增
         // revision（过去 flush 重试路径会对空 pendings 白跑一次读改写）。
         if (state.savedRevision === state.saveRevision
@@ -250,14 +195,17 @@
         }
         if (!retry) state.saveRevision += 1;
         const write = state.writeQueue.catch(() => undefined).then(async () => {
+            if (state.retired) return;
             if (state.savedRevision === state.saveRevision
                 && state.pendingUpserts.size === 0 && state.pendingDeleteKeys.size === 0) return;
             const revision = state.saveRevision;
             const upserts = new Map(state.pendingUpserts);
             const deletedKeys = new Set(state.pendingDeleteKeys);
             return withImageStoreLock(state, async () => {
+                if (state.retired) return;
                 const db = await openImageDatabase();
                 try {
+                    if (state.retired) return;
                     let merged;
                     await new Promise((resolve, reject) => {
                         const transaction = db.transaction(['store'], 'readwrite');
@@ -265,6 +213,7 @@
                         const request = store.get(IMAGE_STORAGE_PREFIX + state.id);
                         request.onerror = () => reject(request.error || new Error('图片记录读取失败'));
                         request.onsuccess = () => {
+                            if (state.retired) return;
                             merged = mergeRecordLists(request.result, upserts.values(), deletedKeys, state.characterName);
                             store.put(merged, IMAGE_STORAGE_PREFIX + state.id);
                         };
@@ -272,6 +221,7 @@
                         transaction.onerror = () => reject(transaction.error || new Error('图片记录保存失败'));
                         transaction.onabort = () => reject(transaction.error || new Error('图片记录保存中止'));
                     });
+                    if (state.retired) return;
                     state.pendingUpserts.forEach((record, key) => {
                         if (upserts.get(key) === record) state.pendingUpserts.delete(key);
                     });
@@ -310,6 +260,10 @@
 
     const buildRecordUrl = (record, token = '', allowGeneration = false) => {
         const url = new URL('/api/rp-image', location.origin);
+        if (!allowGeneration && record.imageKey) {
+            url.searchParams.set('key', record.imageKey);
+            return url.href;
+        }
         const snapshot = record.paramsSnapshot || {};
         IMAGE_PARAM_KEYS.forEach(key => url.searchParams.set(key, key === 'tag' ? record.prompt : String(snapshot[key] || '')));
         if (snapshot.rerollNonce) url.searchParams.set('reroll_nonce', String(snapshot.rerollNonce));
@@ -386,12 +340,12 @@
         if (job?.status === 'done') bindDirectImageEvents(card);
         let warning = card?.querySelector?.('.magic-image-save-warning');
         if (job?.storageError) {
-            if (!warning) {
+            if (!warning && card) {
                 warning = document.createElement('div');
                 warning.className = 'magic-image-save-warning';
                 card.appendChild(warning);
             }
-            warning.textContent = '固定记录未保存，请勿刷新';
+            if (warning) warning.textContent = '固定记录未保存，请勿刷新';
         } else {
             warning?.remove();
         }
@@ -463,8 +417,8 @@
         const existing = imageGenerationTasks.get(key);
         if (existing) return existing;
         const promise = requestImageGeneration(requestUrl)
-            .then(() => ({
-                status: 'done', imageUrl: key, generationProgress: { percent: 100 }
+            .then(imageKey => ({
+                status: 'done', imageKey, imageUrl: imageKey ? `/api/rp-image?key=${encodeURIComponent(imageKey)}` : key, generationProgress: { percent: 100 }
             }))
             .catch(error => ({
                 status: 'failed',
@@ -485,10 +439,11 @@
             throw new Error(payload?.error || `生图失败：HTTP ${response.status}`);
         }
         if (response.body) await response.body.cancel().catch(() => undefined);
+        return response.headers.get('x-rp-image-key') ? decodeURIComponent(response.headers.get('x-rp-image-key')) : '';
     };
 
     const commitGeneratedRecord = async (state, record, previous, persistRequested) => {
-        if (!state) return;
+        if (!state || state.retired) return;
         const previousWasStored = Boolean(previous && state.records.some(item => item.key === previous.key));
         if (previous) state.transientRecords.delete(previous.key);
         state.transientRecords.delete(record.key);
@@ -497,7 +452,7 @@
             state.records = [
                 ...state.records.filter(item => item.key !== record.key && item.key !== previous?.key),
                 record
-            ].slice(-IMAGE_RECORD_LIMIT);
+            ];
             state.pendingUpserts.set(record.key, record);
             await saveImageStore(state);
             return;
@@ -506,13 +461,14 @@
         state.transientRecords.set(record.key, record);
     };
 
-    const createGenerationTask = ({ slotKey, sourcePromptHash, record, previous = null, state = null, token = '', render, persistRequested = false }) => {
+    const createGenerationTask = ({ slotKey, sourcePromptHash, record, previous = null, state = null, characterId = state?.id || '', token = '', render, persistRequested = false }) => {
         const generateUrl = buildRecordUrl(record, token, true);
         const readUrl = buildRecordUrl(record);
         const task = {
             sourcePromptHash,
             record,
             state,
+            characterId: String(state?.id || ''),
             requestUrl: generateUrl,
             baseUrl: location.origin,
             token: '',
@@ -530,6 +486,7 @@
             }
             if (imageSlotTasks.get(slotKey) !== task) return job;
             if (job.status === 'done') {
+                record.imageKey = job.imageKey || record.imageKey;
                 try {
                     await commitGeneratedRecord(state, record, previous, persistRequested);
                 } catch (_) {
@@ -543,10 +500,10 @@
 
     // 用既有记录恢复已完成任务的两条路径（非 fresh 命中、开关关闭时的重掷）
     // 共用同一份装配逻辑。
-    const resumeRecordedImageTask = (record, descriptor, slotKey, token, render, state) => {
+    const resumeRecordedImageTask = (record, descriptor, slotKey, token, render, state, characterId = state?.id || '') => {
         const readUrl = buildRecordUrl(record);
-        const task = createCompletedImageTask(buildRecordUrl(record, token, true), readUrl, render);
-        Object.assign(task, { record, state, sourcePromptHash: descriptor.promptHash });
+        const task = createCompletedImageTask(readUrl, readUrl, render);
+        Object.assign(task, { record, state, characterId: String(characterId || ''), sourcePromptHash: descriptor.promptHash });
         imageSlotTasks.set(slotKey, task);
         pruneSlotTasks();
         return task;
@@ -558,7 +515,7 @@
         const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);
         if (!descriptor) {
             // 无卡片上下文时无法定位槽位：作者的“自动生图”开关关闭时只隐藏。
-            // autoImageGen 未传（旧适配清单）按作者原生行为放行。
+            // 适配层未提供“自动生图”状态时，按作者原生行为放行。
             if (autoImageGen === false) return createSuppressedImageTask(currentUrl.href, render);
             const record = normalizeRecord({
                 storyScopeId,
@@ -568,11 +525,13 @@
             return createGenerationTask({
                 slotKey: JSON.stringify([String(characterId || ''), normalizeStoryScopeId(storyScopeId), buildRecordUrl(record)]),
                 record,
+                characterId,
                 token,
                 render
             });
         }
         const state = await loadImageStore(characterId, characterName);
+        if (state?.retired) return createSuppressedImageTask(currentUrl.href, render);
         const slotKey = JSON.stringify([
             String(characterId || ''),
             normalizeStoryScopeId(descriptor.storyScopeId),
@@ -582,7 +541,7 @@
         const activeTask = imageSlotTasks.get(slotKey);
         if (fresh !== true && activeTask && activeTask.job?.status !== 'failed'
             && (activeTask.record?.promptHash === descriptor.promptHash || activeTask.sourcePromptHash === descriptor.promptHash)) {
-            if (activeTask.record) activeTask.requestUrl = buildRecordUrl(activeTask.record, token, true);
+            if (activeTask.record) activeTask.requestUrl = buildRecordUrl(activeTask.record);
             activeTask.render = render;
             return activeTask;
         }
@@ -592,7 +551,7 @@
             ? findSlotRecord([...state.transientRecords.values(), ...state.records], descriptor)
             : null;
         const previous = transientRecord || storedRecord || slotRecord;
-        // 开关由适配层实时传入，不依赖存储；未传（旧适配清单）按作者原生行为放行。
+        // 开关由适配层实时传入，不依赖存储；未提供状态时按作者原生行为放行。
         const generationAllowed = autoImageGen !== false;
 
         if (fresh !== true && previous) {
@@ -620,6 +579,7 @@
                 record,
                 previous,
                 state,
+                characterId,
                 token,
                 render,
                 persistRequested: isFixedImageEnabled()
@@ -636,19 +596,25 @@
             sourcePromptHash: descriptor.promptHash,
             record,
             state,
+            characterId,
             token,
             render,
             persistRequested: isFixedImageEnabled()
         });
     };
 
-    window.RPH_MAGIC_IMAGE_TASK = options => {
+    const imageTask = options => {
         const deferredTask = { cards: new Set(), job: null, requestUrl: normalizeRequestUrl(options.requestUrl, options.characterName).href };
         const previousBinding = imageCardBindings.get(options.card);
         previousBinding?.task?.cards.delete(options.card);
         const binding = { task: null };
         imageCardBindings.set(options.card, binding);
-        deferredTask.promise = startMagicImageTask(options).then(task => {
+        deferredTask.promise = Promise.resolve().then(() => {
+            if (retiredCharacterIds.has(String(options.characterId || ''))) {
+                return createSuppressedImageTask(deferredTask.requestUrl, options.render);
+            }
+            return startMagicImageTask(options);
+        }).then(task => {
             if (!task) return { status: 'failed', error: '图片任务初始化失败' };
             deferredTask.requestUrl = task.requestUrl || deferredTask.requestUrl;
             deferredTask.job = task.job || null;
@@ -690,474 +656,21 @@
         });
     };
 
-    const migrateRegexArray = value => {
-        if (!Array.isArray(value)) return { value, changed: false };
-        const oldRules = value.filter(rule => rule?.name === 'R2生图正则');
-        if (oldRules.length === 0) return { value, changed: false };
-        const enabled = oldRules.some(rule => rule.enabled === true);
-        const next = value.filter(rule => rule?.name !== 'R2生图正则');
-        const naiRule = next.find(rule => rule?.name === 'NAI画图正则');
-        if (naiRule) {
-            if (enabled) naiRule.enabled = true;
-        } else {
-            const replacement = { ...oldRules[0], name: 'NAI画图正则', enabled };
-            next.splice(Math.min(value.indexOf(oldRules[0]), next.length), 0, replacement);
-        }
-        return { value: next, changed: true };
-    };
-    const migrateCharacterRegex = value => {
-        if (!Array.isArray(value)) return { value, changed: false };
-        let changed = false;
-        const next = value.map(character => {
-            if (!isObject(character) || !Array.isArray(character.regexScripts)) return character;
-            const migrated = migrateRegexArray(character.regexScripts);
-            if (!migrated.changed) return character;
-            changed = true;
-            return { ...character, regexScripts: migrated.value };
-        });
-        return { value: next, changed };
-    };
-    const migrateLegacyImageRegex = () => new Promise(resolve => {
-        if (!activeAdapter) return resolve(false);
-        if (localStorage.getItem(LEGACY_REGEX_MIGRATION_KEY) === '1') return resolve(false);
-        openImageDatabase().then(db => {
-            if (!db.objectStoreNames.contains('store')) {
-                db.close();
-                localStorage.setItem(LEGACY_REGEX_MIGRATION_KEY, '1');
-                resolve(false);
-                return;
-            }
-            let changed = false;
-            const transaction = db.transaction(['store'], 'readwrite');
-            const store = transaction.objectStore('store');
-            ['rp_hub_regex', 'rp_hub_global_regex', 'rp_hub_characters'].forEach(key => {
-                const getRequest = store.get(key);
-                getRequest.onsuccess = () => {
-                    const migrated = key === 'rp_hub_characters'
-                        ? migrateCharacterRegex(getRequest.result)
-                        : migrateRegexArray(getRequest.result);
-                    if (!migrated.changed) return;
-                    changed = true;
-                    store.put(migrated.value, key);
-                };
-            });
-            transaction.oncomplete = () => {
-                db.close();
-                localStorage.setItem(LEGACY_REGEX_MIGRATION_KEY, '1');
-                resolve(changed);
-            };
-            transaction.onabort = () => {
-                db.close();
-                resolve(false);
-            };
-        }, () => resolve(false));
-    });
-
-    loadUiAdapter().then(adapter => {
-        if (!adapter) return false;
-        return migrateLegacyImageRegex();
-    }).then(changed => {
-        if (changed) location.reload();
-    });
-
-    const addButton = (parent, label, onClick) => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = label;
-        button.className = 'magic-extension-button';
-        button.addEventListener('click', onClick);
-        parent.appendChild(button);
-        return button;
-    };
-
-    const installStyle = () => {
-        if (document.getElementById('magic-extension-style')) return;
-        const style = document.createElement('style');
-        style.id = 'magic-extension-style';
-        style.textContent = [
-            '.magic-extension-button{display:inline-flex;align-items:center;justify-content:center;gap:4px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.92);color:#475569;border-radius:9px;padding:5px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;transition:.15s}',
-            '.magic-extension-button:hover{color:#2563eb;background:#eff6ff}',
-            '.magic-extension-button svg{width:14px;height:14px;flex:none}',
-            '.magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
-            '.app-sidebar[class~="md:w-16"] .magic-extension-actions{display:none}',
-            '.app-navigation-user .magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
-            '.magic-image-nav{margin-top:4px}',
-            '.magic-image-nav svg{flex:none}',
-            '.magic-image-nav span{white-space:nowrap;overflow:hidden}',
-            '.app-navigation-item.magic-image-nav{display:flex;align-items:center;gap:.65rem;width:100%;text-align:left}',
-            '.app-navigation-item.magic-image-nav .magic-image-nav-icon{display:inline-flex;align-items:center;justify-content:center;flex:none;width:1.5rem;height:1.5rem}',
-            '.app-sidebar[class~="md:w-16"] .magic-image-nav span{display:none}',
-            '.app-sidebar[class~="md:w-16"] .magic-image-nav{width:3rem;height:3rem;margin-left:auto;margin-right:auto;justify-content:center;padding:0}',
-            '.app-sidebar[class~="md:w-16"] .magic-image-nav svg{margin-right:0}',
-            '.magic-fixed-image-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px}',
-            '.magic-fixed-image-toggle input{accent-color:#4f46e5}',
-            '.magic-scroll-button{position:absolute;left:50%;top:-2.75rem;z-index:30;display:none;width:2.25rem;height:2.25rem;padding:0;pointer-events:auto;align-items:center;justify-content:center;border:1px solid #e5e7eb;border-radius:999px;transform:translateX(-50%);background:rgba(255,255,255,.95);color:#6b7280;box-shadow:0 10px 15px -3px rgba(15,23,42,.12),0 4px 6px -4px rgba(15,23,42,.12);backdrop-filter:blur(12px);cursor:pointer;transition:all .15s}',
-            '.magic-scroll-button:hover{color:#4f46e5;border-color:#c7d2fe}',
-            '.magic-scroll-button:active{transform:translateX(-50%) scale(.95)}',
-            '.magic-scroll-button svg{width:1rem;height:1rem}',
-            '.magic-scroll-button.is-visible{display:flex}',
-            '.magic-scroll-sentinel{width:1px;height:1px;pointer-events:none}',
-            '.magic-image-suppressed{display:none!important}',
-            '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
-            '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
-            '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}'
-        ].join('');
-        document.head.appendChild(style);
-    };
-
-    const installSidebarActions = () => {
-        if (typeof window.RPHubAuthorSaveData !== 'function') return;
-        const cfg = navigationConfig();
-        const userSelector = cfg.user || '.app-navigation-user';
-        const userCard = document.querySelector(userSelector)
-            || (() => {
-                const sidebar = document.querySelector('.app-sidebar');
-                return sidebar?.lastElementChild?.firstElementChild || sidebar?.lastElementChild || null;
-            })();
-        if (!userCard || userCard.querySelector('.magic-extension-actions')) return;
-        const actions = document.createElement('div');
-        actions.className = 'magic-extension-actions';
-        const syncButton = addButton(actions, '同步', () => window.RPH_R2_OPEN_SYNC?.());
-        syncButton.title = '同步';
-        syncButton.setAttribute('aria-label', '同步');
-        syncButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-4L3 10"></path><path d="M3 4v6h6"></path><path d="M4 13a8.1 8.1 0 0 0 14.9 4L21 14"></path><path d="M21 20v-6h-6"></path></svg><span>同步</span>';
-        userCard.appendChild(actions);
-    };
-    const installImageNav = () => {
-        const cfg = navigationConfig();
-        if (cfg.mode === 'section-grid') {
-            const content = document.querySelector(cfg.content || '.app-navigation-content');
-            if (!content) return;
-            const sections = [...content.querySelectorAll(cfg.section || '.app-navigation-section')];
-            const section = sections.find(item => {
-                const heading = item.querySelector('h1,h2,h3,[role="heading"]');
-                return !cfg.sectionHeading || textOf(heading || item).includes(String(cfg.sectionHeading));
-            });
-            const grid = section?.querySelector(cfg.grid || '.app-navigation-grid');
-            if (!grid || grid.querySelector('.magic-image-nav')) return;
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = `${cfg.buttonClass || 'app-navigation-item'} magic-image-nav`;
-            button.title = '图片管理';
-            button.setAttribute('aria-label', '图片管理');
-            const iconClass = cfg.iconClass || 'app-navigation-icon';
-            button.innerHTML = `<span class="${iconClass} magic-image-nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5zm3 10 3-3 2 2 2-2 3 3M8 8h.01"></path></svg></span><span>图片管理</span>`;
-            button.addEventListener('click', () => { window.location.href = '/image'; });
-            const itemSelector = cfg.item || '.app-navigation-item';
-            const settingsButton = [...grid.querySelectorAll(itemSelector)]
-                .find(item => textOf(item).includes(String(cfg.insertBeforeLabel || '设置')));
-            grid.insertBefore(button, settingsButton || null);
-            return;
-        }
-    };
-    const findFixedImageAnchor = () => {
-        const cfg = settingsConfig();
-        const labels = cfg.labelSelector
-            ? [...document.querySelectorAll(cfg.labelSelector)]
-                .filter(label => textOf(label).includes(String(cfg.labelText || '沉浸模式')))
-                .filter(label => cfg.anchorParentSelector ? label.closest(cfg.anchorParentSelector) : true)
-            : [...document.querySelectorAll('label')]
-                .filter(label => [...label.querySelectorAll('span')].some(span => span.textContent.trim() === '沉浸模式'));
-        const label = labels[cfg.occurrence === 'last' ? labels.length - 1 : 0] || null;
-        if (!label) return { grid: null, anchor: null };
-        const grid = cfg.labelSelector
-            ? label.closest(cfg.anchorParentSelector || 'div')
-            : (label.parentElement?.classList.contains('grid') ? label.parentElement : null);
-        if (!grid) return { grid: null, anchor: null };
-        // 锚点可能是网格的嵌套后代；插入位相对锚点计算，作者调整设置项
-        // 顺序不再改变“固定生图”的落点。
-        let anchor = label;
-        while (anchor && anchor.parentElement !== grid) anchor = anchor.parentElement;
-        if (anchor?.parentElement !== grid) anchor = null;
-        return { grid, anchor };
-    };
-    const installFixedImageSetting = () => {
-        if (typeof window.RPHubAuthorSaveData !== 'function') return { grid: null, anchor: null };
-        const cfg = settingsConfig();
-        const { grid, anchor } = findFixedImageAnchor();
-        // 设置视图是条件渲染：网格尚未挂载时先跳过，等观察者在网格出现后补装。
-        if (!grid) return { grid: null, anchor: null };
-        // 安装判定看开关行特有的 input：模型行复用同一个行类，但不能被当成开关本体
-        if (grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return { grid, anchor };
-        const label = document.createElement('label');
-        // 行样式类全部来自适配层 ui.settings：作者改设置行样式时只更新适配 JSON。
-        // 兜底值跟随作者当前设置行语义类，适配键缺失也不渲染裸样式。
-        label.className = `magic-fixed-image-toggle ${cfg.rowClass || 'settings-toggle-row group'}`;
-        label.innerHTML = `<span class="${cfg.textClass || 'text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors'}">固定生图</span><span class="${cfg.toggleWrapClass || 'relative inline-flex flex-none items-center'}"><input type="checkbox" class="magic-fixed-image-input settings-toggle-input sr-only"><span class="${cfg.toggleClass || 'settings-toggle'}"></span></span>`;
-        const input = label.querySelector('input');
-        input.checked = isFixedImageEnabled();
-        input.addEventListener('change', () => localStorage.setItem(FIXED_IMAGE_KEY, input.checked ? '1' : '0'));
-        const insertAfter = cfg.insert === 'after';
-        grid.insertBefore(label, anchor
-            ? (insertAfter ? anchor.nextSibling : anchor)
-            : (insertAfter ? grid.children[0]?.nextSibling || null : null));
-        return { grid, anchor };
-    };
-
-    // YNAI 模型劫持：密钥为 YNAI- 时隐藏作者“生图版本”浮窗，原位放入同款样式的
-    // 下拉，选项来自中转站模型列表（经 worker /api/rp-image-models 拉取），默认
-    // 取云端 defaultModel（缺失回退 nai-diffusion-4-5-full）；选择存本地并在构建
-    // 请求时覆盖 model 参数。
-    // sta1n 密钥时移除劫持、还原作者浮窗。浮窗定位不写死 DOM 结构：按适配层
-    // ui.settings.modelLabel 文本找到设置标签，再找同容器里的 custom-select 渲染根。
-    const YNAI_SELECT_CLASS = 'magic-ynai-select';
-    const ynaiSelectState = { key: '', checkedAt: 0, loading: false, loaded: false, failedAt: 0, models: null, renderedModels: null };
-
-    const readAuthorImageGenKey = async () => {
-        try {
-            const db = await openImageDatabase();
-            try {
-                const value = await new Promise((resolve, reject) => {
-                    const request = db.transaction(['store'], 'readonly').objectStore('store').get('rp_hub_settings');
-                    request.onsuccess = () => resolve(request.result);
-                    request.onerror = () => reject(request.error || new Error('设置读取失败'));
-                });
-                return String(value?.imageGenKey || '');
-            } finally {
-                db.close();
-            }
-        } catch (_) {
-            return '';
-        }
-    };
-
-    const readStoredYnaiModels = () => {
-        try {
-            const value = JSON.parse(localStorage.getItem(YNAI_MODEL_LIST_KEY) || 'null');
-            return Array.isArray(value) ? value.filter(item => item?.id) : null;
-        } catch (_) {
-            return null;
-        }
-    };
-
-    const ynaiDefaultModel = () => String(activeAdapter?.image?.ynai?.defaultModel || '');
-
-    const findImageModelControl = () => {
-        const labelText = String(settingsConfig().modelLabel || '生图版本');
-        const labels = [...document.querySelectorAll('label.settings-label')]
-            .filter(label => label.textContent.trim() === labelText);
-        for (const label of labels) {
-            const box = label.parentElement;
-            if (!box) continue;
-            const control = [...box.children].find(el => el !== label
-                && !el.classList.contains(YNAI_SELECT_CLASS)
-                && el.querySelector(':scope > button.settings-control'));
-            if (control) return { box, control };
-        }
-        return null;
-    };
-
-    const renderYnaiSelectOptions = (select, models) => {
-        select.textContent = '';
-        for (const model of models) {
-            const option = document.createElement('option');
-            option.value = String(model.id);
-            option.textContent = String(model.label || model.id);
-            select.appendChild(option);
-        }
-        const current = String(localStorage.getItem(YNAI_MODEL_KEY) || '');
-        const preferred = current && models.some(model => String(model.id) === current)
-            ? current
-            : (models.some(model => model.id === ynaiDefaultModel()) ? ynaiDefaultModel() : String(models[0].id));
-        select.value = preferred;
-        localStorage.setItem(YNAI_MODEL_KEY, preferred);
-    };
-
-    // ynai 模型列表拉取：30 秒超时；失败后退避（同 key 60 秒内不重发），
-    // 避免 reconcile 每 4 秒对故障端点连续打请求。
-    const YNAI_MODEL_FETCH_TIMEOUT_MS = 30_000;
-    const YNAI_MODEL_FAILURE_BACKOFF_MS = 60_000;
-    const fetchYnaiModels = async key => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), YNAI_MODEL_FETCH_TIMEOUT_MS);
-        try {
-            const response = await fetch('/api/rp-image-models', {
-                headers: { 'x-rp-image-token': key.trim() },
-                signal: controller.signal
-            });
-            const payload = await response.json().catch(() => null);
-            const models = payload && Array.isArray(payload.data) ? payload.data.filter(item => item?.id) : [];
-            if (!response.ok || !models.length) throw new Error(payload?.error || `HTTP ${response.status}`);
-            return models;
-        } catch (error) {
-            ynaiSelectState.failedAt = Date.now();
-            throw error;
-        } finally {
-            clearTimeout(timer);
-        }
-    };
-
-    const applyYnaiModelHijack = async (box, control, select, force = false) => {
-        const now = Date.now();
-        if (!force && now - ynaiSelectState.checkedAt < 4000) return;
-        ynaiSelectState.checkedAt = now;
-        const key = await readAuthorImageGenKey();
-        const ynai = isYnaiToken(key);
-        select.style.display = ynai ? '' : 'none';
-        control.style.display = ynai ? 'none' : '';
-        if (!ynai) return;
-        if (ynaiSelectState.key !== key) {
-            ynaiSelectState.loaded = false;
-            ynaiSelectState.failedAt = 0;
-            ynaiSelectState.models = readStoredYnaiModels();
-        }
-        if (ynaiSelectState.models) {
-            // 选项未变化时跳过重建：渲染会清空重挂 <option> 并写 localStorage，
-            // 不加守卫时每次 reconcile（≤4 秒节流）都触发一轮 mutation→reconcile 循环。
-            if (ynaiSelectState.renderedModels !== ynaiSelectState.models) {
-                renderYnaiSelectOptions(select, ynaiSelectState.models);
-                ynaiSelectState.renderedModels = ynaiSelectState.models;
+    external.register('image-request', imageTask);
+    external.register('character-deleted', async id => {
+        id = String(id);
+        retiredCharacterIds.add(id);
+        const state = imageStores.get(id);
+        if (state) state.retired = true;
+        await state?.loadPromise.catch(() => undefined);
+        imageStores.delete(id);
+        for (const [key, task] of imageSlotTasks) {
+            if (task.characterId === id) {
+                task.cards.clear();
+                imageSlotTasks.delete(key);
             }
         }
-        if (ynaiSelectState.loading || ynaiSelectState.loaded) return;
-        // 上次拉取失败后 60 秒内静默跳过（缓存列表仍可显示）。
-        if (ynaiSelectState.failedAt && now - ynaiSelectState.failedAt < YNAI_MODEL_FAILURE_BACKOFF_MS) return;
-        ynaiSelectState.key = key;
-        ynaiSelectState.loading = true;
-        try {
-            const models = await fetchYnaiModels(key);
-            ynaiSelectState.models = models;
-            ynaiSelectState.loaded = true;
-            ynaiSelectState.failedAt = 0;
-            ynaiSelectState.renderedModels = models;
-            try { localStorage.setItem(YNAI_MODEL_LIST_KEY, JSON.stringify(models)); } catch (_) { }
-            renderYnaiSelectOptions(select, models);
-        } catch (_) {
-            // 失败保持已有缓存/回退默认；failedAt 已记录，退避到期后 reconcile 重试。
-        } finally {
-            ynaiSelectState.loading = false;
-        }
-    };
-
-    const installYnaiModelHijack = () => {
-        const found = findImageModelControl();
-        if (!found) return;
-        const { box, control } = found;
-        let select = box.querySelector(`.${YNAI_SELECT_CLASS}`);
-        if (!select) {
-            select = document.createElement('select');
-            select.className = `${YNAI_SELECT_CLASS} settings-control`;
-            select.style.display = 'none';
-            control.after(select);
-            select.addEventListener('change', () => {
-                localStorage.setItem(YNAI_MODEL_KEY, String(select.value || ''));
-            });
-        }
-        applyYnaiModelHijack(box, control, select);
-    };
-
-    let scrollContainer = null;
-    let scrollButtonNode = null;
-    let scrollSentinelNode = null;
-    let scrollIntersectionObserver = null;
-    const installScrollButton = () => {
-        const cfg = chatConfig();
-        const input = document.querySelector(cfg.input || 'textarea.chat-input-scrollbar');
-        const inputRow = input?.closest(cfg.row || '.relative.w-full.flex.items-end');
-        const inputArea = input?.closest('.input-area-mobile')
-            || input?.closest(cfg.area || '.input-island')?.parentElement
-            || inputRow?.parentElement;
-        if (!inputRow || !inputArea) {
-            scrollIntersectionObserver?.disconnect();
-            scrollContainer = null;
-            scrollButtonNode = null;
-            scrollSentinelNode = null;
-            return;
-        }
-        let button = inputArea.querySelector('.magic-scroll-button') || inputRow.querySelector('.magic-scroll-button');
-        if (!button) {
-            button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'magic-scroll-button';
-            button.title = '滚动到底部';
-            button.setAttribute('aria-label', '滚动到底部');
-            button.innerHTML = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>';
-            button.addEventListener('click', () => {
-                scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'smooth' });
-            });
-        }
-        if (button.parentElement !== inputArea) inputArea.prepend(button);
-        const chatView = inputRow.closest('.chat-view-root');
-        const container = chatView?.querySelector(cfg.container || ':scope > .flex-1.overflow-y-auto') || null;
-        if (!container) {
-            button.classList.remove('is-visible');
-            return;
-        }
-        let sentinel = container.querySelector(':scope > .magic-scroll-sentinel');
-        if (!sentinel) {
-            sentinel = document.createElement('div');
-            sentinel.className = 'magic-scroll-sentinel';
-            sentinel.setAttribute('aria-hidden', 'true');
-            container.appendChild(sentinel);
-        }
-        if (scrollContainer === container && scrollButtonNode === button && scrollSentinelNode === sentinel) return;
-        scrollIntersectionObserver?.disconnect();
-        scrollContainer = container;
-        scrollButtonNode = button;
-        scrollSentinelNode = sentinel;
-        scrollIntersectionObserver = new IntersectionObserver(entries => {
-            const entry = entries[entries.length - 1];
-            scrollButtonNode?.classList.toggle('is-visible', !entry?.isIntersecting);
-        }, { root: scrollContainer, rootMargin: '0px 0px 120px 0px', threshold: 0 });
-        scrollIntersectionObserver.observe(sentinel);
-    };
-
-    let reconcileScheduled = false;
-    const uiObserver = new MutationObserver(() => {
-        if (reconcileScheduled) return;
-        reconcileScheduled = true;
-        requestAnimationFrame(() => {
-            reconcileScheduled = false;
-            reconcileUi();
-        });
+        await state?.writeQueue.catch(() => undefined);
     });
-    const observeUiTargets = fixedAnchor => {
-        uiObserver.disconnect();
-        const targets = new Set([
-            document.body,
-            document.getElementById('app'),
-            document.querySelector('.app-sidebar'),
-            document.querySelector(navigationConfig().content || '.app-navigation-content'),
-            document.querySelector('.app-main'),
-            // reconcileUi 已算过一次固定生图锚点（installFixedImageSetting 的
-            // 返回值），这里直接复用，不再第三次扫设置区 DOM。
-            fixedAnchor?.grid || null,
-            document.querySelector(chatConfig().input || 'textarea.chat-input-scrollbar')?.closest(chatConfig().row || '.relative.w-full.flex.items-end'),
-            scrollContainer
-        ].filter(Boolean));
-        targets.forEach(target => {
-            const subtree = target.classList?.contains('app-sidebar')
-                || target.matches?.('#app, .app-navigation-content') || false;
-            uiObserver.observe(target, { childList: true, subtree });
-        });
-    };
-        function reconcileUi() {
-        // 每步独立兜底：条件渲染的视图未挂载时单步可能拿不到锚点，
-        // 任何一步异常都不允许炸断后续安装与观察者挂载，否则视图
-        // 出现后无人补装（固定生图按钮永久消失正是这个链条断裂）。
-        let fixedAnchor = null;
-        const steps = [
-            () => installSidebarActions(),
-            () => installImageNav(),
-            () => { fixedAnchor = installFixedImageSetting(); },
-            () => installYnaiModelHijack(),
-            () => installScrollButton(),
-        ];
-        for (const step of steps) {
-            try { step(); } catch (_) { /* 单步失败不阻塞其余安装 */ }
-        }
-        observeUiTargets(fixedAnchor);
-    }
-    const start = () => {
-        installStyle();
-        loadUiAdapter().finally(reconcileUi);
-        document.addEventListener('click', event => {
-            if (!event.target.closest?.('.sidebar-nav-button, .advanced-nav-trigger, .app-nav-trigger')) return;
-            requestAnimationFrame(reconcileUi);
-            setTimeout(reconcileUi, 250);
-        }, true);
-    };
-
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
-    else start();
+    external.installUi();
 })();
