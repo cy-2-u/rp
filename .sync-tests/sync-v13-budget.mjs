@@ -32,7 +32,6 @@ const encoder = new TextEncoder();
 const keys = {
     manifest: `${PREFIX}/manifest.json`,
     migration: `${PREFIX}/migration-v13.done`,
-    lock: `${PREFIX}/maintenance/mutation-lock.json`,
     gc: `${PREFIX}/maintenance/gc-v1.json`,
     pack: checksum => `${PREFIX}/packs/${checksum}.bin`,
     page: (checksum, index) => `${PREFIX}/manifests/${checksum}/${String(index).padStart(4, '0')}.json`,
@@ -405,7 +404,7 @@ await benchmark({
 await benchmark({
     name: 'finalize-upload (verified root)',
     status: 200,
-    minSubrequests: 10,
+    minSubrequests: 5,
     setup(bucket) {
         bucket.reset();
         bucket.seed(keys.migration, migration);

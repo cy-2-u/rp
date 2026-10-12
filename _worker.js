@@ -20,19 +20,51 @@ const AUTHOR_FETCH_TIMEOUT_MS = 8 * 1000;
 const ADAPTER_FETCH_TIMEOUT_MS = 10 * 1000;
 let adapterLastGoodPersisted = null;
 
+async function readBoundedText(response, maxBytes, signal) {
+    const reader = response.body?.getReader();
+    if (!reader) return '';
+    const cancel = () => { void reader.cancel().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
+    let text = '';
+    let total = 0;
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    try {
+        const declaredLength = Number(response.headers?.get?.('content-length') ?? response.size);
+        if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+            throw new Error('Response exceeds size limit.');
+        }
+        while (true) {
+            if (signal?.aborted) throw new Error('Response read timed out.');
+            const { done, value } = await reader.read();
+            if (signal?.aborted) throw new Error('Response read timed out.');
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) throw new Error('Response exceeds size limit.');
+            text += decoder.decode(value, { stream: true });
+        }
+        return text + decoder.decode();
+    } catch (error) {
+        cancel();
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', cancel);
+        reader.releaseLock();
+    }
+}
+
 async function fetchAdapterText(url, timeoutMs) {
+    const signal = AbortSignal.timeout(timeoutMs);
     const response = await fetch(url, {
         headers: { accept: 'application/json,text/plain' },
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
         redirect: 'follow'
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const text = String(await response.text()).replace(/^\uFEFF/, '');
-    return text;
+    return (await readBoundedText(response, ADAPTER_MAX_BYTES, signal)).replace(/^\uFEFF/, '');
 }
 
 // 作者页面直连 GitHub Pages：任何状态码（含 304/4xx/5xx）原样交调用方处理，
-// 超时与网络错误直接抛出（与多源时代的整体失败语义一致，只是不再重试镜像）。
+// 超时与网络错误直接抛出，不重试——作者站是唯一上游，失败即交给调用方。
 async function fetchAuthorUpstream(path, init, search) {
     const rel = String(path || '').replace(/^\/+/, '');
     const url = new URL(rel, AUTHOR_BASE);
@@ -157,7 +189,7 @@ async function loadAdapterFresh(env, url) {
         if (url.protocol === 'file:') throw error;
         const lastGood = await env?.[R2_BINDING]?.get(ADAPTER_LASTGOOD_KEY);
         if (!lastGood) throw new Error('适配清单读取失败：没有可用配置。');
-        source = String(await lastGood.text()).replace(/^\uFEFF/, '');
+        source = (await readBoundedText(lastGood, ADAPTER_MAX_BYTES)).replace(/^\uFEFF/, '');
         adapter = parseAdapterSource(source);
         fromLastGood = true;
     }
@@ -185,7 +217,6 @@ const MANIFEST_PAGE_PREFIX = `${R2_PREFIX}/manifests`;
 const BLOOM_PREFIX = `${R2_PREFIX}/blooms`;
 const UPLOAD_SESSION_PREFIX = `${R2_PREFIX}/uploads`;
 const GC_STATE_KEY = `${R2_PREFIX}/maintenance/gc-v1.json`;
-const MUTATION_LOCK_KEY = `${R2_PREFIX}/maintenance/mutation-lock.json`;
 const MAX_PACK_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 const MAX_OBJECT_COUNT = 8192;
@@ -193,6 +224,7 @@ const MAX_PACK_ENTRIES = 512;
 const MANIFEST_PAGE_PACKS = 32;
 const MANIFEST_CHAIN_SEED = '0'.repeat(64);
 const GC_LIST_LIMIT = 256;
+const GC_PENDING_UPLOAD_LIMIT = 16;
 const GC_BLOOM_BYTES = 32 * 1024;
 const textEncoder = new TextEncoder();
 const SYNC_CONTROL_MAX_BYTES = 256 * 1024;
@@ -249,6 +281,7 @@ const IMAGE_UPSTREAM_STA1N = 'https://nai.sta1n.cn';
 const IMAGE_SIZE_PIXELS = { '竖图': '832x1216', '横图': '1216x832', '方图': '1024x1024' };
 const IMAGE_MODELS_PATH = '/api/rp-image-models';
 const IMAGE_MODELS_CACHE_TTL_MS = 30 * 1000;
+const IMAGE_MODELS_MAX_BYTES = 256 * 1024;
 const imageModelsCache = new Map();
 
 // ynai 中转端点只认云端适配清单（adapter.image.ynai）：中转站换域名/路径时改
@@ -665,10 +698,11 @@ async function handleImageModels(request, env) {
     const ynai = resolveYnaiConfig(await tryLoadAdapter(env));
     if (!ynai) return error('中转生图配置未加载，请检查适配清单。', 503);
     let response;
+    const signal = AbortSignal.timeout(15000);
     try {
         response = await fetch(ynai.base + ynai.modelsPath, {
             headers: { accept: 'application/json', authorization: `Bearer ${token}` },
-            signal: AbortSignal.timeout(15000)
+            signal
         });
     } catch (_) {
         return error('\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002', 503);
@@ -677,7 +711,12 @@ async function handleImageModels(request, env) {
         try { await response.body?.cancel(); } catch (_) { }
         return error(`\u6a21\u578b\u5217\u8868\u83b7\u53d6\u5931\u8d25\uff1aHTTP ${response.status}`, response.status);
     }
-    const text = await response.text();
+    let text;
+    try {
+        text = await readBoundedText(response, IMAGE_MODELS_MAX_BYTES, signal);
+    } catch (_) {
+        return error('\u6a21\u578b\u5217\u8868\u54cd\u5e94\u8d85\u8fc7\u5927\u5c0f\u4e0a\u9650\u6216\u65e0\u6cd5\u8bfb\u53d6\u3002', 502);
+    }
     let data;
     try {
         const parsed = JSON.parse(text);
@@ -2007,21 +2046,13 @@ async function readUploadManifestPage(bucket, session, pageIndex) {
 }
 
 async function handleBeginUpload(bucket, body) {
-    const lock = await acquireMutationLock(bucket);
-    if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
-    try {
-        return await beginUploadLocked(bucket, body, lock);
-    } finally {
-        await releaseMutationLock(bucket, lock);
-    }
+    return beginUpload(bucket, body);
 }
 
-async function beginUploadLocked(bucket, body, lock) {
+async function beginUpload(bucket, body) {
     const checksum = String(body.checksum || '').toLowerCase();
     const bloomChecksum = String(body.bloomChecksum || '').toLowerCase();
     const pageRoot = String(body.pageRoot || '').toLowerCase();
-    const baseVersion = Number(body.baseVersion);
-    const baseChecksum = String(body.baseChecksum || '');
     const totalBytes = Number(body.totalBytes);
     const packCount = Number(body.packCount);
     const entryCount = Number(body.entryCount);
@@ -2032,7 +2063,6 @@ async function beginUploadLocked(bucket, body, lock) {
     }
     if (!/^[a-f0-9]{64}$/.test(checksum) || !/^[a-f0-9]{64}$/.test(bloomChecksum)
         || !/^[a-f0-9]{64}$/.test(pageRoot)) return error('上传根校验码无效。', 409);
-    if (!Number.isInteger(baseVersion) || baseVersion < 0) return error('上传基础版本无效。', 409);
     if (!Number.isInteger(packCount) || packCount < 0 || packCount > MAX_OBJECT_COUNT
         || !Number.isInteger(entryCount) || entryCount < 0 || entryCount > MAX_OBJECT_COUNT * MAX_PACK_ENTRIES
         || !Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > MAX_TOTAL_BYTES
@@ -2054,14 +2084,8 @@ async function beginUploadLocked(bucket, body, lock) {
     }
     const currentVersion = Number(manifestState.manifest?.version || 0);
     const currentChecksum = String(manifestState.manifest?.checksum || '');
-    if (baseVersion !== currentVersion || baseChecksum !== currentChecksum) {
-        return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
-    }
 
-    const [gcGeneration, existing] = await Promise.all([
-        readGcGeneration(bucket),
-        readUploadSession(bucket, checksum)
-    ]);
+    const existing = await readUploadSession(bucket, checksum);
     if (existing) {
         const session = existing.session;
         if (session.bloomChecksum !== bloomChecksum || session.totalBytes !== totalBytes
@@ -2069,10 +2093,9 @@ async function beginUploadLocked(bucket, body, lock) {
             || session.pageCount !== pageCount || session.pageRoot !== pageRoot) {
             return error('同一快照存在不兼容的上传会话。', 409);
         }
-        if (session.baseVersion === baseVersion && session.baseChecksum === baseChecksum
-            && session.baseEtag === manifestState.etag && session.gcGeneration === gcGeneration) {
-            return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
-        }
+        // 上传内容和分页清单按 checksum 不可变；云端根在会话期间变化时，
+        // 仍然复用已上传的页面和分片，最后完成的快照自然覆盖当前存档。
+        return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
     }
 
     const now = Date.now();
@@ -2081,10 +2104,11 @@ async function beginUploadLocked(bucket, body, lock) {
         uploadId: checksum,
         checksum,
         bloomChecksum,
-        baseVersion,
-        baseChecksum,
+        // 保留基线字段用于读取旧会话，但它们不再阻止最后一次完整上传覆盖云端存档。
+        baseVersion: currentVersion,
+        baseChecksum: currentChecksum,
         baseEtag: manifestState.etag,
-        gcGeneration,
+        gcGeneration: '',
         totalBytes,
         packCount,
         entryCount,
@@ -2101,16 +2125,17 @@ async function beginUploadLocked(bucket, body, lock) {
         createdAt: now,
         updatedAt: now
     };
-    if (!await promoteMutationLock(bucket, lock)) return error('同步维护锁已被其他请求接管，请重试。', 409);
-    const stored = await mutateUnderLock(lock, () => bucket.put(createUploadSessionKey(checksum), JSON.stringify(session), {
+    const stored = await bucket.put(createUploadSessionKey(checksum), JSON.stringify(session), {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
-        onlyIf: existing ? { etagMatches: existing.etag } : { etagDoesNotMatch: '*' }
-    }));
+        onlyIf: { etagDoesNotMatch: '*' }
+    });
     if (!stored) {
         const raced = await readUploadSession(bucket, checksum);
         if (!raced) return error('上传会话创建失败。', 503);
-        if (raced.session.baseEtag !== manifestState.etag || raced.session.gcGeneration !== gcGeneration) {
-            return error('上传会话已变化，请重新检查后上传。', 409);
+        if (raced.session.bloomChecksum !== bloomChecksum || raced.session.totalBytes !== totalBytes
+            || raced.session.packCount !== packCount || raced.session.entryCount !== entryCount
+            || raced.session.pageCount !== pageCount || raced.session.pageRoot !== pageRoot) {
+            return error('同一快照存在不兼容的上传会话。', 409);
         }
         return json({ ok: true, committed: false, ...uploadSessionInfo(raced.session) });
     }
@@ -2164,7 +2189,7 @@ async function handleUploadManifestPage(bucket, body) {
     // Bloom 是内容寻址对象（checksum 即内容 SHA-256），同一次上传会话内
     // 恒定不变；页级只需要“包含关系”判定，按 checksum 在 isolate 内缓存
     // 已验字节，每个缺失页重提/多页上传不再重复 get + 32KiB hash。
-    // finalize 在持锁后仍按约束重新读取并校验 Bloom（readBloomFilter 不缓存）。
+    // finalize 在提交前仍按约束重新读取并校验 Bloom（readBloomFilter 不缓存）。
     let bloomCache = verifiedBloomCache.get(session.bloomChecksum);
     if (!bloomCache) {
         const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
@@ -2229,8 +2254,6 @@ async function handleUploadManifestPage(bucket, body) {
     });
     const missingPacks = checked.filter(Boolean);
     if (missingPacks.length) {
-        // 页面声明先于缺包响应持久化；nextPage 与 verified* 仍保持不变，
-        // upload-pack 才能在重试/丢响应时按当前页精确校验授权。
         return json({ ok: true, ...uploadSessionInfo(session), missingPacks });
     }
 
@@ -2246,11 +2269,30 @@ async function handleUploadManifestPage(bucket, body) {
         nextPart,
         updatedAt: Date.now()
     };
-    const updated = await bucket.put(createUploadSessionKey(uploadId), JSON.stringify(next), {
+    let updated = await bucket.put(createUploadSessionKey(uploadId), JSON.stringify(next), {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         onlyIf: stored.etag ? { etagMatches: stored.etag } : undefined
     });
-    if (!updated) return error('上传会话已被其他请求推进，请重试。', 409);
+    if (!updated) {
+        const raced = await readUploadSession(bucket, uploadId);
+        if (!raced) return error('上传会话推进结果未知，请稍后查询同步状态。', 503);
+        if (raced.session.nextPage > pageIndex) {
+            return json({ ok: true, ...uploadSessionInfo(raced.session), missingPacks: [] });
+        }
+        // 另一个请求可能只完成了同页声明的不可变写入，重读会话后
+        // 用新的 etag 再推进一次；普通同页竞态不应变成用户可见 409。
+        updated = await bucket.put(createUploadSessionKey(uploadId), JSON.stringify(next), {
+            httpMetadata: { contentType: 'application/json; charset=utf-8' },
+            onlyIf: raced.etag ? { etagMatches: raced.etag } : undefined
+        });
+        if (!updated) {
+            const latest = await readUploadSession(bucket, uploadId);
+            if (latest?.session.nextPage > pageIndex) {
+                return json({ ok: true, ...uploadSessionInfo(latest.session), missingPacks: [] });
+            }
+            return error('上传会话推进结果未知，请稍后查询同步状态。', 503);
+        }
+    }
     return json({ ok: true, ...uploadSessionInfo(next), missingPacks: [] });
 }
 
@@ -2269,64 +2311,6 @@ async function handleUploadBloom(request, bucket, url) {
     return new Response(null, { status: 204 });
 }
 
-async function acquireMutationLock(bucket) {
-    const now = Date.now();
-    const current = await readSmallJsonObject(bucket, MUTATION_LOCK_KEY, 4096);
-    const currentPhase = String(current?.value?.phase || 'preparing');
-    if (currentPhase === 'mutating') return null;
-    if (current && Number(current.value?.expiresAt || 0) > now) return null;
-    const owner = crypto.randomUUID();
-    const value = JSON.stringify({ owner, phase: 'preparing', expiresAt: now + 30_000 });
-    const saved = await bucket.put(MUTATION_LOCK_KEY, value, {
-        httpMetadata: { contentType: 'application/json; charset=utf-8' },
-        onlyIf: current?.etag ? { etagMatches: current.etag } : { etagDoesNotMatch: '*' }
-    });
-    if (!saved) return null;
-    const etag = saved.etag || null;
-    return etag ? { owner, etag, phase: 'preparing', preserve: false } : null;
-}
-
-async function promoteMutationLock(bucket, lock) {
-    if (!lock?.owner || !lock.etag || lock.phase === 'mutating') return Boolean(lock?.phase === 'mutating');
-    const saved = await mutateUnderLock(lock, () => bucket.put(MUTATION_LOCK_KEY, JSON.stringify({
-        owner: lock.owner,
-        phase: 'mutating',
-        expiresAt: 0
-    }), {
-        httpMetadata: { contentType: 'application/json; charset=utf-8' },
-        onlyIf: { etagMatches: lock.etag }
-    }));
-    if (!saved) return false;
-    if (!saved.etag) { lock.preserve = true; return false; }
-    lock.etag = saved.etag;
-    lock.phase = 'mutating';
-    lock.preserve = false;
-    return true;
-}
-
-async function mutateUnderLock(lock, action) {
-    try { return await action(); }
-    catch (error) {
-        // R2 拒绝响应不能证明写入未发生；临界区结果未知时禁止后继维护进入。
-        lock.preserve = true;
-        throw error;
-    }
-}
-
-async function releaseMutationLock(bucket, lock) {
-    if (!lock?.etag || lock.preserve) return;
-    try {
-        await bucket.put(MUTATION_LOCK_KEY, JSON.stringify({
-            owner: null,
-            phase: 'released',
-            expiresAt: 0
-        }), {
-            httpMetadata: { contentType: 'application/json; charset=utf-8' },
-            onlyIf: { etagMatches: lock.etag }
-        });
-    } catch (_) { }
-}
-
 async function handleFinalizeUpload(bucket, body) {
     const uploadId = String(body.uploadId || '').toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(uploadId)) return error('上传会话无效。', 400);
@@ -2342,33 +2326,22 @@ async function handleFinalizeUpload(bucket, body) {
         || session.verifiedEntries !== session.entryCount) {
         return error('上传清单尚未验证完成。', 409, uploadSessionInfo(session));
     }
-    const bloom = await bucket.head(createManifestBloomKey(session.bloomChecksum));
-    if (!bloom || Number(bloom.size) !== GC_BLOOM_BYTES) return error('上传过滤器尚未完成。', 409);
+    await readBloomFilter(bucket, session);
 
-    const lock = await acquireMutationLock(bucket);
-    if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
-    try {
-        // 三条读链互不依赖，仅依赖已持有的会话，并行取回。
-        const [manifestState, gcGeneration] = await Promise.all([
-            getManifestState(bucket),
-            readGcGeneration(bucket),
-            readBloomFilter(bucket, session)
-        ]);
+    // 根清单仍使用 R2 ETag 条件写，避免一次写入覆盖另一次尚未观察到的写入。
+    // 个人存档不把 CAS 失败暴露给用户，而是重新读取当前根并继续提交；
+    // 循环中最后成功写入的完整快照就是最后一次存档。
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const manifestState = await getManifestState(bucket);
+        if (manifestState.resetRequired) return error('同步存储尚未初始化。', 409, { resetRequired: true });
         if (manifestState.manifest?.checksum === session.checksum) {
+            try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
             return json({ ok: true, remote: buildRemoteInfo(manifestState.manifest) });
         }
         const currentVersion = Number(manifestState.manifest?.version || 0);
-        const currentChecksum = String(manifestState.manifest?.checksum || '');
-        if (currentVersion !== session.baseVersion || currentChecksum !== session.baseChecksum
-            || manifestState.etag !== session.baseEtag) {
-            return error('服务器同步版本已变化，请重新检查后上传。', 409, { currentVersion });
-        }
-        if (session.gcGeneration !== gcGeneration) {
-            return error('分片回收后需要重新核对本地清单。', 409, { recheckRequired: true });
-        }
         const root = {
             format: MANIFEST_ROOT_FORMAT,
-            version: session.baseVersion + 1,
+            version: currentVersion + 1,
             checksum: session.checksum,
             updatedAt: Date.now(),
             totalBytes: session.totalBytes,
@@ -2380,27 +2353,29 @@ async function handleFinalizeUpload(bucket, body) {
             snapshotFormat: STREAM_SNAPSHOT_FORMAT,
             schemaVersion: STREAM_SNAPSHOT_SCHEMA_VERSION
         };
-        if (!await promoteMutationLock(bucket, lock)) {
-            return error('同步维护锁已被其他请求接管，请重试。', 409);
-        }
         let committed;
         try {
             committed = await bucket.put(MANIFEST_KEY, JSON.stringify(root), {
                 httpMetadata: { contentType: 'application/json; charset=utf-8' },
-                onlyIf: session.baseEtag
-                    ? { etagMatches: session.baseEtag }
+                onlyIf: manifestState.etag
+                    ? { etagMatches: manifestState.etag }
                     : { etagDoesNotMatch: '*' }
             });
         } catch (error) {
-            lock.preserve = true;
+            // R2 响应丢失时先核对根清单；只有无法证明提交成功才上报未知结果。
+            const observed = await getManifest(bucket);
+            if (observed?.checksum === session.checksum) {
+                try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+                return json({ ok: true, remote: buildRemoteInfo(observed) });
+            }
             throw error;
         }
-        if (!committed) return error('服务器同步版本已变化，请重新检查后上传。', 409);
-        try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
-        return json({ ok: true, remote: buildRemoteInfo(root) });
-    } finally {
-        await releaseMutationLock(bucket, lock);
+        if (committed) {
+            try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+            return json({ ok: true, remote: buildRemoteInfo(root) });
+        }
     }
+    return error('同步提交未确认，请查看当前同步状态后再继续。', 503);
 }
 
 async function readBloomFilter(bucket, root) {
@@ -2415,64 +2390,109 @@ async function readBloomFilter(bucket, root) {
     return bytes;
 }
 
-async function readGcGeneration(bucket) {
-    const state = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
-    return typeof state?.value?.generation === 'string' ? state.value.generation : '';
+async function readPendingUploadBloom(bucket) {
+    const listed = await bucket.list({
+        prefix: `${UPLOAD_SESSION_PREFIX}/`,
+        limit: GC_PENDING_UPLOAD_LIMIT
+    });
+    // 无法枚举完整的未完成会话时宁可本轮不回收，避免把长时间断点续传
+    // 的分片误判为孤儿。个人存档通常只有一个会话，这个上限也保持请求有界。
+    if (listed.truncated) return { complete: false, bloom: null };
+    const protectedBloom = new Uint8Array(GC_BLOOM_BYTES);
+    for (const object of listed.objects || []) {
+        const key = typeof object?.key === 'string' ? object.key : '';
+        if (!key.startsWith(`${UPLOAD_SESSION_PREFIX}/`)) continue;
+        let stored;
+        try {
+            stored = await readSmallJsonObject(bucket, key, 16 * 1024);
+        } catch (_) {
+            return { complete: false, bloom: null };
+        }
+        const session = stored && normalizeUploadSession(stored.value);
+        if (!session) return { complete: false, bloom: null };
+        try {
+            const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
+            if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) {
+                return { complete: false, bloom: null };
+            }
+            const bytes = new Uint8Array(await new Response(bloomObject.body).arrayBuffer());
+            if (bytes.byteLength !== GC_BLOOM_BYTES
+                || await sha256Bytes(bytes) !== session.bloomChecksum) {
+                return { complete: false, bloom: null };
+            }
+            for (let index = 0; index < protectedBloom.length; index += 1) {
+                protectedBloom[index] |= bytes[index];
+            }
+        } catch (_) {
+            return { complete: false, bloom: null };
+        }
+    }
+    return { complete: true, bloom: protectedBloom };
 }
 
 async function handleGcStep(bucket) {
-    const lock = await acquireMutationLock(bucket);
-    if (!lock) return error('服务器正在完成另一项同步维护，请重试。', 409);
-    try {
-        const root = await getManifest(bucket);
-        if (!root) return json({ ok: true, done: true, deletedCount: 0 });
-        const bloom = await readBloomFilter(bucket, root);
-        const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
-        const cursor = typeof storedState?.value?.cursor === 'string' && storedState.value.cursor
-            ? storedState.value.cursor
-            : undefined;
-        const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
-        const nextCursor = getNextSyncCursor(page, cursor);
-        const cutoff = Date.now() - SYNC_PACK_GC_GRACE_MS;
-        const candidates = [];
-        for (const object of page.objects || []) {
-            const key = typeof object?.key === 'string' ? object.key : '';
-            const name = key.startsWith(`${PACK_PREFIX}/`) ? key.slice(PACK_PREFIX.length + 1) : '';
-            const match = name.match(/^([a-f0-9]{64})\.bin$/);
-            if (!match || bloomHasChecksum(bloom, match[1])) continue;
-            const uploaded = object.uploaded;
-            const uploadedAt = uploaded instanceof Date
-                ? uploaded.getTime()
-                : typeof uploaded === 'number'
-                    ? uploaded
-                    : Date.parse(String(uploaded || ''));
-            if (Number.isFinite(uploadedAt) && uploadedAt < cutoff) candidates.push(key);
-        }
-        const nextState = {
-            format: 'rp-sync-gc-state-v1',
-            rootChecksum: root.checksum,
-            generation: candidates.length ? crypto.randomUUID() : (storedState?.value?.generation || ''),
-            cursor: nextCursor,
-            updatedAt: Date.now()
-        };
-        if (!await promoteMutationLock(bucket, lock)) {
-            return error('同步维护锁已被其他请求接管，请重试。', 409);
-        }
-        await mutateUnderLock(lock, async () => {
-            if (candidates.length) {
-                await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, cursor }), {
-                    httpMetadata: { contentType: 'application/json; charset=utf-8' }
-                });
-                await bucket.delete(candidates);
-            }
-            await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
-                httpMetadata: { contentType: 'application/json; charset=utf-8' }
-            });
-        });
-        return json({ ok: true, done: !nextCursor, deletedCount: candidates.length });
-    } finally {
-        await releaseMutationLock(bucket, lock);
+    const root = await getManifest(bucket);
+    if (!root) return json({ ok: true, done: true, deletedCount: 0 });
+    const bloom = await readBloomFilter(bucket, root);
+    const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
+    const cursor = storedState?.value?.rootChecksum === root.checksum
+        && typeof storedState?.value?.cursor === 'string' && storedState.value.cursor
+        ? storedState.value.cursor
+        : undefined;
+    const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
+    const nextCursor = getNextSyncCursor(page, cursor);
+    const cutoff = Date.now() - SYNC_PACK_GC_GRACE_MS;
+    const candidates = [];
+    for (const object of page.objects || []) {
+        const key = typeof object?.key === 'string' ? object.key : '';
+        const name = key.startsWith(`${PACK_PREFIX}/`) ? key.slice(PACK_PREFIX.length + 1) : '';
+        const match = name.match(/^([a-f0-9]{64})\.bin$/);
+        if (!match || bloomHasChecksum(bloom, match[1])) continue;
+        const uploaded = object.uploaded;
+        const uploadedAt = uploaded instanceof Date
+            ? uploaded.getTime()
+            : typeof uploaded === 'number'
+                ? uploaded
+                : Date.parse(String(uploaded || ''));
+        if (Number.isFinite(uploadedAt) && uploadedAt < cutoff) candidates.push(key);
     }
+
+    // 先枚举待完成上传，再重新读取根清单。这个顺序覆盖两种交错：
+    // 若 finalize 尚未提交，会话 Bloom 保护其分片；若已提交，后一次根读取
+    // 会保护新根分片。两次检查都完成后才允许删除候选。
+    const pending = await readPendingUploadBloom(bucket);
+    const latestRoot = await getManifest(bucket);
+    let safeCandidates = [];
+    if (pending.complete && latestRoot) {
+        const latestBloom = latestRoot.checksum === root.checksum
+            ? bloom
+            : await readBloomFilter(bucket, latestRoot);
+        safeCandidates = candidates.filter(key => {
+            const checksum = key.slice(PACK_PREFIX.length + 1, -4);
+            return !bloomHasChecksum(latestBloom, checksum)
+                && !bloomHasChecksum(pending.bloom, checksum);
+        });
+    }
+
+    const nextState = {
+        format: 'rp-sync-gc-state-v1',
+        rootChecksum: latestRoot?.checksum || root.checksum,
+        generation: storedState?.value?.generation || '',
+        cursor: nextCursor,
+        updatedAt: Date.now()
+    };
+    if (safeCandidates.length) {
+        // 记录删除前的游标；删除响应丢失时重复执行仍然安全，内容寻址
+        // 对象的删除是幂等的，且下一轮会再次核对根和未完成会话。
+        await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, deleting: safeCandidates }), {
+            httpMetadata: { contentType: 'application/json; charset=utf-8' }
+        });
+        await bucket.delete(safeCandidates);
+    }
+    await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8' }
+    });
+    return json({ ok: true, done: !nextCursor, deletedCount: safeCandidates.length });
 }
 
 async function runConcurrent(items, limit, worker) {

@@ -625,6 +625,35 @@ test('adapter load fails cleanly when the direct source returns non-JSON and no 
     assert.equal(await context.tryLoadAdapter({ RP_SYNC_R2: store }), null, '直连源非 JSON 且无兜底时适配加载失败且不抛出');
     assert.equal(lastGoodReads, 1, '失败后已尝试 R2 last-good');
 });
+test('adapter source without content-length is bounded and cancelled', async () => {
+    const stream = streamFixture(0);
+    const { context } = load({ fetch: async () => new Response(stream.body) });
+    const adapter = await context.tryLoadAdapter({ RP_SYNC_R2: { async get() { return null; } } });
+    assert.equal(adapter, null);
+    assert.equal(stream.cancelled, true, 'oversized adapter source is cancelled');
+    assert.ok(stream.pulled <= 1, `read ${stream.pulled} chunks`);
+});
+test('oversized R2 adapter last-good is bounded and cancelled', async () => {
+    const stream = streamFixture(0);
+    const { context } = load({ fetch: async () => new Response('<html>invalid</html>') });
+    await assert.rejects(context.loadAdapter({ RP_SYNC_R2: { async get() { return new Response(stream.body); } } }));
+    assert.equal(stream.cancelled, true, 'oversized R2 last-good is cancelled');
+    assert.ok(stream.pulled <= 1, `read ${stream.pulled} chunks`);
+});
+test('model list response without content-length is bounded and cancelled', async () => {
+    const stream = streamFixture(0);
+    const { context } = load({ fetch: async url => {
+        if (String(url).startsWith('file:')) return new Response(bundle(YNAI_ADAPTER));
+        return new Response(stream.body);
+    } });
+    const response = await context.handleImageModels(
+        new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }),
+        { RP_SYNC_R2: bucket(), RPHUB_ADAPTER_URL: 'file:///adapter.json' }
+    );
+    assert.equal(response.status, 502);
+    assert.equal(stream.cancelled, true, 'oversized model list response is cancelled');
+    assert.ok(stream.pulled <= 1, `read ${stream.pulled} chunks`);
+});
 test('adapter load succeeds against the direct GitHub source only', async () => {
     const valid = JSON.stringify({ schema: 2, id: 'rp-hub' });
     const contacted = [];

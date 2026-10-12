@@ -13,7 +13,6 @@ const BLOOM_BYTES = 32 * 1024;
 const PREFIX = 'rp-sync/main';
 const MANIFEST_KEY = `${PREFIX}/manifest.json`;
 const MIGRATION_KEY = `${PREFIX}/migration-v13.done`;
-const LOCK_KEY = `${PREFIX}/maintenance/mutation-lock.json`;
 const encoder = new TextEncoder();
 
 async function sha256Bytes(bytes) {
@@ -359,7 +358,7 @@ async function testResumablePagedUploadAndPull(worker) {
     };
     const raced = await Promise.all([submitPage(api, snapshot, 0), submitPage(api, snapshot, 0)]);
     bucket.hooks.beforePut = null;
-    assert.deepEqual(raced.map(item => item.response.status).sort(), [200, 409], 'only one concurrent page CAS may advance');
+    assert.deepEqual(raced.map(item => item.response.status).sort(), [200, 200], 'concurrent same-page retries are idempotent');
 
     const resumed = await begin(api, snapshot);
     assert.equal(resumed.response.status, 200);
@@ -383,7 +382,8 @@ async function testResumablePagedUploadAndPull(worker) {
     const finalizing = api.json({ action: 'finalize-upload', uploadId: snapshot.checksum });
     await entered;
     const blockedGc = await api.json({ action: 'gc-step' });
-    assert.equal(blockedGc.response.status, 409, 'GC must not run while finalize owns the mutation lock');
+    assert.equal(blockedGc.response.status, 200, 'GC may run while finalize is in progress');
+    assert.equal(blockedGc.body.deletedCount, 0, 'pending finalize packs must remain protected');
     releaseManifest();
     const finalized = await finalizing;
     bucket.hooks.beforePut = null;
@@ -505,20 +505,22 @@ async function testConcurrentFinalizeAndRootCas(worker) {
         const api = makeApi(worker, bucket);
         await initialize(api);
         const snapshot = await buildSnapshot(0, { prefix: 'finalize-race' });
-        await begin(api, snapshot);
-        await uploadBloom(api, snapshot);
-        const lockGate = createBarrier(2);
+        await prepareSnapshot(api, snapshot);
+        const rootGate = createBarrier(2);
         bucket.hooks.beforePut = async ({ key, options }) => {
-            if (key === LOCK_KEY && options.onlyIf) await lockGate();
+            if (key === MANIFEST_KEY && options.onlyIf) await rootGate();
         };
         const results = await Promise.all([
             api.json({ action: 'finalize-upload', uploadId: snapshot.checksum }),
             api.json({ action: 'finalize-upload', uploadId: snapshot.checksum })
         ]);
         bucket.hooks.beforePut = null;
-        assert.deepEqual(results.map(item => item.response.status).sort(), [200, 409]);
+        assert.deepEqual(results.map(item => item.response.status).sort(), [200, 200],
+            'same snapshot finalize is idempotent under a root CAS race');
+        const root = JSON.parse(Buffer.from(bucket.objects.get(MANIFEST_KEY).bytes).toString('utf8'));
+        assert.equal(root.checksum, snapshot.checksum);
         const retry = await api.json({ action: 'finalize-upload', uploadId: snapshot.checksum });
-        assert.equal(retry.response.status, 200, 'a lost successful finalize response must be retryable');
+        assert.equal(retry.response.status, 200, 'a repeated finalize must be idempotent');
     }
 
     {
@@ -530,18 +532,12 @@ async function testConcurrentFinalizeAndRootCas(worker) {
         await prepareSnapshot(api, left);
         await prepareSnapshot(api, right);
         assert.equal((await api.post({ action: 'finalize-upload', uploadId: left.checksum })).status, 200);
-        const stale = await api.post({ action: 'finalize-upload', uploadId: right.checksum });
-        assert.equal(stale.status, 409, 'a second session from the same base must lose the root CAS');
-        const rootObject = JSON.parse(Buffer.from(bucket.objects.get(MANIFEST_KEY).bytes).toString('utf8'));
-        assert.equal(rootObject.checksum, left.checksum);
-        const restarted = await begin(api, right, rootObject.version, rootObject.checksum);
-        assert.equal(restarted.response.status, 200, 'the same snapshot must rebase instead of getting stuck in its old session');
-        assert.equal(restarted.body.nextPage, 0);
-        assert.deepEqual((await submitPage(api, right, 0)).body.missingPacks, [], 'already uploaded packs are reused');
         const replaced = await api.json({ action: 'finalize-upload', uploadId: right.checksum });
-        assert.equal(replaced.response.status, 200);
+        assert.equal(replaced.response.status, 200, 'a later complete snapshot must replace the old root');
         assert.equal(replaced.body.remote.checksum, right.checksum);
-        assert.equal(replaced.body.remote.version, rootObject.version + 1);
+        const rootObject = JSON.parse(Buffer.from(bucket.objects.get(MANIFEST_KEY).bytes).toString('utf8'));
+        assert.equal(rootObject.checksum, right.checksum);
+        assert.equal(rootObject.version, 2, 'last-wins commit increments the observed root version');
     }
 }
 
@@ -556,18 +552,10 @@ async function testGcInvalidatesPendingUpload(worker) {
     await seedPack(bucket, pending.packs[0], new Date(Date.now() - 48 * 60 * 60 * 1000));
     await prepareSnapshot(api, pending, 1, committed.checksum);
     const collected = await api.json({ action: 'gc-step' });
-    assert.equal(collected.body.deletedCount, 1);
-    const rejected = await api.json({ action: 'finalize-upload', uploadId: pending.checksum });
-    assert.equal(rejected.response.status, 409, 'GC must invalidate the old existence checks');
-    assert.equal(rejected.body.recheckRequired, true);
-    const latest = (await api.json({ action: 'prepare-upload', schemaVersion: SCHEMA })).body.remote;
-    const restarted = await begin(api, pending, latest.version, latest.checksum);
-    assert.equal(restarted.response.status, 200);
-    assert.equal(restarted.body.nextPage, 0);
-    assert.deepEqual((await submitPage(api, pending, 0)).body.missingPacks, [pending.packs[0].checksum]);
-    await finishPages(api, pending);
+    assert.equal(collected.response.status, 200);
+    assert.equal(collected.body.deletedCount, 0, 'GC must retain packs referenced by a pending upload');
     const final = await api.json({ action: 'finalize-upload', uploadId: pending.checksum });
-    assert.equal(final.response.status, 200);
+    assert.equal(final.response.status, 200, 'a pending upload remains finalizable after GC');
     const pack = pending.packs[0];
     const pulled = await api.post({ action: 'pull-pack', version: final.body.remote.version,
         pageIndex: 0, packIndex: 0, checksum: pack.checksum, length: pack.length, entryCount: pack.entryCount });

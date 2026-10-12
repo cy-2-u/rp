@@ -47,19 +47,15 @@
             location.reload();
         }
     };
-    const checkInterruptedRestore = async () => {
+    const checkInterruptedRestore = () => {
         if (RESTORE_PAGE) return;
         checkRestoreState();
-        const active = localStorage.getItem(RESTORE_ACTIVE_KEY);
-        if (!active || !navigator.locks?.query) return;
-        const locks = await navigator.locks.query();
-        // 裸字符串比较 bootstrap.js CONFIG.lockName 持有的同一把锁，
-        // 改必须与 bootstrap 双侧同步。
-        if (localStorage.getItem(RESTORE_ACTIVE_KEY) !== active
-            || locks.held.some(lock => lock.name === 'rp-hub-r2-sync-v1')) return;
+        if (!localStorage.getItem(RESTORE_ACTIVE_KEY)) return;
         showRestorePause();
         const overlay = document.getElementById('rp-sync-restore-pause');
-        if (overlay) overlay.innerHTML = '上次恢复已中断，请重新从云端恢复。<a href="/sync-restore" style="color:#2563eb">重新恢复</a>';
+        if (overlay) {
+            overlay.innerHTML = '正在从云端恢复，完成后此页面会自动刷新。<a href="/sync-restore" style="color:#2563eb;margin-left:8px">打开恢复页</a>';
+        }
     };
     window.addEventListener('storage', event => {
         if (event.key === RESTORE_ACTIVE_KEY || event.key === RESTORE_EPOCH_KEY) checkRestoreState();

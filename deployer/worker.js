@@ -139,6 +139,7 @@ const PASSWORD_VAR = 'RP_SYNC_PASSWORD';
 const API = 'https://api.cloudflare.com/client/v4';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_REPO}/${REPO_BRANCH}/${REPO_DIR}/`;
 const FRONTEND_URL = 'https://cy-2-u.github.io/rp/';
+const REQUEST_MAX_BYTES = 4096;
 
 function json(data, status, origin) {
   const headers = { 'Content-Type': 'application/json; charset=utf-8' };
@@ -147,6 +148,49 @@ function json(data, status, origin) {
     headers['Vary'] = 'Origin';
   }
   return new Response(JSON.stringify(data), { status: status || 200, headers });
+}
+
+async function readJsonBody(request) {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > REQUEST_MAX_BYTES) {
+    try { await request.body?.cancel(); } catch (_) { }
+    const error = new Error('请求体过大。');
+    error.status = 413;
+    throw error;
+  }
+  const reader = request.body?.getReader();
+  if (!reader) throw new Error('请求格式错误。');
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let text = '';
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > REQUEST_MAX_BYTES) {
+        const error = new Error('请求体过大。');
+        error.status = 413;
+        throw error;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } catch (error) {
+    try { await reader.cancel(); } catch (_) { }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function requestBodyError(error, origin) {
+  const tooLarge = error?.status === 413;
+  return json(
+    { ok: false, error: tooLarge ? '请求体过大。' : '请求格式错误。' },
+    tooLarge ? 413 : 200,
+    origin
+  );
 }
 
 function bytesToBase64(bytes) {
@@ -328,7 +372,7 @@ function rateLimited(ip) {
 
 async function handleDeploy(request, origin) {
   let body;
-  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  try { body = await readJsonBody(request); } catch (e) { return requestBodyError(e, origin); }
   const token = String((body && body.token) || '').trim();
   const password = String((body && body.password) || '');
   const projectName = sanitizeProjectName(body && body.projectName);
@@ -434,7 +478,7 @@ async function handleDeploy(request, origin) {
 
 async function handleProjectConfig(request, origin) {
   let body;
-  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  try { body = await readJsonBody(request); } catch (e) { return requestBodyError(e, origin); }
   const token = String((body && body.token) || '').trim();
   const projectName = sanitizeProjectName(body && body.projectName);
   if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
@@ -453,7 +497,7 @@ async function handleProjectConfig(request, origin) {
 
 async function handleProjects(request, origin) {
   let body;
-  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  try { body = await readJsonBody(request); } catch (e) { return requestBodyError(e, origin); }
   const token = String((body && body.token) || '').trim();
   if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
 
@@ -477,7 +521,7 @@ async function handleProjects(request, origin) {
 
 async function handleUpdate(request, origin) {
   let body;
-  try { body = await request.json(); } catch (e) { return json({ ok: false, error: '请求格式错误。' }, 200, origin); }
+  try { body = await readJsonBody(request); } catch (e) { return requestBodyError(e, origin); }
   const token = String((body && body.token) || '').trim();
   const projectName = sanitizeProjectName(body && body.projectName);
   if (!token) return json({ ok: false, error: '请填写令牌。' }, 200, origin);
@@ -531,8 +575,6 @@ export default {
     if (request.method === 'POST' && url.pathname === '/api/deploy') {
       const ip = request.headers.get('cf-connecting-ip') || 'unknown';
       if (rateLimited(ip)) return json({ ok: false, error: '请求太频繁，稍后再试。' }, 429, origin);
-      const len = Number(request.headers.get('content-length') || 0);
-      if (len > 4096) return json({ ok: false, error: '请求体过大。' }, 413, origin);
       try {
         return await handleDeploy(request, origin);
       } catch (e) {
@@ -543,8 +585,6 @@ export default {
     if (request.method === 'POST' && (url.pathname === '/api/projects' || url.pathname === '/api/project-check' || url.pathname === '/api/update')) {
       const ip = request.headers.get('cf-connecting-ip') || 'unknown';
       if (rateLimited(ip)) return json({ ok: false, error: '请求太频繁，稍后再试。' }, 429, origin);
-      const len = Number(request.headers.get('content-length') || 0);
-      if (len > 4096) return json({ ok: false, error: '请求体过大。' }, 413, origin);
       try {
         const path = url.pathname;
         return path === '/api/projects'

@@ -179,6 +179,51 @@ globalThis.fetch = async (url, init = {}) => {
   return jsonResponse({ success: false, errors: [{ message: 'unexpected mock call: ' + method + ' ' + short }] }, 500);
 };
 
+async function oversizedBodyRequest(path, ip, contentLength) {
+  let cancelled = false;
+  const body = new ReadableStream({
+    pull(controller) { controller.enqueue(new Uint8Array(4097)); },
+    cancel() { cancelled = true; }
+  }, { highWaterMark: 0 });
+  const headers = { 'Content-Type': 'application/json', 'cf-connecting-ip': ip };
+  if (contentLength) headers['Content-Length'] = contentLength;
+  const request = new Request('http://deployer.local' + path, {
+    method: 'POST', headers, body, duplex: 'half'
+  });
+  if (!contentLength) ok(request.headers.get('content-length') === null, `${path}: test request omits Content-Length`);
+  const response = await worker.fetch(request);
+  const data = await response.json();
+  ok(response.status === 413 && /请求体过大/.test(data.error), `${path}: oversized streamed JSON is rejected`);
+  ok(cancelled, `${path}: oversized request stream is cancelled`);
+  ok(calls.length === 0, `${path}: oversized body rejected before external API calls`);
+}
+
+// ---------- 请求体上限覆盖无 Content-Length 的流式请求 ----------
+for (const [path, ip] of [
+  ['/api/deploy', 'ip-size-deploy'],
+  ['/api/projects', 'ip-size-projects'],
+  ['/api/project-check', 'ip-size-project-check'],
+  ['/api/update', 'ip-size-update']
+]) {
+  calls = []; saved = {}; mock = {}; uploaded = new Set();
+  await oversizedBodyRequest(path, ip);
+  calls = []; saved = {}; mock = {}; uploaded = new Set();
+  await oversizedBodyRequest(path, `${ip}-declared`, '4097');
+}
+{
+  const baseBody = JSON.stringify({ token: '', padding: '' });
+  const exactSizeBody = JSON.stringify({ token: '', padding: 'a'.repeat(4096 - new TextEncoder().encode(baseBody).byteLength) });
+  ok(new TextEncoder().encode(exactSizeBody).byteLength === 4096, 'boundary fixture is exactly 4096 bytes');
+  const request = new Request('http://deployer.local/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': 'ip-size-boundary' },
+    body: exactSizeBody
+  });
+  const response = await worker.fetch(request);
+  const data = await response.json();
+  ok(response.status !== 413 && /令牌/.test(data.error), 'request at the 4096-byte boundary is accepted by the size guard');
+}
+
 async function deploy(body, ip, path = '/api/deploy', mockInit) {
   calls = []; saved = {}; mock = mockInit || {}; uploaded = new Set();
   const req = new Request('http://deployer.local' + path, {

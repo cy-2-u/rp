@@ -742,9 +742,6 @@ function createAutoSaveScheduler(options = {}) {
     const CONFIG = {
         apiEndpoint: '/api/rp-sync',
         passwordStorageKey: 'rp_hub_sync_password_v1',
-        // 跨 tab 同步互斥锁名：dirty-tracker.js 的 checkInterruptedRestore
-        // 以裸字符串比较同一把锁，改必须双侧同步。
-        lockName: 'rp-hub-r2-sync-v1',
         autoSaveEnabledKey: 'rp_hub_sync_auto_save_enabled_v1',
         autoSaveMinutesKey: 'rp_hub_sync_auto_save_minutes_v1',
         lastSyncKey: 'rp_hub_sync_last_result_v1',
@@ -893,11 +890,6 @@ function createAutoSaveScheduler(options = {}) {
         };
     }
 
-    async function withCrossTabSyncLock(task) {
-        if (!navigator.locks?.request) return task();
-        return navigator.locks.request(CONFIG.lockName, { mode: 'exclusive' }, task);
-    }
-
     async function runSyncOperation(task, options = {}) {
         const automatic = Boolean(options.automatic);
         if (state.operationPending || state.syncing) return { skipped: true, reason: 'syncing' };
@@ -908,12 +900,10 @@ function createAutoSaveScheduler(options = {}) {
         autoSaveScheduler?.pause();
         setActionButtonsDisabled(true);
         try {
-            return await withCrossTabSyncLock(async () => {
-                if (automatic && (!isAutoSaveEnabled() || !isAutoSavePageActive())) {
-                    return { skipped: true, reason: 'inactive' };
-                }
-                return task();
-            });
+            if (automatic && (!isAutoSaveEnabled() || !isAutoSavePageActive())) {
+                return { skipped: true, reason: 'inactive' };
+            }
+            return await task();
         } finally {
             state.operationPending = false;
             setActionButtonsDisabled(false);
@@ -2856,33 +2846,20 @@ function createAutoSaveScheduler(options = {}) {
     let gcMaintenance = null;
     function scheduleGcMaintenance() {
         if (gcMaintenance) return;
-        gcMaintenance = wait(0).then(() => withCrossTabSyncLock(runGcMaintenance))
+        gcMaintenance = wait(0).then(runGcMaintenance)
             .catch(() => {}).finally(() => { gcMaintenance = null; });
     }
 
     async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
-        let currentBaseVersion = baseVersion;
-        let currentBaseChecksum = baseChecksum;
         for (let attempt = 0; ; attempt += 1) {
             try {
-                return await uploadPagedSnapshotAttempt(
-                    snapshot,
-                    currentBaseVersion,
-                    currentBaseChecksum,
-                    progress
-                );
+                return await uploadPagedSnapshotAttempt(snapshot, baseVersion, baseChecksum, progress);
             } catch (error) {
-                if (!error.response?.recheckRequired || attempt >= 2) throw error;
-                updateProgress(progress.uploadStart, '正在重新核对分片清单…');
-                const latest = await postSync({
-                    action: 'prepare-upload',
-                    schemaVersion: SNAPSHOT_SCHEMA_VERSION
-                }, { timeoutMs: CONFIG.commitTimeoutMs });
-                if (latest.resetRequired) {
-                    throw new Error('同步存储尚未初始化，请重试。');
-                }
-                currentBaseVersion = Number(latest.remote?.version || 0);
-                currentBaseChecksum = String(latest.remote?.checksum || '');
+                // 根切换竞争由 Worker 在服务端重读 ETag 并收敛；客户端只对
+                // 无法确认写入结果的 5xx 做有限重试，同一 checksum 会从已有
+                // 会话和内容寻址分片继续，不把个人存档变成“请重试”的冲突门。
+                if (Number(error?.status || 0) < 500 || attempt >= 2) throw error;
+                updateProgress(progress.uploadStart, '正在确认同步结果…');
             }
         }
     }

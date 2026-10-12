@@ -162,30 +162,22 @@ for (const stage of ['dirty', 'state']) {
     console.log('PASS restore record batches honor the byte threshold');
 }
 
-// GC recheck retries must refresh the remote base before rebuilding the same
-// local snapshot. Ordinary CAS conflicts remain one-shot errors.
+// Root CAS races are absorbed by the Worker; the client retries only an
+// unknown server result and keeps the same local snapshot/base.
 {
     const start = source.indexOf('    async function resumePagedUpload(');
     const end = source.indexOf('    async function uploadPagedSnapshotAttempt(', start);
     assert.ok(start >= 0 && end > start, 'resumePagedUpload source boundaries');
     const resumeSource = source.slice(start, end);
     const attempts = [];
-    let prepareCalls = 0;
     const context = vm.createContext({
         CONFIG: { commitTimeoutMs: 10 },
         SNAPSHOT_SCHEMA_VERSION: 13,
         updateProgress() { },
-        postSync: async payload => {
-            assert.equal(payload.action, 'prepare-upload');
-            prepareCalls += 1;
-            return { remote: { version: 9, checksum: 'fresh-base' } };
-        },
         uploadPagedSnapshotAttempt: async (_snapshot, version, checksum) => {
             attempts.push([version, checksum]);
             if (attempts.length === 1) {
-                throw Object.assign(new Error('GC changed'), {
-                    response: { recheckRequired: true }, status: 409
-                });
+                throw Object.assign(new Error('unknown result'), { status: 503 });
             }
             return { checksum: 'snapshot' };
         }
@@ -193,29 +185,27 @@ for (const stage of ['dirty', 'state']) {
     vm.runInContext(resumeSource, context);
     const result = await context.resumePagedUpload({ checksum: 'snapshot' }, 3, 'old-base', { uploadStart: 1 });
     assert.equal(result.checksum, 'snapshot');
-    assert.deepEqual(attempts, [[3, 'old-base'], [9, 'fresh-base']]);
-    assert.equal(prepareCalls, 1);
+    assert.deepEqual(attempts, [[3, 'old-base'], [3, 'old-base']]);
 
-    const ordinaryAttempts = [];
-    const ordinary = vm.createContext({
+    const conflictAttempts = [];
+    const conflict = vm.createContext({
         CONFIG: { commitTimeoutMs: 10 },
         SNAPSHOT_SCHEMA_VERSION: 13,
         updateProgress() { },
-        postSync: async () => { throw new Error('unexpected prepare'); },
-        uploadPagedSnapshotAttempt: async () => {
-            ordinaryAttempts.push(true);
-            throw Object.assign(new Error('root CAS conflict'), {
-                response: { error: 'version changed' }, status: 409
+        uploadPagedSnapshotAttempt: async (_snapshot, version, checksum) => {
+            conflictAttempts.push([version, checksum]);
+            throw Object.assign(new Error('validation failure'), {
+                response: { error: 'invalid snapshot' }, status: 409
             });
         }
     });
-    vm.runInContext(resumeSource, ordinary);
+    vm.runInContext(resumeSource, conflict);
     await assert.rejects(
-        ordinary.resumePagedUpload({ checksum: 'snapshot' }, 3, 'old-base', { uploadStart: 1 }),
-        /root CAS conflict/
+        conflict.resumePagedUpload({ checksum: 'snapshot' }, 3, 'old-base', { uploadStart: 1 }),
+        /validation failure/
     );
-    assert.equal(ordinaryAttempts.length, 1, 'ordinary CAS conflicts must not auto-merge or retry');
-    console.log('PASS client GC recheck refreshes the base, while ordinary CAS remains one-shot');
+    assert.deepEqual(conflictAttempts, [[3, 'old-base']], 'validation 409 must not be retried as a base conflict');
+    console.log('PASS client retries unknown results without recheck/base-conflict coupling');
 }
 
 // Autosave scheduler is a foreground-only one-shot timer. Keep this test
@@ -318,8 +308,7 @@ for (const stage of ['dirty', 'state']) {
         'rp_sync_intent_v2:',
         'rp_sync_tracking_epoch_v2',
         'rp_sync_restore_active',
-        'rp_sync_restore_epoch',
-        'rp-hub-r2-sync-v1'
+        'rp_sync_restore_epoch'
     ];
     const declares = (text, literal) => text.includes(`'${literal}'`) || text.includes(`"${literal}"`);
     for (const literal of sharedLiterals) {

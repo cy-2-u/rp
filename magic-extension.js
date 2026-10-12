@@ -317,7 +317,16 @@
             notice.innerHTML = '<span>加载失败</span><button type="button">重新加载</button>';
             notice.querySelector('button').addEventListener('click', event => {
                 event.stopPropagation();
-                const retryUrl = new URL(image.currentSrc || image.src, location.origin);
+                // 与上面 error 回调的自动重试同一道校验：只重发本站代理地址。
+                // currentSrc 可能已被作者页面换成带 token 的站外绝对 URL，
+                // 无条件改写并重发会把 token 带到第三方 origin。
+                let retryUrl;
+                try {
+                    retryUrl = new URL(image.currentSrc || image.src || '', location.origin);
+                } catch (_) {
+                    return;
+                }
+                if (retryUrl.origin !== location.origin || retryUrl.pathname !== '/api/rp-image') return;
                 retryUrl.searchParams.set('_rph_retry', String(Date.now()));
                 image.dataset.rphRetry = '1';
                 notice.querySelector('span').textContent = '加载中…';

@@ -34,7 +34,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 8. 开屏访问门禁：主页与恢复页由 bootstrap.js 在站点打开时先静默做一次同步密码校验（`auth-status` 单次请求，`retryCount: 0`、8 秒超时）。**已保存密码（`rp_hub_sync_password_v1`）验证通过时全程不出现任何登录 UI**，照常进入站点；只有云端要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录锁页（z-index 10000，面板与锁页样式均由 bootstrap 自注入，不依赖外部样式表加载时序；body 为 null 时挂到 documentElement；浅色纯 CSS 极光背景 + 玻璃卡片，徽标 + 眼睛明文切换 + 抖动错误 + spinner + `prefers-reduced-motion` 降级）。锁页表单提交正确密码后保存到该 key，同步弹窗与图片管理页照常复用（图片管理页本就自动用该 key 登录），正常使用中不再弹出密码框（原 401 兜底密码弹窗保留，用于会话中途改密）。云端不可达直接放行（首屏静默路径网络失败即放行；锁页表单态的提交失败显示错误并可重试，刷新页面同样回到静默放行路径）：门禁只是体验层，真正的数据防护始终由 Worker 端 401 承担，不得因网络故障把整站锁死。恢复页在门禁放行（静默或表单解锁）后才开始拉取；测试与代码不得依赖 body children 顺序定位同步面板。
 
-9. bootstrap.js 与 dirty-tracker.js 的协议常量（journal/intent/epoch/restore 标记、RESTORE_PAGE 判定、`rp-hub-r2-sync-v1` 这把 Web Locks 锁名）是人肉双写副本，两侧均有互指注释；audit-regressions.mjs 的静态断言逐字比较两侧声明，任何一侧改名必须双侧同步。原第二把锁 `rp-hub-app-writers-v1`（业务页共享写租约 + 恢复排他锁）已于 2026-10 移除：真实浏览器中同页面持共享租约再请求排他会互相卡死，恢复流程反复误报"请关闭其他 RP Hub 页面"。恢复期间的跨标签页写保护改由 RESTORE_ACTIVE_KEY storage 信号（其他标签页暂停写入并显示遮罩）+ 恢复标签页自身的 write barrier（等待在途 IndexedDB 写事务收尾）承担，不再依赖 Web Locks 排他等待；不得在无重设计的情况下把这对共享/排他锁加回来。
+9. bootstrap.js 与 dirty-tracker.js 的协议常量（journal/intent/epoch/restore 标记、RESTORE_PAGE 判定）是人肉双写副本，两侧均有互指注释；audit-regressions.mjs 的静态断言逐字比较两侧声明，任何一侧改名必须双侧同步。同步请求不再使用跨标签页 Web Locks 排队；当前页面的 `operationPending/syncing` 只负责防重复点击。恢复期间的跨标签页写保护由 RESTORE_ACTIVE_KEY storage 信号（其他标签页暂停写入并显示遮罩）+ 恢复标签页自身的 IndexedDB write barrier（等待在途写事务收尾）承担。
 
 二、同步协议硬约束
 
@@ -51,8 +51,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - `rp-sync/main/packs/<sha256>.bin`
    - `rp-sync/main/blooms/<sha256>.bin`
    - `rp-sync/main/uploads/<root-checksum>.json`
-   - `rp-sync/main/maintenance/gc-v1.json`（游标与 generation）
-   - `rp-sync/main/maintenance/mutation-lock.json`
+   - `rp-sync/main/maintenance/gc-v1.json`（GC 游标与删除前复核状态）
    - `rp-sync/main/migration-v13.done`
 
 3. 初始化是非破坏式的。缺少 v13 标记时只写初始化标记并记录旧 manifest etag；不得批量删除 `rp-sync/main/`，不得触碰 `rp-images/`。
@@ -64,7 +63,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    `prepare-upload` → 可选 `initialize-storage` → `begin-upload` → `upload-bloom` →
    `upload-manifest-page` → 缺失时逐包 `upload-pack` → 重交页面 → `finalize-upload` → 串行 `gc-step`。
 
-6. 同一个 snapshot checksum 的上传重试要返回现有进度；若 base version/checksum/etag 或 `gcGeneration` 已变化，在旧会话 etag CAS 保护下重置上传进度并复用已有 pack。丢失 finalize 响应后重试不得重复提交。
+6. 同一个 snapshot checksum 的上传重试要返回现有进度；会话按 checksum 复用已上传的页和 pack，不因当前云端根版本或 GC 状态变化而重置个人存档。丢失 finalize 响应后必须先核对当前根，确认已提交则直接返回，不重复提交。
 
 7. 每个 manifest page 最多 32 个 pack，按 page index 顺序提交。页 hash 必须绑定页号、前页 hash 和 pack 元数据；最后页 hash 必须等于 root 的 `pageRoot`。
    页链、Bloom、总量校验后先以 `etagDoesNotMatch: '*'` 保存不可变声明；有缺包时不推进会话，全包验证成功后用 etag CAS 推进。
@@ -72,12 +71,10 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 8. 页面验证每页最多并发 6 个 R2 `head`，且同时核对 pack size 与 `customMetadata.entryCount`。同 checksum 的重复项必须 length 和 entryCount 都一致。
 
-9. Bloom 固定 32KiB。上传时由 R2 校验 SHA-256；manifest page 验证其包含关系；finalize 在持锁后重新读取并校验 Bloom。
+9. Bloom 固定 32KiB。上传时由 R2 校验 SHA-256；manifest page 验证其包含关系；finalize 写根前重新读取并校验 Bloom。
    Bloom 假阳性只允许多留垃圾，绝不能产生假阴性删除当前数据。
 
-10. 根 manifest 必须保持常数大小，不包含完整 pack 数组。begin/finalize/GC 共用两阶段 mutation lock；根切换必须使用旧 root etag CAS，并继续比对 baseVersion、baseChecksum、baseEtag。begin-upload 在同一把 mutation lock 下记录当前 GC generation；GC 删除候选前先持久化新的 generation；finalize 发现上传期间 generation 变化时必须返回 `recheckRequired`，客户端刷新远端基线并核对本地分片清单。客户端只对该明确 recheck 做最多两次重试，普通根 CAS 冲突仍报错，不做自动合并。
-    preparing 30 秒后可接管；每次临界写入前用当前 owner 的 etag CAS 升为 mutating，后者不按时间抢占。不能通过 head 采纳后继 owner 的 etag。
-    promotion、session/root/GC generation/delete/cursor 写入结果未知时保留锁，finally 不清空。没有自动解锁；恢复前须确认旧请求停止并核对状态，不得单靠超时删除锁。
+10. 根 manifest 必须保持常数大小，不包含完整 pack 数组。根切换保留 ETag 条件写作为完整性保护；begin/finalize 不使用全局 mutation lock，也不因普通根版本变化向用户返回 409。finalize 在 CAS 失败时重新读取当前根并继续提交当前完整 snapshot，最后成功完成的快照成为云端存档。GC 删除前必须重新读取当前根和 Bloom，并保护所有可完整枚举、仍可能 finalize 的上传会话；无法完成复核时跳过本轮删除。写入结果未知时先核对根、会话和对象状态，不能证明成功或安全时才返回未知结果，不建立永久阻塞锁。
 
 11. 下载 pack 必须绑定已提交清单位置：version、pageIndex、packIndex、checksum、length、entryCount 全部匹配后才读取 R2。不得只信任客户端提交的 checksum。
 
@@ -113,11 +110,11 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 7. 索引缺失、缓存版本变化、追踪 epoch 重置时，只能经确认完整重建本地索引。重建只读本地。
 
-8. 上传/下载为整体替换语义（单用户产品决策，最后点击者生效）：上传以上传开始时的云端状态为 CAS 基准，用本机数据整体替换云端（本机为空则清空云端）；下载用云端整体替换本机。客户端不做跨设备基线比对与自动合并；服务器端根切换 etag CAS 与 mutation lock 保持不变（并发上传时后提交者会 CAS 失败报错）。
+8. 上传/下载为整体替换语义（单用户产品决策，最后一次完整上传生效）：上传用本机数据整体替换云端（本机为空则清空云端）；下载用云端整体替换本机。客户端不做跨设备基线比对与自动合并；服务器端只保留根 ETag 条件写和校验，CAS 竞争由 Worker 自动重读并收敛，不因设备或维护请求让用户重试。
 
 9. 不同步：`rp_hub_presets`、同步密码、自动保存开关与分钟配置、上次同步徽标（`rp_hub_sync_last_result_v1`，bootstrap.js 启动时读入同步浮窗头部右侧，格式 `16:30 同步成功/同步失败`）、RPHubSyncCache、RPHubSyncStaging、日志 store、意图键、epoch、恢复状态键。
 
-10. 自动保存只使用一个前台 one-shot 定时器，不使用高频轮询：打开或刷新页面重新计时；隐藏、pagehide、freeze 时暂停，pageshow、resume 或重新可见时继续；电脑休眠没有跨浏览器可靠事件，延迟回调按保守策略不立即补传。自动保存复用现有上传 runner、Web Lock 和 `state.syncing`，无变化也执行 checksum 检查，失败等待下一完整周期，不自动弹窗或自动重建失效索引。
+10. 自动保存只使用一个前台 one-shot 定时器，不使用高频轮询：打开或刷新页面重新计时；隐藏、pagehide、freeze 时暂停，pageshow、resume 或重新可见时继续；电脑休眠没有跨浏览器可靠事件，延迟回调按保守策略不立即补传。自动保存复用现有上传 runner、当前页 `state.syncing/operationPending` 防重复操作和服务端幂等会话，无变化也执行 checksum 检查，失败等待下一完整周期，不自动弹窗或自动重建失效索引。
 
 四、免费版资源边界
 
@@ -164,7 +161,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 7. 适配层传入 autoImageGen 时先确认世界书已加载且状态字段存在，否则传 undefined，图片业务按原生生成语义放行。角色/分支/消息上下文缺失则不接管。“固定生图”开关保持纯持久化语义（只决定生成结果是否落盘为固定记录），不参与生成门控；其设置行样式仍来自适配层 ui.settings。
 
-8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生 `GET /generate`。YNAI JSON 响应受有界读取保护，解码图片上限 16MiB；固定生图开关只决定结果是否落盘，不得绕过本项目 URL 规范化、YNAI 路由或已有记录读取。空 steps 默认按提供商区分：ynai 28、sta1n 40；未显式带 `model` 的 ynai 请求默认值取云端 `image.ynai.defaultModel`（配置缺失回退内置 `nai-diffusion-4-5-full`，sta1n 恒用内置默认），默认值在签名计算前解析，缓存键与实际模型一致。**中转端点只认云端适配清单 `image.ynai` 段（base/modelsPath/generatePath/defaultModel），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存，写入前淘汰过期条目）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此改写作者源码。
+8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生 `GET /generate`。YNAI JSON 响应受有界读取保护，解码图片上限 16MiB；固定生图开关只决定结果是否落盘，不得绕过本项目 URL 规范化、YNAI 路由或已有记录读取。空 steps 默认按提供商区分：ynai 28、sta1n 40；未显式带 `model` 的 ynai 请求默认值取云端 `image.ynai.defaultModel`（配置缺失回退内置 `nai-diffusion-4-5-full`，sta1n 恒用内置默认），默认值在签名计算前解析，缓存键与实际模型一致。**中转端点只认云端适配脚本头部元数据 `image.ynai` 段（base/modelsPath/generatePath/defaultModel），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存，写入前淘汰过期条目）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此改写作者源码。
 
 六、验证与发布
 
@@ -190,7 +187,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - `deployer/test-flow.mjs`
    - `deployer/test-blake3.mjs`
 
-4. 改协议时测试至少覆盖：空快照、缺包重试、持久会话恢复、清单页 CAS、并发 finalize、finalize/GC 锁、根 CAS、page hash、pack membership、Bloom 缺项/损坏、GC 游标、密码、丢失提交响应和远端版本冲突。
+4. 改协议时测试至少覆盖：空快照、缺包重试、持久会话恢复、清单页 CAS、同页幂等、并发 finalize、finalize/GC 并发、根 CAS 自动收敛、page hash、pack membership、Bloom 缺项/损坏、GC 游标、活动上传保护、密码、丢失提交响应和远端状态核对。
 
 5. 发布前：
    - 外部适配脚本已发布到固定 Raw URL，并确认可读取；Worker/page 只使用该新版入口；
