@@ -226,6 +226,12 @@ const MANIFEST_CHAIN_SEED = '0'.repeat(64);
 const GC_LIST_LIMIT = 256;
 const GC_PENDING_UPLOAD_LIMIT = 16;
 const GC_BLOOM_BYTES = 32 * 1024;
+const GC_STATE_FORMAT = 'rp-sync-gc-state-v2';
+const GC_STAGE_NAMES = ['packs', 'manifest-pages', 'blooms', 'uploads'];
+const GC_SESSION_GC_LIMIT = 16;
+const GC_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const GC_CONTROL_GC_GRACE_MS = 24 * 60 * 60 * 1000;
+const GC_STATE_MAX_BYTES = 128 * 1024;
 const textEncoder = new TextEncoder();
 const SYNC_CONTROL_MAX_BYTES = 256 * 1024;
 const SYNC_PACK_GC_GRACE_MS = 24 * 60 * 60 * 1000;
@@ -1576,7 +1582,12 @@ async function readSmallJsonObject(bucket, key, maxBytes = SYNC_CONTROL_MAX_BYTE
     } catch (_) {
         throw new SyncRequestError('服务器同步控制对象损坏。', 409);
     }
-    return { value, etag: object.etag || null, size: Number(object.size || 0) };
+    return {
+        value,
+        etag: object.etag || null,
+        size: Number(object.size || 0),
+        uploaded: object.uploaded || null
+    };
 }
 
 async function getMigrationState(bucket) {
@@ -2008,12 +2019,14 @@ function normalizeUploadSession(value) {
     return { format: UPLOAD_SESSION_FORMAT, ...fields };
 }
 
-async function readUploadSession(bucket, uploadId) {
+async function readUploadSession(bucket, uploadId, includeExpired = false) {
     const stored = await readSmallJsonObject(bucket, createUploadSessionKey(uploadId), 16 * 1024);
     if (!stored) return null;
     const session = normalizeUploadSession(stored.value);
     if (!session) throw new SyncRequestError('上传会话损坏。', 409);
-    return { session, etag: stored.etag };
+    const expired = gcSessionExpired(session, stored);
+    if (expired && !includeExpired) return null;
+    return { session, etag: stored.etag, uploaded: stored.uploaded, expired };
 }
 
 function uploadSessionInfo(session) {
@@ -2085,8 +2098,11 @@ async function beginUpload(bucket, body) {
     const currentVersion = Number(manifestState.manifest?.version || 0);
     const currentChecksum = String(manifestState.manifest?.checksum || '');
 
-    const existing = await readUploadSession(bucket, checksum);
-    if (existing) {
+    const existing = await readUploadSession(bucket, checksum, true);
+    if (existing?.expired) {
+        try { await bucket.delete(createUploadSessionKey(checksum)); } catch (_) { }
+    }
+    if (existing && !existing.expired) {
         const session = existing.session;
         if (session.bloomChecksum !== bloomChecksum || session.totalBytes !== totalBytes
             || session.packCount !== packCount || session.entryCount !== entryCount
@@ -2390,15 +2406,36 @@ async function readBloomFilter(bucket, root) {
     return bytes;
 }
 
-async function readPendingUploadBloom(bucket) {
+function gcObjectTimestamp(value) {
+    if (value instanceof Date) return value.getTime();
+    if (typeof value === 'number') return value;
+    const parsed = Date.parse(String(value || ''));
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function gcSessionExpired(session, object) {
+    const lastActivity = Math.max(
+        Number(session?.createdAt) || 0,
+        Number(session?.updatedAt) || 0,
+        gcObjectTimestamp(object?.uploaded)
+    );
+    return lastActivity > 0 && lastActivity < Date.now() - GC_UPLOAD_SESSION_TTL_MS;
+}
+
+async function readActiveUploadProtection(bucket) {
     const listed = await bucket.list({
         prefix: `${UPLOAD_SESSION_PREFIX}/`,
         limit: GC_PENDING_UPLOAD_LIMIT
     });
-    // 无法枚举完整的未完成会话时宁可本轮不回收，避免把长时间断点续传
-    // 的分片误判为孤儿。个人存档通常只有一个会话，这个上限也保持请求有界。
-    if (listed.truncated) return { complete: false, bloom: null };
+    const activeSessionChecksums = new Set();
+    const activeBloomChecksums = new Set();
     const protectedBloom = new Uint8Array(GC_BLOOM_BYTES);
+    if (listed.truncated) return {
+        complete: false,
+        bloom: null,
+        sessionChecksums: activeSessionChecksums,
+        bloomChecksums: activeBloomChecksums
+    };
     for (const object of listed.objects || []) {
         const key = typeof object?.key === 'string' ? object.key : '';
         if (!key.startsWith(`${UPLOAD_SESSION_PREFIX}/`)) continue;
@@ -2406,93 +2443,238 @@ async function readPendingUploadBloom(bucket) {
         try {
             stored = await readSmallJsonObject(bucket, key, 16 * 1024);
         } catch (_) {
-            return { complete: false, bloom: null };
+            return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
         }
         const session = stored && normalizeUploadSession(stored.value);
-        if (!session) return { complete: false, bloom: null };
+        if (!session) return {
+            complete: false,
+            bloom: null,
+            sessionChecksums: activeSessionChecksums,
+            bloomChecksums: activeBloomChecksums
+        };
+        if (gcSessionExpired(session, stored)) continue;
+        activeSessionChecksums.add(session.checksum);
+        activeBloomChecksums.add(session.bloomChecksum);
         try {
             const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
             if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) {
-                return { complete: false, bloom: null };
+                return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
             }
             const bytes = new Uint8Array(await new Response(bloomObject.body).arrayBuffer());
             if (bytes.byteLength !== GC_BLOOM_BYTES
                 || await sha256Bytes(bytes) !== session.bloomChecksum) {
-                return { complete: false, bloom: null };
+                return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
             }
             for (let index = 0; index < protectedBloom.length; index += 1) {
                 protectedBloom[index] |= bytes[index];
             }
         } catch (_) {
-            return { complete: false, bloom: null };
+            return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
         }
     }
-    return { complete: true, bloom: protectedBloom };
+    return {
+        complete: true,
+        bloom: protectedBloom,
+        sessionChecksums: activeSessionChecksums,
+        bloomChecksums: activeBloomChecksums
+    };
+}
+
+function parseGcManifestPageKey(key) {
+    const match = String(key || '').match(
+        new RegExp(`^${MANIFEST_PAGE_PREFIX}/([a-f0-9]{64})/(\\d{4})\\.json$`)
+    );
+    return match ? { rootChecksum: match[1], pageIndex: Number(match[2]) } : null;
+}
+
+function parseGcBloomKey(key) {
+    const match = String(key || '').match(
+        new RegExp(`^${BLOOM_PREFIX}/([a-f0-9]{64})\\.bin$`)
+    );
+    return match ? match[1] : null;
+}
+
+function parseGcUploadKey(key) {
+    const match = String(key || '').match(
+        new RegExp(`^${UPLOAD_SESSION_PREFIX}/([a-f0-9]{64})\\.json$`)
+    );
+    return match ? match[1] : null;
+}
+
+function parseGcPackKey(key) {
+    const match = String(key || '').match(
+        new RegExp(`^${PACK_PREFIX}/([a-f0-9]{64})\\.bin$`)
+    );
+    return match ? match[1] : null;
+}
+
+function freshGcState(rootChecksum) {
+    return {
+        format: GC_STATE_FORMAT,
+        rootChecksum,
+        stage: GC_STAGE_NAMES[0],
+        cursors: Object.fromEntries(GC_STAGE_NAMES.map(stage => [stage, null])),
+        updatedAt: Date.now()
+    };
+}
+
+function normalizeGcState(value, rootChecksum) {
+    if (value?.format === GC_STATE_FORMAT && value.rootChecksum === rootChecksum) {
+        const cursors = Object.fromEntries(GC_STAGE_NAMES.map(stage => [
+            stage,
+            typeof value.cursors?.[stage] === 'string' && value.cursors[stage]
+                ? value.cursors[stage]
+                : null
+        ]));
+        const stage = value.stage === 'done' || GC_STAGE_NAMES.includes(value.stage)
+            ? value.stage
+            : GC_STAGE_NAMES[0];
+        return { format: GC_STATE_FORMAT, rootChecksum, stage, cursors, updatedAt: Date.now() };
+    }
+    // gc-v1 only had a pack cursor. Preserve it and restart the new control-object
+    // stages from their beginning instead of discarding useful scan progress.
+    if (value?.format === 'rp-sync-gc-state-v1' && value.rootChecksum === rootChecksum) {
+        const state = freshGcState(rootChecksum);
+        state.cursors.packs = typeof value.cursor === 'string' && value.cursor ? value.cursor : null;
+        return state;
+    }
+    return freshGcState(rootChecksum);
+}
+
+async function writeGcState(bucket, state, etag = null) {
+    return bucket.put(GC_STATE_KEY, JSON.stringify({ ...state, updatedAt: Date.now() }), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8' },
+        onlyIf: etag ? { etagMatches: etag } : { etagDoesNotMatch: '*' }
+    });
+}
+
+// R2 批量删除没有条件写；候选来自本轮扫描并已通过引用与宽限复核，删除
+// 本身幂等。分成小批推进，失败在下一轮 gc-step 里按同样依据重判即可。
+async function gcDeleteCandidates(bucket, keys) {
+    let deleted = 0;
+    for (let start = 0; start < keys.length; start += GC_LIST_LIMIT) {
+        try {
+            await bucket.delete(keys.slice(start, start + GC_LIST_LIMIT));
+        } catch (_) {
+            continue;
+        }
+        deleted += Math.min(GC_LIST_LIMIT, keys.length - start);
+    }
+    return deleted;
 }
 
 async function handleGcStep(bucket) {
     const root = await getManifest(bucket);
-    if (!root) return json({ ok: true, done: true, deletedCount: 0 });
-    const bloom = await readBloomFilter(bucket, root);
-    const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, 16 * 1024);
-    const cursor = storedState?.value?.rootChecksum === root.checksum
-        && typeof storedState?.value?.cursor === 'string' && storedState.value.cursor
-        ? storedState.value.cursor
-        : undefined;
-    const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
-    const nextCursor = getNextSyncCursor(page, cursor);
-    const cutoff = Date.now() - SYNC_PACK_GC_GRACE_MS;
-    const candidates = [];
-    for (const object of page.objects || []) {
-        const key = typeof object?.key === 'string' ? object.key : '';
-        const name = key.startsWith(`${PACK_PREFIX}/`) ? key.slice(PACK_PREFIX.length + 1) : '';
-        const match = name.match(/^([a-f0-9]{64})\.bin$/);
-        if (!match || bloomHasChecksum(bloom, match[1])) continue;
-        const uploaded = object.uploaded;
-        const uploadedAt = uploaded instanceof Date
-            ? uploaded.getTime()
-            : typeof uploaded === 'number'
-                ? uploaded
-                : Date.parse(String(uploaded || ''));
-        if (Number.isFinite(uploadedAt) && uploadedAt < cutoff) candidates.push(key);
+    if (!root) return json({ ok: true, done: true, deletedCount: 0, stage: 'done' });
+    const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, GC_STATE_MAX_BYTES);
+    const state = normalizeGcState(storedState?.value, root.checksum);
+    if (state.stage === 'done') return json({ ok: true, done: true, deletedCount: 0, stage: 'done' });
+
+    let deletedCount = 0;
+    const stage = state.stage;
+    const cursor = state.cursors[stage] || undefined;
+    const now = Date.now();
+    const controlCutoff = now - GC_CONTROL_GC_GRACE_MS;
+
+    if (stage === 'uploads') {
+        const page = await bucket.list({ prefix: `${UPLOAD_SESSION_PREFIX}/`, cursor, limit: GC_SESSION_GC_LIMIT });
+        const nextCursor = getNextSyncCursor(page, cursor);
+        const candidates = [];
+        for (const object of page.objects || []) {
+            const uploadId = parseGcUploadKey(object?.key);
+            if (!uploadId) continue;
+            let stored;
+            try {
+                stored = await readSmallJsonObject(bucket, object.key, 16 * 1024);
+            } catch (_) {
+                continue;
+            }
+            const session = stored && normalizeUploadSession(stored.value);
+            if (!session || session.uploadId !== uploadId || session.checksum === root.checksum) continue;
+            if (gcSessionExpired(session, { ...stored, uploaded: object.uploaded })) candidates.push(object.key);
+        }
+        // Re-read each candidate immediately before deletion. This avoids deleting a
+        // session that received a late page retry after the listing snapshot.
+        const safeCandidates = [];
+        for (const key of candidates) {
+            const uploadId = parseGcUploadKey(key);
+            let stored;
+            try {
+                stored = await readSmallJsonObject(bucket, key, 16 * 1024);
+            } catch (_) {
+                continue;
+            }
+            const session = stored && normalizeUploadSession(stored.value);
+            if (session && session.uploadId === uploadId && session.checksum !== root.checksum
+                && gcSessionExpired(session, stored)) safeCandidates.push(key);
+        }
+        deletedCount = await gcDeleteCandidates(bucket, safeCandidates);
+        state.cursors.uploads = nextCursor;
+        if (!nextCursor) state.stage = 'done';
+    } else if (stage === 'packs') {
+        const bloom = await readBloomFilter(bucket, root);
+        const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
+        const nextCursor = getNextSyncCursor(page, cursor);
+        const candidates = [];
+        for (const object of page.objects || []) {
+            const checksum = parseGcPackKey(object?.key);
+            if (!checksum || bloomHasChecksum(bloom, checksum)) continue;
+            const uploadedAt = gcObjectTimestamp(object.uploaded);
+            if (uploadedAt && uploadedAt < now - SYNC_PACK_GC_GRACE_MS) candidates.push(object.key);
+        }
+        // 在删除前复核：保护仍可能 finalize 的活动上传，并确认根清单没有
+        // 在扫描期间切换。任一保护不完整就整体跳过删除，只推进游标。
+        const protection = await readActiveUploadProtection(bucket);
+        const latestRoot = await getManifest(bucket);
+        if (latestRoot && latestRoot.checksum === root.checksum && protection.complete) {
+            const safe = candidates.filter(key => {
+                const checksum = parseGcPackKey(key);
+                return checksum && !bloomHasChecksum(bloom, checksum)
+                    && !bloomHasChecksum(protection.bloom, checksum);
+            });
+            deletedCount = await gcDeleteCandidates(bucket, safe);
+        }
+        state.cursors.packs = nextCursor;
+        if (!nextCursor) state.stage = GC_STAGE_NAMES[1];
+    } else {
+        // manifest-pages / blooms：控制对象按内容寻址，只有「不属于当前根、
+        // 也不属于任何仍可恢复的上传会话」且超过宽限期的才能删除。活动
+        // 会话枚举或对象校验失败时保护不完整，本步只推进游标不删除。
+        const isPages = stage === 'manifest-pages';
+        const prefix = isPages ? `${MANIFEST_PAGE_PREFIX}/` : `${BLOOM_PREFIX}/`;
+        const page = await bucket.list({ prefix, cursor, limit: GC_LIST_LIMIT });
+        const nextCursor = getNextSyncCursor(page, cursor);
+        const protection = await readActiveUploadProtection(bucket);
+        const latestRoot = await getManifest(bucket);
+        if (latestRoot && latestRoot.checksum === root.checksum && protection.complete) {
+            const candidates = [];
+            for (const object of page.objects || []) {
+                const key = typeof object?.key === 'string' ? object.key : '';
+                const uploadedAt = gcObjectTimestamp(object.uploaded);
+                if (!uploadedAt || uploadedAt >= controlCutoff) continue;
+                if (isPages) {
+                    const parsed = parseGcManifestPageKey(key);
+                    if (parsed && parsed.rootChecksum !== root.checksum
+                        && !protection.sessionChecksums.has(parsed.rootChecksum)) candidates.push(key);
+                } else {
+                    const checksum = parseGcBloomKey(key);
+                    if (checksum && checksum !== root.bloomChecksum
+                        && !protection.bloomChecksums.has(checksum)) candidates.push(key);
+                }
+            }
+            deletedCount = await gcDeleteCandidates(bucket, candidates);
+        }
+        state.cursors[stage] = nextCursor;
+        if (!nextCursor) state.stage = isPages ? GC_STAGE_NAMES[2] : GC_STAGE_NAMES[3];
     }
 
-    // 先枚举待完成上传，再重新读取根清单。这个顺序覆盖两种交错：
-    // 若 finalize 尚未提交，会话 Bloom 保护其分片；若已提交，后一次根读取
-    // 会保护新根分片。两次检查都完成后才允许删除候选。
-    const pending = await readPendingUploadBloom(bucket);
-    const latestRoot = await getManifest(bucket);
-    let safeCandidates = [];
-    if (pending.complete && latestRoot) {
-        const latestBloom = latestRoot.checksum === root.checksum
-            ? bloom
-            : await readBloomFilter(bucket, latestRoot);
-        safeCandidates = candidates.filter(key => {
-            const checksum = key.slice(PACK_PREFIX.length + 1, -4);
-            return !bloomHasChecksum(latestBloom, checksum)
-                && !bloomHasChecksum(pending.bloom, checksum);
-        });
+    // 游标用 ETag CAS 持久化：另一个 GC 并发写入会令本次推进失效，直接
+    // 静默放弃——对方的推进同样有效，下一批调用会从最新游标继续。
+    const persisted = await writeGcState(bucket, state, storedState?.etag || null);
+    if (!persisted) {
+        return json({ ok: true, done: false, stage: GC_STAGE_NAMES[0], deletedCount: 0, concurrent: true });
     }
-
-    const nextState = {
-        format: 'rp-sync-gc-state-v1',
-        rootChecksum: latestRoot?.checksum || root.checksum,
-        generation: storedState?.value?.generation || '',
-        cursor: nextCursor,
-        updatedAt: Date.now()
-    };
-    if (safeCandidates.length) {
-        // 记录删除前的游标；删除响应丢失时重复执行仍然安全，内容寻址
-        // 对象的删除是幂等的，且下一轮会再次核对根和未完成会话。
-        await bucket.put(GC_STATE_KEY, JSON.stringify({ ...nextState, deleting: safeCandidates }), {
-            httpMetadata: { contentType: 'application/json; charset=utf-8' }
-        });
-        await bucket.delete(safeCandidates);
-    }
-    await bucket.put(GC_STATE_KEY, JSON.stringify(nextState), {
-        httpMetadata: { contentType: 'application/json; charset=utf-8' }
-    });
-    return json({ ok: true, done: !nextCursor, deletedCount: safeCandidates.length });
+    return json({ ok: true, done: state.stage === 'done', stage, deletedCount });
 }
 
 async function runConcurrent(items, limit, worker) {

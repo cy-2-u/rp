@@ -219,6 +219,10 @@
         }
         const label = card.querySelector('.generated-image-progress-label');
         if (label) label.textContent = job.error || (job.status === 'done' ? '' : '生成中');
+        // [RPHub 修改] 重掷按钮跟随卡片状态：生成中（running）禁用，避免重复点击
+        // 触发并发重掷；成功（done）/失败（failed）恢复可用，失败后可重试。
+        const reroll = card.querySelector(imageUi.reroll);
+        if (reroll) reroll.disabled = !['done', 'failed'].includes(job.status);
         emit('image-rendered', { card, status: job.status });
     };
     const loadCard = (card, requestUrl = card?.dataset.imageRequest, fresh = false) => {
@@ -231,6 +235,13 @@
         task.cards.add(card);
         card.dataset.imageJobState = 'loading';
         card.classList.add('is-generating');
+        // [RPHub 修改] 防塌陷：复刻作者 loadGeneratedImageCard 的尺寸设置。卡片内唯一
+        // 在流内容是 height:100% 的 <img>，无 src 时高度为 0，只有 padding+1px 边框，
+        // 加载/失败态会塌成一条线；这里按请求 URL 的 size 参数设 aspect-ratio 撑开卡片，
+        // 保证加载态与失败态都有正常尺寸（重掷按钮也因此可见可点）。size 取值见作者
+        // core-utils.js：竖图 / 横图 / 方图；未知或缺失时回退竖图。
+        const aspectBySize = { '竖图': '832 / 1216', '横图': '1216 / 832', '方图': '1' };
+        card.style.aspectRatio = aspectBySize[url.searchParams.get('size')] || aspectBySize['竖图'];
         return task.promise;
     };
     const hydrate = root => {
@@ -416,7 +427,9 @@
             '.magic-image-suppressed{display:none!important}',
             '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
-            '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}'
+            '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}',
+            // [RPHub 修改] 生成中的重掷按钮置灰且不可点，与 renderImage 里的 disabled 一致。
+            '.generated-image-card.is-generating ' + (imageUi.reroll || '.generated-image-reroll') + '{opacity:.45;pointer-events:none}'
         ].join('');
         document.head.appendChild(style);
     };

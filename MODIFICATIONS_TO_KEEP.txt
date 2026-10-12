@@ -85,9 +85,9 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - 全部预校验成功后才设置恢复标记（其他标签页收到信号后暂停写入并显示遮罩，恢复标签页用写屏障等在途写事务收尾）；第二遍每批最多 4 pack 从 staging 读取一次，同时恢复业务数据、重建 entry 缓存并批量缓存原始 pack。普通记录写入同时受 64 条和约 8MiB 估算字节上限约束。缓存 canonical bytes 用 new Uint8Array(canonicalBytes) 精确复制，禁止持久化整个 pack 的共享 backing buffer。
    不得退回三遍 JSON 解析、每 pack 一个 staging/cache 事务，也不得取消 staging 后重复下载 300MB 快照。进入覆盖阶段后失败必须保留暂停标记，完整重试成功后才能清除。有效旧 32 桶/128 项快照按远端 bucket 恢复并将缓存标为 v7，下一次上传须经确认完整重建为 v8，不引入自动索引迁移。
 
-14. GC 只能由显式 `gc-step` 请求执行，不放进 finalize、`waitUntil` 或长连接。每步最多 list 256 个 pack；只删除 Bloom 明确不引用且超过 24 小时宽限期的对象；游标持久化并可在边界对象被删除后继续。
+14. GC 只能由显式 `gc-step` 请求执行，不放进 finalize、`waitUntil` 或长连接。GC 状态 `rp-sync-gc-state-v2` 按 `packs → manifest-pages → blooms → uploads` 四阶段持久化独立游标；根 checksum 变化时整体重置、从新根完整扫描（旧 gc-v1 状态只保留 pack 游标）。每步最多 list 256 个对象（uploads 阶段 16 个会话）；只删除当前根与活动会话都明确不引用、且超过对应宽限期（pack/控制对象 24 小时）的对象；游标用 ETag CAS 持久化，CAS 竞争静默放弃本次推进；游标持久化并可在边界对象被删除后继续。
 
-15. 当前 GC 只回收 pack。上传会话、旧 manifest page 和旧 Bloom 尚无自动清理；未来加入清理时必须证明不会删除并发上传、当前 root 或仍可能恢复的对象。
+15. GC 保留依据只有当前根与活动 upload session：pack 用当前根 Bloom + 活动会话 Bloom 并集保护；旧 manifest page / 旧 Bloom 按内容寻址归属（不属于当前根 checksum、不属于活动会话 checksum 集合）回收；upload session 超过 7 天 TTL（createdAt/updatedAt/R2 时间最大值）自动清理，删除前逐个重读复核，过期会话删除后 begin-upload 可为同一 checksum 建立新会话。活动会话枚举或对象校验失败时保护不完整，该轮只推进游标不删除。
 
 三、严格增量不变量
 
@@ -143,7 +143,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
    - 峰值：36 子请求、客户端并发 4、R2 put 1MiB。
    - 与旧基线相比首次/恢复请求数增加，但等长修改上传从 87.5MiB 降至 79.7MiB，漂移修改从 110.5MiB 降至 27.6MiB；宿主墙钟不等同 Cloudflare CPU。
 
-6. 最新独立预算见 README 第 5 节：upload-pack 4 子请求，manifest page 35/并发 6，finalize 11，pull page 1，pull pack 2，GC 11；本地墙钟不是 Cloudflare CPU。
+6. 最新独立预算见 README 第 5 节：upload-pack 4 子请求，manifest page 35/并发 6，finalize 5，pull page 1，pull pack 2，GC 8；本地墙钟不是 Cloudflare CPU。
 
 五、图片与图库不变量
 
@@ -201,9 +201,8 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 七、当前已知待办
 
-1. 为过期 upload session、旧 manifest page 和旧 Bloom 设计安全、分页、有宽限期的控制对象 GC。
-2. 部署后继续观察 Cloudflare 官方 CPU、错误率、R2 Class A/B 和存储增长。
-3. 恢复跨 localStorage 与多个 IndexedDB 仍非原子；保持写暂停和“失败后重新完整恢复”语义。
-4. 长期不同步的 localStorage 意图可能占用浏览器配额，不能在未提交前自动删除。
+1. 部署后继续观察 Cloudflare 官方 CPU、错误率、R2 Class A/B 和存储增长。
+2. 恢复跨 localStorage 与多个 IndexedDB 仍非原子；保持写暂停和“失败后重新完整恢复”语义。
+3. 长期不同步的 localStorage 意图可能占用浏览器配额，不能在未提交前自动删除。
 
 本文件只记录当前实现与必须保留的约束，不保留已废弃协议的历史流水账。

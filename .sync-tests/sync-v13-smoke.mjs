@@ -108,7 +108,10 @@ function createBarrier(parties) {
 function createR2Mock() {
     const objects = new Map();
     const hooks = {};
-    let etagSequence = 0;
+    // ETag 全局递增：isolate 级 manifest/迁移标记缓存按 etag 索引，真实 R2
+    // 的 etag 是内容摘要，不会因换 bucket 而重置；mock 若每个 bucket 从
+    // "etag-1" 重新计数，同一 isolate 内多个测试 bucket 会互相污染缓存。
+    let etagSequence = globalThis.__r2MockEtagCounter = (globalThis.__r2MockEtagCounter || 0);
     const asBytes = async value => {
         if (value instanceof Uint8Array) return new Uint8Array(value);
         if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
@@ -152,7 +155,7 @@ function createR2Mock() {
                     : String(options.sha256).toLowerCase();
                 if (await sha256Bytes(bytes) !== expected) throw new Error('BadDigest: SHA-256 mismatch');
             }
-            etagSequence += 1;
+            etagSequence = globalThis.__r2MockEtagCounter = globalThis.__r2MockEtagCounter + 1;
             const nextEtag = `"etag-${etagSequence}"`;
             objects.set(key, {
                 key,
@@ -590,6 +593,175 @@ async function testGcCursor(worker, committed) {
     for (const pack of snapshot.packs) assert.ok(bucket.objects.has(packKey(pack.checksum)));
 }
 
+async function runGcToDone(api, maxSteps = 12) {
+    let steps = 0;
+    let done = false;
+    let deletedCount = 0;
+    while (!done && steps < maxSteps) {
+        const result = await api.json({ action: 'gc-step' });
+        assert.equal(result.response.status, 200);
+        done = result.body.done;
+        deletedCount += result.body.deletedCount || 0;
+        steps += 1;
+    }
+    assert.equal(done, true, `GC must reach done within ${maxSteps} steps`);
+    return deletedCount;
+}
+
+async function testGcControlObjectLifecycle(worker) {
+    const bucket = createR2Mock();
+    const api = makeApi(worker, bucket);
+    await initialize(api);
+
+    // 第一代快照：随后整体替换，其 page/Bloom/session 都成为可回收垃圾。
+    const old = await buildSnapshot(1, { prefix: 'gc-old' });
+    await prepareSnapshot(api, old);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: old.checksum })).status, 200);
+    assert.ok(bucket.objects.has(pageKey(old.checksum, 0)));
+    assert.ok(bucket.objects.has(bloomKey(old.bloomChecksum)));
+
+    // 新根提交后旧 page/Bloom 不再被引用，但仍在 24 小时控制对象宽限期内。
+    const fresh = await buildSnapshot(1, { prefix: 'gc-new' });
+    await prepareSnapshot(api, fresh);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: fresh.checksum })).status, 200);
+
+    const firstPass = await api.json({ action: 'gc-step' });
+    assert.equal(firstPass.response.status, 200);
+    assert.ok(bucket.objects.has(pageKey(old.checksum, 0)), 'fresh control objects stay within the grace window');
+    assert.ok(bucket.objects.has(bloomKey(old.bloomChecksum)));
+
+    // 时钟越过宽限期后，旧 page/Bloom 被回收，当前根的对象保留。
+    bucket.objects.get(pageKey(old.checksum, 0)).uploaded = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    bucket.objects.get(bloomKey(old.bloomChecksum)).uploaded = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    await runGcToDone(api);
+    assert.ok(!bucket.objects.has(pageKey(old.checksum, 0)), 'orphaned manifest pages must be collected');
+    assert.ok(!bucket.objects.has(bloomKey(old.bloomChecksum)), 'orphaned blooms must be collected');
+    assert.ok(bucket.objects.has(pageKey(fresh.checksum, 0)), 'the current root page must survive GC');
+    assert.ok(bucket.objects.has(bloomKey(fresh.bloomChecksum)), 'the current root bloom must survive GC');
+    for (const pack of fresh.packs) assert.ok(bucket.objects.has(packKey(pack.checksum)));
+
+    // 过期 upload session：根切换触发新一轮完整扫描（与真实上传后客户端
+    // drain 的路径一致），过期会话被删除后 begin-upload 能建立新会话。
+    const expired = await buildSnapshot(1, { prefix: 'gc-expired' });
+    await begin(api, expired, fresh.body?.version ?? 2, fresh.checksum);
+    const sessionObject = bucket.objects.get(sessionKey(expired.checksum));
+    assert.ok(sessionObject);
+    const staleTime = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    sessionObject.uploaded = new Date(staleTime);
+    const storedSession = JSON.parse(Buffer.from(sessionObject.bytes).toString('utf8'));
+    storedSession.createdAt = staleTime;
+    storedSession.updatedAt = staleTime;
+    sessionObject.bytes = encoder.encode(JSON.stringify(storedSession));
+    sessionObject.size = sessionObject.bytes.byteLength;
+
+    const next = await buildSnapshot(1, { prefix: 'gc-next' });
+    await prepareSnapshot(api, next);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: next.checksum })).status, 200);
+    await runGcToDone(api);
+    assert.ok(!bucket.objects.has(sessionKey(expired.checksum)), 'expired upload sessions must be collected');
+
+    const reborn = await begin(api, expired, 3, next.checksum);
+    assert.equal(reborn.response.status, 200, 'begin-upload after session expiry must create a new session');
+    assert.equal(reborn.body.nextPage, 0);
+    assert.equal((await uploadBloom(api, expired)).status, 204, 'the bloom can be re-uploaded into the new session');
+    await finishPages(api, expired);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: expired.checksum })).status, 200);
+    assert.equal(JSON.parse(Buffer.from(bucket.objects.get(MANIFEST_KEY).bytes).toString('utf8')).checksum, expired.checksum);
+}
+
+async function testGcProtectsFreshSession(worker) {
+    const bucket = createR2Mock();
+    const api = makeApi(worker, bucket);
+    await initialize(api);
+    const committed = await buildSnapshot(1, { prefix: 'protect-base' });
+    await prepareSnapshot(api, committed);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: committed.checksum })).status, 200);
+
+    // 新鲜（未过期）pending session：其 page/Bloom/session/pack 全部保留。
+    const pending = await buildSnapshot(1, { prefix: 'protect-pending' });
+    await seedPack(bucket, pending.packs[0], new Date(Date.now() - 48 * 60 * 60 * 1000));
+    await begin(api, pending, 1, committed.checksum);
+    await uploadBloom(api, pending);
+    await submitPage(api, pending, 0);
+
+    const replaced = await buildSnapshot(1, { prefix: 'protect-new' });
+    await prepareSnapshot(api, replaced);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: replaced.checksum })).status, 200);
+
+    bucket.objects.get(pageKey(committed.checksum, 0)).uploaded = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    bucket.objects.get(bloomKey(committed.bloomChecksum)).uploaded = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    await runGcToDone(api);
+
+    assert.ok(!bucket.objects.has(pageKey(committed.checksum, 0)), 'replaced root pages are collectable');
+    assert.ok(bucket.objects.has(sessionKey(pending.checksum)), 'a fresh pending session must survive GC');
+    assert.ok(bucket.objects.has(pageKey(pending.checksum, 0)), 'a fresh session page must survive GC');
+    assert.ok(bucket.objects.has(bloomKey(pending.bloomChecksum)), 'a fresh session bloom must survive GC');
+    assert.ok(bucket.objects.has(packKey(pending.packs[0].checksum)), 'packs protected by a fresh session must survive GC');
+
+    const resumed = await begin(api, pending, 1, committed.checksum);
+    assert.equal(resumed.response.status, 200, 'a fresh session remains resumable after GC');
+    assert.equal(resumed.body.nextPage, 1);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: pending.checksum })).status, 200);
+}
+
+async function testGcStageDrainCoversAllObjects(worker) {
+    const bucket = createR2Mock();
+    const api = makeApi(worker, bucket);
+    await initialize(api);
+    const root = await buildSnapshot(1, { prefix: 'drain-root' });
+    await prepareSnapshot(api, root);
+    assert.equal((await api.post({ action: 'finalize-upload', uploadId: root.checksum })).status, 200);
+
+    // 四类垃圾各造一个：旧 pack、旧 page、旧 Bloom、过期 session。
+    const stale = Date.now() - 48 * 60 * 60 * 1000;
+    const seedStale = async (key, bytes) => {
+        await bucket.put(key, bytes);
+        bucket.objects.get(key).uploaded = new Date(stale);
+    };
+    const orphanPack = 'e'.repeat(64);
+    assert.ok(!bloomHas(root.bloom, orphanPack));
+    await seedStale(packKey(orphanPack), new Uint8Array([9]));
+    const garbageSnapshot = await buildSnapshot(1, { prefix: 'drain-garbage' });
+    await seedStale(pageKey(garbageSnapshot.checksum, 0), encoder.encode('{}'));
+    await seedStale(bloomKey(garbageSnapshot.bloomChecksum), new Uint8Array(BLOOM_BYTES));
+    await begin(api, garbageSnapshot, 1, root.checksum);
+    const staleTime = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const garbageSession = bucket.objects.get(sessionKey(garbageSnapshot.checksum));
+    garbageSession.uploaded = new Date(staleTime);
+    const garbageStored = JSON.parse(Buffer.from(garbageSession.bytes).toString('utf8'));
+    garbageStored.createdAt = staleTime;
+    garbageStored.updatedAt = staleTime;
+    garbageSession.bytes = encoder.encode(JSON.stringify(garbageStored));
+    garbageSession.size = garbageSession.bytes.byteLength;
+
+    let stageSequence = [];
+    let steps = 0;
+    let done = false;
+    while (!done && steps < 12) {
+        const result = await api.json({ action: 'gc-step' });
+        assert.equal(result.response.status, 200);
+        done = result.body.done;
+        if (result.body.stage) stageSequence.push(result.body.stage);
+        steps += 1;
+    }
+    assert.equal(done, true);
+    assert.ok(stageSequence.includes('packs') && stageSequence.includes('manifest-pages')
+        && stageSequence.includes('blooms') && stageSequence.includes('uploads'),
+        `all four GC stages must run, saw ${stageSequence.join(',')}`);
+    assert.ok(!bucket.objects.has(packKey(orphanPack)), 'orphan packs must be collected');
+    assert.ok(!bucket.objects.has(pageKey(garbageSnapshot.checksum, 0)), 'garbage pages must be collected');
+    assert.ok(!bucket.objects.has(bloomKey(garbageSnapshot.bloomChecksum)), 'garbage blooms must be collected');
+    assert.ok(!bucket.objects.has(sessionKey(garbageSnapshot.checksum)), 'expired sessions must be collected');
+    assert.ok(bucket.objects.has(pageKey(root.checksum, 0)));
+    assert.ok(bucket.objects.has(bloomKey(root.bloomChecksum)));
+    for (const pack of root.packs) assert.ok(bucket.objects.has(packKey(pack.checksum)));
+
+    // 全部阶段完成后重复 gc-step 是幂等的空操作。
+    const idle = await api.json({ action: 'gc-step' });
+    assert.equal(idle.response.status, 200);
+    assert.equal(idle.body.done, true);
+}
+
 async function testPasswordAndBinaryEndpoint(worker) {
     const bucket = createR2Mock();
     const api = makeApi(worker, bucket, 'secret');
@@ -631,5 +803,8 @@ await testMetadataBloomAndOrderingRejections(worker);
 await testConcurrentFinalizeAndRootCas(worker);
 await testGcInvalidatesPendingUpload(worker);
 await testGcCursor(worker, committed);
+await testGcControlObjectLifecycle(worker);
+await testGcProtectsFreshSession(worker);
+await testGcStageDrainCoversAllObjects(worker);
 await testPasswordAndBinaryEndpoint(worker);
 console.log('sync-v13-smoke: ok');

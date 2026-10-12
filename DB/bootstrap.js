@@ -2834,20 +2834,25 @@ function createAutoSaveScheduler(options = {}) {
 
     async function runGcMaintenance() {
         const deadline = Date.now() + 3000;
-        for (let step = 0; step < 2 && Date.now() < deadline; step += 1) {
+        for (let step = 0; step < 8 && Date.now() < deadline; step += 1) {
             const result = await postSync({ action: 'gc-step' }, {
                 retryCount: 0,
                 timeoutMs: Math.max(1, deadline - Date.now())
             });
-            if (result.done) return;
+            if (result.done) return false;
         }
+        return true;
     }
 
     let gcMaintenance = null;
-    function scheduleGcMaintenance() {
+    function scheduleGcMaintenance(delay = 0) {
         if (gcMaintenance) return;
-        gcMaintenance = wait(0).then(runGcMaintenance)
-            .catch(() => {}).finally(() => { gcMaintenance = null; });
+        gcMaintenance = wait(delay).then(runGcMaintenance)
+            .catch(() => false)
+            .then(continueGc => {
+                gcMaintenance = null;
+                if (continueGc) scheduleGcMaintenance(250);
+            });
     }
 
     async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
