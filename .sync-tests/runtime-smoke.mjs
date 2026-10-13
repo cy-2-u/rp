@@ -180,7 +180,8 @@ async function testAuthorScriptPassthrough() {
 async function testBootstrapUsesBoundedEngine() {
     const bootstrap = await read('DB/bootstrap.js');
     assert.match(bootstrap, /window\.RPH_SYNC_UPLOAD_ENGINE/);
-    assert.match(bootstrap, /async function resumePagedUpload/);
+    assert.match(bootstrap, /async function uploadPagedSnapshotAttempt/);
+    assert.doesNotMatch(bootstrap, /resumePagedUpload/);
     assert.match(bootstrap, /action: 'upload-pack'/);
     assert.match(bootstrap, /uploadBatchMaxPacks: 1/);
     assert.doesNotMatch(bootstrap, /upload-pack-batch|upload-complete|reset-upload/);
@@ -475,10 +476,12 @@ async function testImageRenderApi() {
     assert.equal(plainMiss.status, 404, 'a read without generate must not fabricate data');
     assert.equal(counters.r2Get, 2, 'a miss costs one original get plus one tombstone get');
 
-    const noToken = await worker.fetch(new Request(imageUrl({ character_name: 'Cat', generate: '1' })), env, {});
+    const noToken = await worker.fetch(new Request(imageUrl({ character_name: 'Cat' }), { method: 'POST' }), env, {});
     assert.equal(noToken.status, 401);
-    const noTag = await worker.fetch(new Request(imageUrl({ token: 'tok', generate: '1' })), env, {});
+    const noTag = await worker.fetch(new Request(imageUrl({ token: 'tok' }), { method: 'POST' }), env, {});
     assert.equal(noTag.status, 400, 'a missing prompt must be a client error, not a thrown 500');
+    const getMustNotGenerate = await worker.fetch(new Request(imageUrl({ token: 'tok', tag: 'cat', generate: '1' })), env, {});
+    assert.equal(getMustNotGenerate.status, 404, 'GET must stay read-only even with generate=1');
 
     const created = await worker.fetch(new Request(targetUrl, { method: 'POST' }), env, {});
     assert.equal(created.status, 200);
@@ -497,8 +500,8 @@ async function testImageRenderApi() {
     assert.equal(headHit.body, null, 'HEAD responses must not carry a body');
 
     const reroll = await worker.fetch(new Request(imageUrl({
-        tag: 'cat', character_name: 'Cat', token: 'tok', generate: '1', reroll_nonce: 'fresh'
-    })), env, {});
+        tag: 'cat', character_name: 'Cat', token: 'tok', reroll_nonce: 'fresh'
+    }), { method: 'POST' }), env, {});
     assert.equal(reroll.status, 200);
     assert.equal(counters.upstream, 2, 'a reroll nonce must produce a fresh signature');
     assert.equal(counters.r2Put, 2);
@@ -537,14 +540,14 @@ async function testImageRenderApi() {
 
     upstreamResponse = () => new Response('nope', { status: 503, headers: { 'content-type': 'text/plain' } });
     const upstreamError = await worker.fetch(new Request(imageUrl({
-        tag: 'cat', character_name: 'Cat', token: 'tok', generate: '1', reroll_nonce: 'upstream-error'
-    })), env, {});
+        tag: 'cat', character_name: 'Cat', token: 'tok', reroll_nonce: 'upstream-error'
+    }), { method: 'POST' }), env, {});
     assert.equal(upstreamError.status, 503, 'upstream failures must pass their status through');
 
     upstreamResponse = () => new Response('<html>login</html>', { status: 200, headers: { 'content-type': 'text/html' } });
     const notAnImage = await worker.fetch(new Request(imageUrl({
-        tag: 'cat', character_name: 'Cat', token: 'tok', generate: '1', reroll_nonce: 'bad-type'
-    })), env, {});
+        tag: 'cat', character_name: 'Cat', token: 'tok', reroll_nonce: 'bad-type'
+    }), { method: 'POST' }), env, {});
     assert.equal(notAnImage.status, 502, 'a non-image upstream response must be rejected');
 
     upstreamResponse = () => new Response('tiny', {
@@ -552,14 +555,14 @@ async function testImageRenderApi() {
         headers: { 'content-type': 'image/png', 'content-length': String(64 * 1024 * 1024 + 1) }
     });
     const oversize = await worker.fetch(new Request(imageUrl({
-        tag: 'cat', character_name: 'Cat', token: 'tok', generate: '1', reroll_nonce: 'huge'
-    })), env, {});
+        tag: 'cat', character_name: 'Cat', token: 'tok', reroll_nonce: 'huge'
+    }), { method: 'POST' }), env, {});
     assert.equal(oversize.status, 413, 'oversized upstream responses must be refused before storage');
 
     const badMethod = await worker.fetch(new Request(targetUrl, { method: 'PUT' }), env, {});
     assert.equal(badMethod.status, 405);
     assert.equal(counters.r2Put, 2, 'failed generations must not write anything');
-    assert.equal(counters.upstream, 5, 'exactly the three failed attempts may call the upstream again');
+    assert.equal(counters.upstream, 5, 'exactly the three failed generation attempts may call the upstream again');
 }
 
 // catch-all 代理：本地资源直出、作者未来新增页面自动回源、注入面最小化。

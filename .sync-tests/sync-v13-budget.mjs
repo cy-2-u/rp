@@ -385,7 +385,9 @@ await benchmark({
     name: 'upload-manifest-page (32 packs)',
     status: 200,
     // 首个样本付 Bloom get+hash（1），WARMUPS 后 Bloom 命中 isolate 缓存；
-    // 稳态 = 1 session get + 32 pack head + 1 page put = 34。
+    // 稳态 = 1 session get + 31 pack head + 1 page put + 1 session CAS put = 34。
+    // 32 包里 pack[0] 已被前面的 upload-pack 基准验证并记入 verifiedPackCache，
+    // 页提交复核只对缓存外的 31 包照常 head。
     minSubrequests: 34,
     setup(bucket) {
         bucket.reset();

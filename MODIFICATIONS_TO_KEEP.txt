@@ -1,5 +1,5 @@
 RP Hub 魔改版：修改时必须保留的当前实现
-更新时间：2026-10-10
+更新时间：2026-10-13
 
 一、部署与文件边界
 
@@ -70,11 +70,13 @@ RP Hub 魔改版：修改时必须保留的当前实现
    upload-pack 必须核对当前页或紧邻上一页的 checksum/length/entryCount；同元数据幂等 204，已有元数据不同则 409，不能覆盖。新对象条件创建，正文继续直接传 R2。
 
 8. 页面验证每页最多并发 6 个 R2 `head`，且同时核对 pack size 与 `customMetadata.entryCount`。同 checksum 的重复项必须 length 和 entryCount 都一致。
+   upload-pack 校验成功的包按 checksum 在 isolate 内记入验证缓存（对象不可变、活动会话期间受 GC 保护）；upload-manifest-page 的页提交复核只 head 缓存外的包，缓存值与页声明不一致仍按元数据冲突处理。
 
 9. Bloom 固定 32KiB。上传时由 R2 校验 SHA-256；manifest page 验证其包含关系；finalize 写根前重新读取并校验 Bloom。
    Bloom 假阳性只允许多留垃圾，绝不能产生假阴性删除当前数据。
 
-10. 根 manifest 必须保持常数大小，不包含完整 pack 数组。根切换保留 ETag 条件写作为完整性保护；begin/finalize 不使用全局 mutation lock，也不因普通根版本变化向用户返回 409。finalize 在 CAS 失败时重新读取当前根并继续提交当前完整 snapshot，最后成功完成的快照成为云端存档。GC 删除前必须重新读取当前根和 Bloom，并保护所有可完整枚举、仍可能 finalize 的上传会话；无法完成复核时跳过本轮删除。写入结果未知时先核对根、会话和对象状态，不能证明成功或安全时才返回未知结果，不建立永久阻塞锁。
+10. 根 manifest 必须保持常数大小，不包含完整 pack 数组。根切换保留 ETag 条件写作为完整性保护；begin/finalize 不使用全局 mutation lock，也不因普通根版本变化向用户返回 409。finalize 在 CAS 失败时重新读取当前根并继续提交当前完整 snapshot（最多 3 轮，无竞争首轮必成功），最后成功完成的快照成为云端存档。GC 删除前必须重新读取当前根和 Bloom，并保护所有可完整枚举、仍可能 finalize 的上传会话；无法完成复核时跳过本轮删除。写入结果未知时先核对根、会话和对象状态，不能证明成功或安全时才返回未知结果，不建立永久阻塞锁。
+   manifest 状态读取在 isolate 内按 key/etag 缓存；legacy etag 迁移复核观察到 etag 已变化后用 WeakSet 永久短路，不再逐请求重 head 旧根。清单页在 isolate 内按 (根校验码, 页码) 共享缓存（上传侧与拉取侧同一批不可变页对象）。
 
 11. 下载 pack 必须绑定已提交清单位置：version、pageIndex、packIndex、checksum、length、entryCount 全部匹配后才读取 R2。不得只信任客户端提交的 checksum。
 
@@ -83,7 +85,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 13. 恢复必须保持两遍安全语义：
    - 下载批次直接复用内存字节完成长度、SHA-256、JSONL 数量、对象顺序和 bucket/group 归属的完整预校验，再写 staging；预校验失败不得触碰业务数据；
    - 全部预校验成功后才设置恢复标记（其他标签页收到信号后暂停写入并显示遮罩，恢复标签页用写屏障等在途写事务收尾）；第二遍每批最多 4 pack 从 staging 读取一次，同时恢复业务数据、重建 entry 缓存并批量缓存原始 pack。普通记录写入同时受 64 条和约 8MiB 估算字节上限约束。缓存 canonical bytes 用 new Uint8Array(canonicalBytes) 精确复制，禁止持久化整个 pack 的共享 backing buffer。
-   不得退回三遍 JSON 解析、每 pack 一个 staging/cache 事务，也不得取消 staging 后重复下载 300MB 快照。进入覆盖阶段后失败必须保留暂停标记，完整重试成功后才能清除。有效旧 32 桶/128 项快照按远端 bucket 恢复并将缓存标为 v7，下一次上传须经确认完整重建为 v8，不引入自动索引迁移。
+   不得退回三遍 JSON 解析、每 pack 一个 staging/cache 事务，也不得取消 staging 后重复下载 300MB 快照。进入覆盖阶段后失败必须保留暂停标记，完整重试成功后才能清除。缓存只识别当前 256 桶/32 项数组布局：旧 32 桶/128 项快照在放置校验处报错（不静默转换、无自动索引迁移）；恢复时命中本地缓存的 pack 只验证长度（写入缓存前已按 checksum 完整验证过），长度不符回退服务器下载，下载路径仍做完整 SHA-256 校验。
 
 14. GC 只能由显式 `gc-step` 请求执行，不放进 finalize、`waitUntil` 或长连接。GC 状态 `rp-sync-gc-state-v2` 按 `packs → manifest-pages → blooms → uploads` 四阶段持久化独立游标；根 checksum 变化时整体重置、从新根完整扫描（旧 gc-v1 状态只保留 pack 游标）。每步最多 list 256 个对象（uploads 阶段 16 个会话）；只删除当前根与活动会话都明确不引用、且超过对应宽限期（pack/控制对象 24 小时）的对象；游标用 ETag CAS 持久化，CAS 竞争静默放弃本次推进；游标持久化并可在边界对象被删除后继续。
 
@@ -133,17 +135,17 @@ RP Hub 魔改版：修改时必须保留的当前实现
 4. 本地 `sync-v13-budget` 使用小堆、R2 流外部托管，硬门槛 p95 ≤10ms、max ≤20ms、子请求 ≤50、R2 并发 ≤6；并发压力阶段（8 路同 isolate upload-pack、4 推 + 4 拉混合）逐请求套用同一门槛——客户端上传并发不得改变单请求预算结论。
    它是高分辨率墙钟代理，不是 Cloudflare 官方 CPU。部署后仍要看 Metrics 和 1102 错误。
 
-5. 2026-10-10 300MB 验证结果（新 256 桶/32 项数组布局）：
-   - 首次：0.293GiB、530 pack、448 字节 root、571 请求；宿主诊断 25.1 秒；
+5. 2026-10-13 300MB 验证结果（256 桶/32 项数组布局）：
+   - 首次：0.293GiB、530 pack、448 字节 root、575 请求；
    - 无变化：1 请求、0 pack；
-   - 100 条等长修改：90 新 pack、79.7MiB、130 请求、业务全扫游标 0；
-   - 20 加长 + 10 删除 + 10 新增：52 新 pack、27.6MiB、89 请求、业务全扫游标 0；
-   - 最终恢复：38,820 条、530 pack、547 个拉取请求、最大并发 4、133 个 staging 读取事务、宿主诊断 7.8 秒；
-   - 恢复每条记录固定解析 2 次、每个 staging pack 固定读取 1 次；
-   - 峰值：36 子请求、客户端并发 4、R2 put 1MiB。
-   - 与旧基线相比首次/恢复请求数增加，但等长修改上传从 87.5MiB 降至 79.7MiB，漂移修改从 110.5MiB 降至 27.6MiB；宿主墙钟不等同 Cloudflare CPU。
+   - 100 条等长修改：90 新 pack、79.7MiB、134 请求、业务全扫游标 0；
+   - 20 加长 + 10 删除 + 10 新增：52 新 pack、27.6MiB、93 请求、业务全扫游标 0；
+   - 最终恢复：38,820 条、530 pack、547 个拉取请求、最大并发 4、133 个 staging 读取事务；
+   - 恢复每条记录固定解析 2 次、每个 staging pack 固定读取 1 次、缓存命中不重哈希；
+   - 峰值：35 子请求、客户端并发 4、R2 put 1MiB；R2 Class B 随宿主 gc-step 批次数小幅波动。
+   - 宿主墙钟不等同 Cloudflare CPU。
 
-6. 最新独立预算见 README 第 5 节：upload-pack 4 子请求，manifest page 35/并发 6，finalize 5，pull page 1，pull pack 2，GC 8；本地墙钟不是 Cloudflare CPU。
+6. 最新独立预算见 DEVELOPMENT.md 第 5 节：upload-pack 3 子请求（isolate 页缓存命中后），manifest page 34/并发 6（isolate 内已验包免 head），finalize 5，pull page 1，pull pack 2，GC 8；本地墙钟不是 Cloudflare CPU。
 
 五、图片与图库不变量
 
@@ -161,7 +163,7 @@ RP Hub 魔改版：修改时必须保留的当前实现
 
 7. 适配层传入 autoImageGen 时先确认世界书已加载且状态字段存在，否则传 undefined，图片业务按原生生成语义放行。角色/分支/消息上下文缺失则不接管。“固定生图”开关保持纯持久化语义（只决定生成结果是否落盘为固定记录），不参与生成门控；其设置行样式仍来自适配层 ui.settings。
 
-8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生 `GET /generate`。YNAI JSON 响应受有界读取保护，解码图片上限 16MiB；固定生图开关只决定结果是否落盘，不得绕过本项目 URL 规范化、YNAI 路由或已有记录读取。空 steps 默认按提供商区分：ynai 28、sta1n 40；未显式带 `model` 的 ynai 请求默认值取云端 `image.ynai.defaultModel`（配置缺失回退内置 `nai-diffusion-4-5-full`，sta1n 恒用内置默认），默认值在签名计算前解析，缓存键与实际模型一致。**中转端点只认云端适配脚本头部元数据 `image.ynai` 段（base/modelsPath/generatePath/defaultModel），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存，写入前淘汰过期条目）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此改写作者源码。
+8. 生图提供商由密钥决定：`imageGenKey` 以 `YNAI-` 开头（不分大小写）时 provider 为 `ynai`，Worker 转发到中转站的 OpenAI images 形状（POST `/v1/images/generations`、`b64_json` 应答、尺寸映射 竖图 832x1216 / 横图 1216x832 / 方图 1024x1024）；其余一律 `sta1n` 原生生成。生成只走 POST（含固定记录重放与 reroll），GET 仅读取缓存，无缓存时 404。YNAI JSON 响应受有界读取保护，解码图片上限 16MiB；固定生图开关只决定结果是否落盘，不得绕过本项目 URL 规范化、YNAI 路由或已有记录读取。空 steps 默认按提供商区分：ynai 28、sta1n 40；未显式带 `model` 的 ynai 请求默认值取云端 `image.ynai.defaultModel`（配置缺失回退内置 `nai-diffusion-4-5-full`，sta1n 恒用内置默认），默认值在签名计算前解析，缓存键与实际模型一致。**中转端点只认云端适配脚本头部元数据 `image.ynai` 段（base/modelsPath/generatePath/defaultModel），无代码兜底**——配置缺失或形状非法时模型端点与 ynai 生成显式报 503；**缓存不区分来源**：`provider` 不再是 URL 参数键，签名的 provider 字段恒为 `'sta1n'`，两个提供商共享同一内容寻址缓存，历史键稳定，URL/快照不携带 provider。`GET /api/rp-image-models` 以 `x-rp-image-token` 头转发中转站 `/v1/models`（仅接受 YNAI- 密钥，30 秒内存缓存，写入前淘汰过期条目）；魔改层劫持作者设置页“生图版本”浮窗（按 ui.settings.modelLabel 定位，隐藏 custom-select 并原位放入同款 select），选项来自该端点（列表镜像存 `rp_hub_magic_ynai_models`），默认模型取 `image.ynai.defaultModel`（无则取列表第一个），选择存 `rp_hub_magic_ynai_model` 并在构建请求时覆盖 `model` 参数；固定记录重放使用生成时快照的模型。不使用作者页面的 provider UI（作者已移除多中转），不为此改写作者源码。
 
 六、验证与发布
 

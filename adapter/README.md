@@ -23,5 +23,3 @@ Worker 的 last-good 是通过元数据和契约标记校验的脚本副本，�
 `rp-hub.js` 是当前维护和生产使用的适配入口；Worker 不再改写作者 app.js，而是把该脚本的元数据和可执行桥接层按当前页面版本注入。
 
 `rp-hub.json` 保留给仍在使用旧版适配协议的实例，不参与新版 `rp-hub.js` 的生产加载。
-
-本轮已完成离线回归与本地发布归档校验；外部脚本已发布到 GitHub Raw URL，但未向 Cloudflare、Pages 或真实 R2 上传部署。

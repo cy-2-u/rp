@@ -162,50 +162,20 @@ for (const stage of ['dirty', 'state']) {
     console.log('PASS restore record batches honor the byte threshold');
 }
 
-// Root CAS races are absorbed by the Worker; the client retries only an
-// unknown server result and keeps the same local snapshot/base.
+// The client-side retry wrapper around the paged upload was removed: the
+// Worker absorbs root-CAS races server-side, and ordinary 5xx retries are
+// owned by withSyncRetry inside postSync. The attempt function is invoked
+// exactly once per upload; 409 validation failures are never retried.
 {
-    const start = source.indexOf('    async function resumePagedUpload(');
-    const end = source.indexOf('    async function uploadPagedSnapshotAttempt(', start);
-    assert.ok(start >= 0 && end > start, 'resumePagedUpload source boundaries');
-    const resumeSource = source.slice(start, end);
-    const attempts = [];
-    const context = vm.createContext({
-        CONFIG: { commitTimeoutMs: 10 },
-        SNAPSHOT_SCHEMA_VERSION: 13,
-        updateProgress() { },
-        uploadPagedSnapshotAttempt: async (_snapshot, version, checksum) => {
-            attempts.push([version, checksum]);
-            if (attempts.length === 1) {
-                throw Object.assign(new Error('unknown result'), { status: 503 });
-            }
-            return { checksum: 'snapshot' };
-        }
-    });
-    vm.runInContext(resumeSource, context);
-    const result = await context.resumePagedUpload({ checksum: 'snapshot' }, 3, 'old-base', { uploadStart: 1 });
-    assert.equal(result.checksum, 'snapshot');
-    assert.deepEqual(attempts, [[3, 'old-base'], [3, 'old-base']]);
-
-    const conflictAttempts = [];
-    const conflict = vm.createContext({
-        CONFIG: { commitTimeoutMs: 10 },
-        SNAPSHOT_SCHEMA_VERSION: 13,
-        updateProgress() { },
-        uploadPagedSnapshotAttempt: async (_snapshot, version, checksum) => {
-            conflictAttempts.push([version, checksum]);
-            throw Object.assign(new Error('validation failure'), {
-                response: { error: 'invalid snapshot' }, status: 409
-            });
-        }
-    });
-    vm.runInContext(resumeSource, conflict);
-    await assert.rejects(
-        conflict.resumePagedUpload({ checksum: 'snapshot' }, 3, 'old-base', { uploadStart: 1 }),
-        /validation failure/
-    );
-    assert.deepEqual(conflictAttempts, [[3, 'old-base']], 'validation 409 must not be retried as a base conflict');
-    console.log('PASS client retries unknown results without recheck/base-conflict coupling');
+    const start = source.indexOf('    async function uploadPagedSnapshotAttempt(');
+    const end = source.indexOf('    // cacheDb 由调用方', start);
+    assert.ok(start >= 0 && end > start, 'uploadPagedSnapshotAttempt source boundaries');
+    const bootstrapBody = source.slice(start, end);
+    assert.doesNotMatch(bootstrapBody, /resumePagedUpload/,
+        'the removed retry wrapper must not linger inside the upload attempt');
+    assert.match(bootstrapBody, /action: 'begin-upload'/);
+    assert.match(bootstrapBody, /action: 'finalize-upload'/);
+    console.log('PASS paged upload has no client-side 5xx retry wrapper');
 }
 
 // Autosave scheduler is a foreground-only one-shot timer. Keep this test

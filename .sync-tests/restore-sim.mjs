@@ -518,7 +518,13 @@ const restoreMetrics = {
     cachePackWrites: [],
     pullInflight: 0,
     maxPullInflight: 0,
-    packNetworkRequests: 0
+    packNetworkRequests: 0,
+    digestCount: 0
+};
+const nativeSubtleDigest = crypto.subtle.digest.bind(crypto.subtle);
+crypto.subtle.digest = function (...args) {
+    restoreMetrics.digestCount += 1;
+    return nativeSubtleDigest(...args);
 };
 const snapshotTypes = new Set([
     'localStorage', 'database', 'record', 'recordArrayStart', 'recordArrayItem',
@@ -678,6 +684,7 @@ cacheDatabase.close();
 
 const runCachedRestoreProbe = async (label, corruptMode) => {
     const before = restoreMetrics.packNetworkRequests;
+    const beforeDigests = restoreMetrics.digestCount;
     const cacheDb = await idbOpen(factoryB, 'RPHubSyncCache', undefined, ['packs']);
     try {
         await new Promise((resolve, reject) => {
@@ -707,26 +714,46 @@ const runCachedRestoreProbe = async (label, corruptMode) => {
         locks: locksB
     });
     await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
+    if (corruptMode === 'checksum') {
+        // Same-length corrupted cache bytes are no longer re-hashed on the
+        // cache-hit path; the damaged line must still stop the restore at
+        // JSONL parsing with zero pack downloads and untouched local data.
+        await waitFor(() => {
+            const modal = findSyncModal(probeDocument);
+            if (modal?.classList.contains('is-error')
+                && /JSON 不正确|数据包|恢复/.test(modal.querySelector('.rp-sync-modal__status').textContent)) return true;
+            return probeLocation.replaced ? false : null;
+        }, 60000, label);
+        assert.equal(probeLocation.replaced, null, `${label} must not complete the restore`);
+        assert.equal(restoreMetrics.packNetworkRequests - before, 0,
+            'a same-length corrupted cached pack must not trigger a download');
+        return;
+    }
     await waitFor(() => {
         const modal = findSyncModal(probeDocument);
         if (modal?.classList.contains('is-error')) throw new Error(`${label} failed: ${modal.querySelector('.rp-sync-modal__status').textContent}`);
         return probeLocation.replaced ? true : null;
     }, 60000, label);
-    if (corruptMode) {
+    if (corruptMode === 'length') {
         assert.equal(restoreMetrics.packNetworkRequests - before, 1,
             `${label} must fetch only the rejected cached pack`);
-    } else {
-        assert.equal(restoreMetrics.packNetworkRequests, before,
-            'a second restore must reuse every SHA-256-verified cached pack');
+        // 回源的那一个包走完整 SHA-256 校验；其余包命中本地缓存不重哈希，
+        // 恢复全程的 digest 只剩页 hash 等清单级计算（页数级，非包数级）。
+        assert.ok(restoreMetrics.digestCount - beforeDigests <= manifestV1.pageCount + 8,
+            `cached restore must not re-hash every cached pack (digests=${restoreMetrics.digestCount - beforeDigests}, pages=${manifestV1.pageCount})`);
+        return;
     }
+    // 全部包命中本地缓存：不重哈希任何包，digest 只剩页 hash 等清单级计算。
+    assert.ok(restoreMetrics.digestCount - beforeDigests <= manifestV1.pageCount + 8,
+        `fully cached restore must not re-hash any pack (digests=${restoreMetrics.digestCount - beforeDigests}, pages=${manifestV1.pageCount})`);
 };
 
 await runCachedRestoreProbe('verified local pack-cache restore', null);
 console.log('phase 2c (verified local cache hit): ok - zero pack downloads');
 await runCachedRestoreProbe('wrong-length local pack-cache restore', 'length');
 console.log('phase 2c (wrong-length cache falls back to server): ok');
-await runCachedRestoreProbe('wrong-checksum local pack-cache restore', 'checksum');
-console.log('phase 2c (wrong-checksum cache falls back to server): ok');
+await runCachedRestoreProbe('same-length corrupted local pack-cache restore', 'checksum');
+console.log('phase 2c (same-length corrupted cache fails JSONL parse without downloads): ok');
 console.log(`phase 2 (restore): ok - ${manifestV1.entryCount} entries parsed twice, ${manifestV1.packCount} staged packs read once`);
 
 // A schema mismatch must be rejected during validate-only preflight, before
@@ -771,130 +798,10 @@ console.log(`phase 2 (restore): ok - ${manifestV1.entryCount} entries parsed twi
     console.log('phase 2e (schema mismatch leaves localStorage and business records untouched): ok');
 }
 
-// A valid legacy snapshot must restore normally, preserve its old placement in
-// the local cache as version 7, and require the existing explicit rebuild flow
-// before the next upload creates the v8 layout.
-restorePrototypes(savedPrototypes);
-const legacyBucket = createMemBucket();
-const legacyKey = 'rp_hub_legacy_fixture';
-const legacySha256Hex = async bytes => Buffer.from(await crypto.subtle.digest('SHA-256', bytes)).toString('hex');
-const legacyLineBytes = new TextEncoder().encode(JSON.stringify({
-    type: 'localStorage', key: legacyKey, value: 'legacy-value'
-}) + '\n');
-const legacyChecksum = await legacySha256Hex(legacyLineBytes);
-const legacyHash = (() => {
-    let hash = 2166136261;
-    for (const character of `ls:${legacyKey}`) {
-        hash ^= character.charCodeAt(0);
-        hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-})();
-const legacyChainSeed = '0'.repeat(64);
-const legacyBucketKey = `localStorage|r${String(legacyHash % 32).padStart(3, '0')}`;
-const legacyPack = {
-    bucketKey: legacyBucketKey,
-    group: 'localStorage',
-    part: 0,
-    checksum: legacyChecksum,
-    length: legacyLineBytes.byteLength,
-    entryCount: 1
-};
-const legacyPageHash = await legacySha256Hex(new TextEncoder().encode(JSON.stringify([
-    'rp-sync-manifest-page-v1', 0, legacyChainSeed,
-    [[legacyPack.bucketKey, legacyPack.group, 0, legacyPack.checksum, legacyPack.length, 1]]
-])));
-const legacyBloom = new Uint8Array(32 * 1024);
-for (const offset of [0, 8, 16, 24]) {
-    const bit = Number.parseInt(legacyChecksum.slice(offset, offset + 8), 16) % (legacyBloom.byteLength * 8);
-    legacyBloom[bit >>> 3] |= 1 << (bit & 7);
-}
-const legacyBloomChecksum = await legacySha256Hex(legacyBloom);
-const legacyRootChecksum = await legacySha256Hex(new TextEncoder().encode(JSON.stringify([
-    'rp-sync-paged-jsonl-v4', 13, legacyPack.length, 1, 1, 1, legacyPageHash, legacyBloomChecksum
-])));
-await legacyBucket.put('rp-sync/main/migration-v13.done', JSON.stringify({
-    format: 'rp-sync-migration-v13', legacyEtag: null, createdAt: Date.now()
-}));
-await legacyBucket.put(`rp-sync/main/packs/${legacyChecksum}.bin`, legacyLineBytes, {
-    customMetadata: { entryCount: '1' }
-});
-await legacyBucket.put(`rp-sync/main/blooms/${legacyBloomChecksum}.bin`, legacyBloom);
-await legacyBucket.put(`rp-sync/main/manifests/${legacyRootChecksum}/0000.json`, JSON.stringify({
-    format: 'rp-sync-manifest-page-v1',
-    checksum: legacyRootChecksum,
-    pageIndex: 0,
-    previousPageHash: legacyChainSeed,
-    pageHash: legacyPageHash,
-    packs: [legacyPack]
-}));
-await legacyBucket.put(MANIFEST_KEY, JSON.stringify({
-    format: 'rp-sync-manifest-root-v1',
-    version: 1,
-    checksum: legacyRootChecksum,
-    updatedAt: Date.now(),
-    totalBytes: legacyPack.length,
-    packCount: 1,
-    entryCount: 1,
-    pageCount: 1,
-    pageRoot: legacyPageHash,
-    bloomChecksum: legacyBloomChecksum,
-    snapshotFormat: 'rp-sync-paged-jsonl-v4',
-    schemaVersion: 13
-}));
-const factoryLegacy = new FDBFactory();
-const StorageLegacy = makeStorageClass();
-const localStorageLegacy = new StorageLegacy();
-localStorageLegacy.setItem(legacyKey, 'local-value');
-const documentLegacy = createDocumentStub();
-const locationLegacy = {
-    pathname: '/sync-restore', replaced: null, assigned: null,
-    replace(url) { this.replaced = url; },
-    assign(url) { this.assigned = url; }
-};
-installBrowserGlobals({
-    storageClass: StorageLegacy,
-    localStorage: localStorageLegacy,
-    factory: factoryLegacy,
-    document: documentLegacy,
-    location: locationLegacy,
-    fetchShim: makeFetchShim('legacy restore', { RP_SYNC_R2: legacyBucket }),
-    locks: locksB
-});
-await runScripts(['DB/dirty-tracker.js', 'DB/bootstrap.js']);
-await waitFor(() => locationLegacy.replaced === '/', 60000, 'valid legacy restore');
-assert.equal(localStorageLegacy.getItem(legacyKey), 'legacy-value', 'legacy localStorage must restore');
-const legacyCacheState = await idbGetAll(factoryLegacy, 'RPHubSyncCache', 'state');
-assert.equal(legacyCacheState.get('snapshot').version, 7, 'legacy placements must mark cache version 7');
-assert.match(legacyCacheState.get('snapshot').packs[0].bucketKey, /\|r\d{3}$/);
-console.log('phase 2a (valid legacy restore): ok');
-
-// On the normal page, the first upload after a legacy restore must use the
-// existing one-time confirmation and then rebuild the cache into v8.
-locationLegacy.pathname = '/';
-const documentLegacyHome = createDocumentStub();
-installBrowserGlobals({
-    storageClass: StorageLegacy,
-    localStorage: localStorageLegacy,
-    factory: factoryLegacy,
-    document: documentLegacyHome,
-    location: locationLegacy,
-    fetchShim: makeFetchShim('legacy rebuild upload', { RP_SYNC_R2: legacyBucket }),
-    locks: locksB
-});
-let rebuildConfirmations = 0;
-setGlobal('confirm', () => { rebuildConfirmations += 1; return true; });
-globalThis.RPHubExternal = { version: 1, flush: async () => {} };
-await runScripts(['DB/bootstrap.js']);
-const legacyHomeModal = findSyncModal(documentLegacyHome);
-assert.ok(legacyHomeModal, 'normal page must expose the sync panel after legacy restore');
-legacyHomeModal.querySelector('[data-action="push"]').click();
-await waitForUploadDone(legacyHomeModal, 'legacy cache rebuild upload');
-assert.equal(rebuildConfirmations, 1, 'legacy cache must ask once before rebuilding');
-const rebuiltCacheState = await idbGetAll(factoryLegacy, 'RPHubSyncCache', 'state');
-assert.equal(rebuiltCacheState.get('snapshot').version, 8, 'confirmed rebuild must produce v8 cache');
-assert.match(rebuiltCacheState.get('snapshot').packs[0].bucketKey, /\|s\d{3}$/);
-console.log('phase 2a (legacy cache confirms v8 rebuild): ok');
+// The legacy 32-bucket/128-item placement compatibility was removed from the
+// client: an individual archive re-uploaded once under the v8 layout never
+// produces legacy snapshots again, so restoring `|r`/`|p` buckets now fails
+// placement validation instead of silently round-tripping through v7.
 
 // Restore the native fake-indexeddb methods before constructing the malformed
 // snapshot fixture below.
@@ -915,7 +822,7 @@ const validLine = JSON.stringify({ type: 'localStorage', key: corruptKey, value:
 const corruptBytes = new TextEncoder().encode(`${validLine}\n{"type":broken}\n`);
 const corruptPackChecksum = await sha256Hex(corruptBytes);
 const corruptPack = {
-    bucketKey: `localStorage|r${String(stableHashForTest(`ls:${corruptKey}`) % 32).padStart(3, '0')}`,
+    bucketKey: `localStorage|s${String(stableHashForTest(`ls:${corruptKey}`) % 256).padStart(3, '0')}`,
     group: 'localStorage',
     part: 0,
     checksum: corruptPackChecksum,

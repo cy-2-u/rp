@@ -686,7 +686,7 @@ test('legacy sta1n replay keys are stable with or without the provider param', (
     const { context } = load();
     const withParam = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?provider=sta1n&tag=t&character_name=A..B'), '');
     const withoutParam = context.buildImageParams(new URL('https://offline.invalid/api/rp-image?tag=t&character_name=A..B'), '');
-    assert.equal(withParam.provider, 'sta1n');
-    assert.equal(withoutParam.provider, 'sta1n', '旧记录/旧页面无 provider 参数时同样落在 sta1n');
     assert.equal(context.buildImageSignature(withParam), context.buildImageSignature(withoutParam), '签名逐字节一致 → 旧图同一 R2 键');
+    assert.equal(JSON.parse(context.buildImageSignature(withParam)).provider, 'sta1n', '签名的 provider 字段恒为 sta1n');
+    assert.equal(withParam.provider, undefined, 'provider 不再是参数键，URL 残留值被忽略');
 });
