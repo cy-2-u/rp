@@ -267,7 +267,6 @@ const IMAGE_DEFAULT_CFG = '0';
 const IMAGE_DEFAULT_SAMPLER = 'k_dpmpp_2m_sde';
 const IMAGE_DEFAULT_NOISE_SCHEDULE = 'karras';
 const IMAGE_PARAM_KEYS = [
-    'provider',
     'tag',
     'model',
     'artist',
@@ -281,8 +280,9 @@ const IMAGE_PARAM_KEYS = [
     'noise_schedule'
 ];
 // 密钥即路由：YNAI- 前缀密钥走第三方中转（OpenAI images 形状），其余走 sta1n 原生。
-// 中转端点只来自云端适配清单（adapter.image.ynai），不做代码兜底；provider 虽进
-// 签名但值恒为 'sta1n'——两个提供商共享同一内容寻址缓存，历史键保持稳定。
+// 中转端点只来自云端适配清单（adapter.image.ynai），不做代码兜底；签名里保留
+// provider 字段但值恒为 'sta1n'，URL/快照不携带 provider。同参数同密钥的键稳定；
+// 空 steps 等按提供商区分的默认值会使不同密钥得到不同键（输出本就不同）。
 const IMAGE_UPSTREAM_STA1N = 'https://nai.sta1n.cn';
 const IMAGE_SIZE_PIXELS = { '竖图': '832x1216', '横图': '1216x832', '方图': '1024x1024' };
 const IMAGE_MODELS_PATH = '/api/rp-image-models';
@@ -408,15 +408,17 @@ function isYnaiImageToken(token) {
 }
 
 function applyImageParamDefaults(params, token, characterName, ynaiDefaultModel = null) {
-    params.provider = isYnaiImageToken(token) ? 'ynai' : 'sta1n';
+    // provider 不再是参数键：密钥即路由（YNAI- → ynai 中转，否则 sta1n），
+    // URL 里的 provider 值一律忽略，也不参与签名（历史链接残留的 provider
+    // 对行为与缓存键都没有影响）。
     params.character_name = sanitizeImageKeySegment(characterName, '未命名角色');
     // 模型默认：sta1n 恒用内置默认；ynai 请求未显式带 model 时优先云端
     // 适配清单的 image.ynai.defaultModel（配置缺失时回退内置默认）。
     params.model = params.model
-        || (params.provider === 'ynai' ? (ynaiDefaultModel || IMAGE_DEFAULT_MODEL) : IMAGE_DEFAULT_MODEL);
+        || (isYnaiImageToken(token) ? (ynaiDefaultModel || IMAGE_DEFAULT_MODEL) : IMAGE_DEFAULT_MODEL);
     params.size = params.size || IMAGE_DEFAULT_SIZE;
     // 空 steps 默认按提供商区分：ynai 中转 28，sta1n 维持原 40。
-    params.steps = params.steps || (params.provider === 'ynai' ? IMAGE_DEFAULT_STEPS_YNAI : IMAGE_DEFAULT_STEPS);
+    params.steps = params.steps || (isYnaiImageToken(token) ? IMAGE_DEFAULT_STEPS_YNAI : IMAGE_DEFAULT_STEPS);
     params.scale = params.scale || IMAGE_DEFAULT_SCALE;
     params.cfg = params.cfg || IMAGE_DEFAULT_CFG;
     params.sampler = params.sampler || IMAGE_DEFAULT_SAMPLER;
@@ -428,9 +430,6 @@ function applyImageParamDefaults(params, token, characterName, ynaiDefaultModel 
 function buildImageParams(url, token, ynaiDefaultModel = null) {
     const params = {};
     for (const key of IMAGE_PARAM_KEYS) {
-        // provider 不从 URL 读取：applyImageParamDefaults 按密钥恒定重算，
-        // URL 里是否携带 provider 对行为与缓存键都没有影响。
-        if (key === 'provider') continue;
         params[key] = normalizeImageParam(url.searchParams.get(key));
     }
     params.reroll_nonce = normalizeImageParam(url.searchParams.get('reroll_nonce'), 120);
@@ -438,11 +437,12 @@ function buildImageParams(url, token, ynaiDefaultModel = null) {
 }
 
 function buildImageSignature(params) {
-    const signature = {};
+    // 签名的 provider 字段恒为 'sta1n'：两个提供商共享同一内容寻址缓存，
+    // 旧图键由此保持稳定，切换密钥不会产生重复副本。provider 不从 URL
+    // 读取，历史 URL 残留的 provider 值对缓存键没有影响。
+    const signature = { provider: 'sta1n' };
     for (const key of IMAGE_PARAM_KEYS) {
-        // 签名的 provider 字段恒为 'sta1n'：两个提供商共享同一内容寻址缓存，
-        // 旧图键由此保持稳定，切换密钥不会产生重复副本。
-        signature[key] = key === 'provider' ? 'sta1n' : (params[key] || '');
+        signature[key] = params[key] || '';
     }
     if (params.reroll_nonce) {
         signature.reroll_nonce = params.reroll_nonce;
@@ -761,8 +761,9 @@ async function handleImageRender(request, env) {
     const url = new URL(request.url);
     const bucket = getBucket(env);
     const token = normalizeImageParam(url.searchParams.get('token'), 1000);
-    const generateOnMiss = request.method === 'POST'
-        || (request.method === 'GET' && url.searchParams.get('generate') === '1');
+    // 生图只接受 POST：GET/HEAD 一律只读（读缓存或 404），链接预取、
+    // 爬虫或旧分享链接都不会意外触发生图扣费。
+    const generateOnMiss = request.method === 'POST';
     // ynai 请求提前解析一次云端配置：defaultModel 要在签名计算前参与
     // 模型默认值（缓存键必须与实际使用的模型一致），生成阶段直接复用，
     // 不再二次加载。
@@ -816,7 +817,8 @@ async function handleImageRender(request, env) {
     if (!token) return error('缺少生图密钥。', 401);
     if (!primary.params.tag) return error('缺少生图提示词。', 400);
     let result;
-    if (primary.params.provider === 'ynai') {
+    // 密钥即路由：YNAI- 前缀走中转，其余走 sta1n 原生。
+    if (isYnaiImageToken(token)) {
         if (!ynaiConfig) return error('中转生图配置未加载，请检查适配清单。', 503);
         result = await fetchYnaiGeneratedImage(primary.params, token, ynaiConfig);
     } else {
@@ -1619,18 +1621,23 @@ const MANIFEST_STATE_CACHE_MAX = 8;
 // 内容寻址 Bloom 的已验字节缓存：键是自校验的 checksum。
 const verifiedBloomCache = new Map();
 const VERIFIED_BLOOM_CACHE_MAX = 4;
+// 迁移标记不可变、根只被 v13 代码写：一旦观测到根 etag 不是 legacy etag，
+// 就永远不会再回到 legacy 态。按 bucket 记下这个事实后，后续每个同步
+// 请求省掉一次仅为 legacy 比对存在的根 head。
+const legacyStateExcluded = new WeakSet();
 
 async function getManifestState(bucket) {
     const migration = await getMigrationState(bucket);
     if (!migration) return { manifest: null, etag: null, resetRequired: true };
     // 正常态 legacyEtag 为 null（非 legacy 库），head 只为与 legacy etag
     // 比对而存在，可直接跳过；legacy 态仍先 head 比对再读正文。
-    if (migration.legacyEtag) {
+    if (migration.legacyEtag && !legacyStateExcluded.has(bucket)) {
         const head = await bucket.head(MANIFEST_KEY);
         if (!head) return { manifest: null, etag: null, resetRequired: false };
         if (head.etag === migration.legacyEtag) {
             return { manifest: null, etag: head.etag, resetRequired: false, legacy: true };
         }
+        legacyStateExcluded.add(bucket);
     }
     const stored = await readSmallJsonObject(bucket, MANIFEST_KEY, 16 * 1024);
     if (!stored) return { manifest: null, etag: null, resetRequired: false };
@@ -1747,10 +1754,23 @@ function normalizeManifestPage(value, root, pageIndex) {
 
 // 清单页按 (根校验码, 页码) 内容寻址且写入不可变（etagDoesNotMatch:*），
 // pull-pack 恢复 N 个包会逐包重读并重验同一页；进程内缓存后恢复 N 包
-// 只付 ≤pageCount 次页读取。根校验码进键名即天然失效；上限防长寿命
-// isolate 在多轮上传后缓慢膨胀。
+// 只付 ≤pageCount 次页读取。上传侧读取的是同一批不可变页对象，upload-pack
+// 逐包校验页归属时由此省一次页 get，逐包上传的子请求预算从 4/包 降到 2/包。
+// 根校验码进键名即天然失效；上限防长寿命 isolate 在多轮上传后缓慢膨胀。
 const manifestPageCache = new Map();
 const MANIFEST_PAGE_CACHE_MAX = 96;
+// 包验证结果是永久性证据：upload-pack 用 R2 sha256 参数校验过正文并核对过
+// 元数据，对象不可变且 GC 保护活动会话。按 checksum 缓存 (length, entryCount)，
+// 页提交复核命中时不再付 head；缓存值与页声明不一致仍按元数据冲突处理。
+const verifiedPackCache = new Map();
+const VERIFIED_PACK_CACHE_MAX = 1024;
+
+function rememberVerifiedPack(checksum, length, entryCount) {
+    if (verifiedPackCache.size >= VERIFIED_PACK_CACHE_MAX) {
+        verifiedPackCache.delete(verifiedPackCache.keys().next().value);
+    }
+    verifiedPackCache.set(checksum, { length, entryCount });
+}
 
 async function readManifestPage(bucket, root, pageIndex) {
     const cacheKey = `${root.checksum}/${pageIndex}`;
@@ -1941,13 +1961,17 @@ async function handleUploadPack(request, bucket, url) {
         if (request.body.cancel) await request.body.cancel();
         return error('上传会话不存在或已过期。', 409);
     }
-    let page = storedSession.session.nextPage < storedSession.session.pageCount
-        ? await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage)
-        : null;
-    let declared = page?.packs.find(pack => pack.checksum === checksum);
+    // 上传清单页不可变（写入 etagDoesNotMatch:*），isolate 内按
+    // (根校验码, 页码) 缓存；readUploadManifestPage 优先命中缓存，
+    // 逐包上传不再每包重读同一页。
+    let declared = null;
+    if (storedSession.session.nextPage < storedSession.session.pageCount) {
+        const page = await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage);
+        declared = page?.packs.find(pack => pack.checksum === checksum) || null;
+    }
     if (!declared && storedSession.session.nextPage > 0) {
-        page = await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage - 1);
-        declared = page?.packs.find(pack => pack.checksum === checksum);
+        const previousPage = await readUploadManifestPage(bucket, storedSession.session, storedSession.session.nextPage - 1);
+        declared = previousPage?.packs.find(pack => pack.checksum === checksum) || null;
     }
     if (!declared || declared.length !== length || declared.entryCount !== entryCount) {
         if (request.body.cancel) await request.body.cancel();
@@ -1960,6 +1984,7 @@ async function handleUploadPack(request, bucket, url) {
         if (Number(existing.size) === length
             && Number(existing.customMetadata?.entryCount) === entryCount) {
             if (request.body.cancel) await request.body.cancel();
+            rememberVerifiedPack(checksum, length, entryCount);
             return new Response(null, { status: 204 });
         }
         if (request.body.cancel) await request.body.cancel();
@@ -1971,10 +1996,14 @@ async function handleUploadPack(request, bucket, url) {
         customMetadata: { entryCount: String(entryCount) },
         onlyIf: { etagDoesNotMatch: '*' }
     });
-    if (stored) return new Response(null, { status: 204 });
+    if (stored) {
+        rememberVerifiedPack(checksum, length, entryCount);
+        return new Response(null, { status: 204 });
+    }
     const raced = await bucket.head(key);
     if (raced && Number(raced.size) === length
         && Number(raced.customMetadata?.entryCount) === entryCount) {
+        rememberVerifiedPack(checksum, length, entryCount);
         return new Response(null, { status: 204 });
     }
     return error('内容寻址数据包已被其他元数据占用。', 409);
@@ -2040,6 +2069,11 @@ function uploadSessionInfo(session) {
 }
 
 async function readUploadManifestPage(bucket, session, pageIndex) {
+    // 上传页不可变且已通过页 hash 与会话衔接校验，读后放入与拉取侧共享的
+    // 页缓存：upload-pack 逐包归属校验命中后不再重读重验。
+    const cacheKey = `${session.checksum}/${pageIndex}`;
+    const cached = manifestPageCache.get(cacheKey);
+    if (cached) return cached;
     const stored = await readSmallJsonObject(bucket, createManifestPageKey(session.checksum, pageIndex));
     if (!stored) return null;
     const page = normalizeManifestPage(stored.value, session, pageIndex);
@@ -2055,11 +2089,11 @@ async function readUploadManifestPage(bucket, session, pageIndex) {
         || (pageIndex === session.pageCount - 1 && page.pageHash !== session.pageRoot)) {
         throw new SyncRequestError('上传清单页校验失败。', 409);
     }
+    if (manifestPageCache.size >= MANIFEST_PAGE_CACHE_MAX) {
+        manifestPageCache.delete(manifestPageCache.keys().next().value);
+    }
+    manifestPageCache.set(cacheKey, page);
     return page;
-}
-
-async function handleBeginUpload(bucket, body) {
-    return beginUpload(bucket, body);
 }
 
 async function beginUpload(bucket, body) {
@@ -2261,7 +2295,15 @@ async function handleUploadManifestPage(bucket, body) {
         }
     }
 
-    const checked = await runConcurrent([...unique.values()], 6, async pack => {
+    // 页提交复核只 head 缓存中没有验证记录的包：upload-pack 已用 R2 sha256
+    // 参数校验过正文并核对过元数据，对象不可变，验证结果是永久性证据。
+    // 首次上传（包刚传完）整页命中缓存，32 head 降为 0；跨 isolate 续传时
+    // 仍对缓存外的包照常 head。缓存值与页声明不一致按元数据冲突处理。
+    const unchecked = [...unique.values()].filter(pack => {
+        const verified = verifiedPackCache.get(pack.checksum);
+        return !verified || verified.length !== pack.length || verified.entryCount !== pack.entryCount;
+    });
+    const checked = await runConcurrent(unchecked, 6, async pack => {
         const object = await bucket.head(createPackKey(pack.checksum));
         return object && Number(object.size) === pack.length
             && Number(object.customMetadata?.entryCount) === pack.entryCount
@@ -2346,8 +2388,8 @@ async function handleFinalizeUpload(bucket, body) {
 
     // 根清单仍使用 R2 ETag 条件写，避免一次写入覆盖另一次尚未观察到的写入。
     // 个人存档不把 CAS 失败暴露给用户，而是重新读取当前根并继续提交；
-    // 循环中最后成功写入的完整快照就是最后一次存档。
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    // 无竞争时首轮必成功，3 轮足以吸收 GC/begin 的偶发交叉。
+    for (let attempt = 0; attempt < 3; attempt += 1) {
         const manifestState = await getManifestState(bucket);
         if (manifestState.resetRequired) return error('同步存储尚未初始化。', 409, { resetRequired: true });
         if (manifestState.manifest?.checksum === session.checksum) {
@@ -2710,7 +2752,7 @@ async function handleJsonApi(request, env) {
     if (body.action === 'initialize-storage') return handleInitializeStorage(bucket, body);
     if (body.action === 'pull-manifest-page') return handlePullManifestPage(bucket, body);
     if (body.action === 'pull-pack') return handlePullPack(bucket, body);
-    if (body.action === 'begin-upload') return handleBeginUpload(bucket, body);
+    if (body.action === 'begin-upload') return beginUpload(bucket, body);
     if (body.action === 'upload-manifest-page') return handleUploadManifestPage(bucket, body);
     if (body.action === 'finalize-upload') return handleFinalizeUpload(bucket, body);
     if (body.action === 'gc-step') return handleGcStep(bucket);

@@ -1469,21 +1469,22 @@ function createAutoSaveScheduler(options = {}) {
         return `${left}${right}-${sourceKey.length}`;
     }
 
-    function snapshotEntryBucket(value, id, sourceKey, legacy = false) {
+    // 旧版 32 桶/128 项布局（|r/%03d 与 |p/%010d）的恢复兼容已删除：
+    // 云端是整体替换存档，个人数据用 v8 布局重新上传一次后不再存在
+    // legacy 快照；恢复到这种包只可能来自早已废弃的旧存档。
+    function snapshotEntryBucket(value, id, sourceKey) {
         const group = snapshotEntryGroup(value);
         if (group.endsWith(':header')) return `${group}|h`;
         if (group.endsWith(':footer')) return `${group}|z`;
         if (value.type === 'recordArrayStart'
             || value.type === 'recordArrayItem'
             || value.type === 'recordArrayEnd') {
-            const length = Number(value.length || 0);
-            const pageSize = legacy ? 128 : ARRAY_BUCKET_ENTRIES;
             const page = value.type === 'recordArrayItem'
-                ? Math.floor(Number(value.index || 0) / pageSize)
-                : value.type === 'recordArrayEnd' ? Math.floor(length / pageSize) : 0;
-            return `${group}|a${arraySourceToken(sourceKey)}|${legacy ? 'p' : 'q'}${String(page).padStart(10, '0')}`;
+                ? Math.floor(Number(value.index || 0) / ARRAY_BUCKET_ENTRIES)
+                : value.type === 'recordArrayEnd' ? Math.floor(Number(value.length || 0) / ARRAY_BUCKET_ENTRIES) : 0;
+            return `${group}|a${arraySourceToken(sourceKey)}|q${String(page).padStart(10, '0')}`;
         }
-        return `${group}|${legacy ? 'r' : 's'}${String(stableHash(id) % (legacy ? 32 : STABLE_BUCKET_COUNT)).padStart(3, '0')}`;
+        return `${group}|s${String(stableHash(id) % STABLE_BUCKET_COUNT).padStart(3, '0')}`;
     }
 
     function buildCacheEntry(value, canonicalBytes = null) {
@@ -1992,8 +1993,12 @@ function createAutoSaveScheduler(options = {}) {
             const pack = packManifest[index];
             const pending = (async () => {
                 const cached = cacheDb ? await cachePack(cacheDb, pack.checksum).catch(() => null) : null;
-                if (cached?.byteLength === pack.length && await sha256Bytes(cached) === pack.checksum) return cached;
-                return postSyncBinary({
+                // 缓存命中只验长度：这份字节在写入本地缓存前已按 checksum
+                // 验过（upload 时经 sha256 校验的分片原样落盘），个人场景
+                // 不再每次恢复对全部缓存包重付一遍 SHA-256。长度不符视为
+                // 缓存损坏，回源下载走完整校验。
+                if (cached?.byteLength === pack.length) return { bytes: cached, verified: true };
+                const bytes = await postSyncBinary({
                     action: 'pull-pack',
                     version: remote.version,
                     pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
@@ -2002,15 +2007,14 @@ function createAutoSaveScheduler(options = {}) {
                     length: pack.length,
                     entryCount: pack.entryCount
                 }, { timeoutMs: CONFIG.packTransferTimeoutMs });
-            })().then(async bytes => {
                 if (bytes.byteLength !== pack.length) {
                     throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
                 }
                 if (await sha256Bytes(bytes) !== pack.checksum) {
                     throw new Error(`服务器数据包 ${index + 1} 校验失败。`);
                 }
-                return { ...pack, index, bytes };
-            });
+                return { bytes, verified: false };
+            })().then(result => ({ ...pack, index, bytes: result.bytes }));
             // 未按序抵达的失败由到达时的 await 抛出；此处先行挂钩避免
             // 未处理拒绝告警。
             pending.catch(() => { });
@@ -2365,8 +2369,7 @@ function createAutoSaveScheduler(options = {}) {
         const bucketKey = entry?.bucketKey ?? snapshotEntryBucket(
             value, snapshotEntryId(value), snapshotEntrySource(value)
         );
-        if (group !== pack.group || (bucketKey !== pack.bucketKey
-            && snapshotEntryBucket(value, snapshotEntryId(value), snapshotEntrySource(value), true) !== pack.bucketKey)) {
+        if (group !== pack.group || bucketKey !== pack.bucketKey) {
             throw new Error('服务器同步分片索引不一致。');
         }
     }
@@ -2613,7 +2616,7 @@ function createAutoSaveScheduler(options = {}) {
                 checksum: String(remote.checksum).toLowerCase()
             };
             await cacheWriteState(cacheDb, {
-                version: packManifest.some(pack => /\|r\d{3}$|\|p\d{10}$/.test(pack.bucketKey)) ? 7 : CACHE_FORMAT_VERSION,
+                version: CACHE_FORMAT_VERSION,
                 groups: [...new Set(packManifest.map(pack => pack.group))],
                 packs: packManifest.map(pack => ({ ...pack })),
                 epoch: localStorage.getItem(TRACKING_EPOCH_KEY),
@@ -2853,20 +2856,6 @@ function createAutoSaveScheduler(options = {}) {
                 gcMaintenance = null;
                 if (continueGc) scheduleGcMaintenance(250);
             });
-    }
-
-    async function resumePagedUpload(snapshot, baseVersion, baseChecksum, progress) {
-        for (let attempt = 0; ; attempt += 1) {
-            try {
-                return await uploadPagedSnapshotAttempt(snapshot, baseVersion, baseChecksum, progress);
-            } catch (error) {
-                // 根切换竞争由 Worker 在服务端重读 ETag 并收敛；客户端只对
-                // 无法确认写入结果的 5xx 做有限重试，同一 checksum 会从已有
-                // 会话和内容寻址分片继续，不把个人存档变成“请重试”的冲突门。
-                if (Number(error?.status || 0) < 500 || attempt >= 2) throw error;
-                updateProgress(progress.uploadStart, '正在确认同步结果…');
-            }
-        }
     }
 
     async function uploadPagedSnapshotAttempt(snapshot, baseVersion, baseChecksum, progress) {
@@ -3718,7 +3707,7 @@ function createAutoSaveScheduler(options = {}) {
         }
 
         updateProgress(progress.uploadStart, '正在上传并分页校验…');
-        const committedRemote = await resumePagedUpload(
+        const committedRemote = await uploadPagedSnapshotAttempt(
             snapshot,
             baseVersion,
             baseChecksum,

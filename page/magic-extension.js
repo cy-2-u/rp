@@ -3,7 +3,7 @@
 
     const FIXED_IMAGE_KEY = 'rp_hub_magic_fixed_image';
     const YNAI_MODEL_KEY = 'rp_hub_magic_ynai_model';
-    // 密钥即路由：YNAI- 前缀密钥走第三方中转（worker 按 provider 转发），其余 sta1n。
+    // 密钥即路由：YNAI- 前缀密钥走第三方中转（worker 看密钥前缀路由），其余 sta1n。
     const isYnaiToken = value => String(value || '').trim().toUpperCase().startsWith('YNAI-');
     const IMAGE_STORAGE_PREFIX = 'rp_hub_image_renders_';
     const DEFAULT_STORY_SCOPE_ID = 'main';
