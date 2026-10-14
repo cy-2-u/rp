@@ -1,6 +1,6 @@
 # RP Hub 魔改版
 
-一个 Cloudflare Pages Worker 项目：反向代理 [RP-Hub](https://github.com/cy-2-u/rp)（作者的酒馆类角色扮演前端），在不修改作者代码的前提下加入**云同步、R2 聊天图片托管、图片管理**等功能。
+一个 Cloudflare Pages Worker 项目：反向代理 [RP-Hub](https://github.com/STA1N156/RP-Hub)（作者的酒馆类角色扮演前端），在不修改作者代码的前提下加入**云同步、R2 聊天图片托管、图片管理**等功能。
 
 - **免服务器运维**：部署到 Cloudflare Pages 免费版即可，数据存在自己的 R2 桶里。
 - **数据自主**：聊天记录、角色卡、生成图片全部保存在自己的 Cloudflare 账号，不经过第三方。
@@ -74,4 +74,4 @@
 
 ## 致谢
 
-- [RP-Hub](https://github.com/cy-2-u/rp) —— 原项目作者
+- [RP-Hub](https://github.com/STA1N156/RP-Hub) —— 原项目作者
