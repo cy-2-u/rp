@@ -71,6 +71,12 @@ try {
     for (const name of ['built-in-content.js', 'core-utils.js', 'api-utils.js', 'data-services.js', 'runtime-services.js']) {
         w.eval(await fs.readFile(path.join(fixture, name), 'utf8'));
     }
+    // 作者 2026-10 新增 cloud-backup.js：app.js 依赖 window.RPHubCloudBackup；
+    // fixture 缺该文件时（旧样本）跳过，真实环境由作者 HTML 动态加载器回源加载。
+    const cloudBackupPath = upstream ? path.join(upstream, 'assets/js/cloud-backup.js') : path.join(fixture, 'cloud-backup.js');
+    if (await fs.stat(cloudBackupPath).then(() => true, () => false)) {
+        w.eval(await fs.readFile(cloudBackupPath, 'utf8'));
+    }
     w.eval(await fs.readFile(upstream ? path.join(upstream, 'assets/js/ui-components.js') : path.join(fixture, 'ui-components.js'), 'utf8'));
     await w.RPHubStorage.initDB();
     await w.RPHubStorage.setStoredValue('settings', { stream: false, temperature: 0.61 });
@@ -185,8 +191,10 @@ try {
     assert.equal(await w.RPHubStorage.getScopedStoredValue('image_renders', 'to-delete'), undefined);
     await w.RPHubExternal.flush();
     await w.RPHubStorage.setScopedStoredValue('image_renders', 'orphan-role', [{ prompt: 'orphan' }]);
-    await app.refreshStorageStats();
-    assert.ok(app.storageStats.orphanedItems > 0, 'author storage manager recognizes orphan image records');
+    // 作者 2026-10 版删除了设置页存储管理面板（refreshStorageStats/storageStats
+    // 不再存在），孤儿记录改由 bootstrap 的 pruneCachedPacks 与图库后台清理回收。
+    // 仍验证 scroped 写入本身落库，保证存储桥接行为不回归。
+    assert.equal((await w.RPHubStorage.getScopedStoredValue('image_renders', 'orphan-role')).length, 1);
     const db = w.RPHubStorage.getMainDb();
     const tx = db.transaction('store', 'readwrite');
     tx.objectStore('store').put({ never: 'committed' }, 'rp_hub_abort_fixture');

@@ -543,28 +543,63 @@
             </div>`
     };
 
+    // Question-mark help. The popover is rendered on <body>, so no scrolling or clipped container can hide it,
+    // and is placed by its trigger: below it, or above when the screen runs out, kept inside the viewport.
     const SettingsHelp = {
         props: {
             topic: { type: String, required: true },
             openTopic: { type: String, default: '' },
             label: { type: String, required: true },
             triggerClass: { type: String, default: '' },
-            popoverClass: { type: String, default: '' },
             iconClass: { type: String, default: 'h-3.5 w-3.5' }
         },
         emits: ['toggle'],
+        setup(props) {
+            const trigger = ref(null);
+            const popover = ref(null);
+            const popoverStyle = ref({});
+            const isOpen = computed(() => props.openTopic === props.topic);
+            const place = () => {
+                const anchor = trigger.value?.getBoundingClientRect();
+                const box = popover.value;
+                if (!anchor || !box) return;
+                const margin = 8;
+                const below = anchor.bottom + 6 + box.offsetHeight <= window.innerHeight - margin;
+                popoverStyle.value = {
+                    left: Math.max(margin, Math.min(anchor.left, window.innerWidth - box.offsetWidth - margin)) + 'px',
+                    top: (below ? anchor.bottom + 6 : Math.max(margin, anchor.top - 6 - box.offsetHeight)) + 'px',
+                    transformOrigin: below ? 'top left' : 'bottom left'
+                };
+            };
+            const stopFollowing = () => {
+                window.removeEventListener('scroll', place, true);
+                window.removeEventListener('resize', place);
+            };
+            watch(isOpen, async (open) => {
+                stopFollowing();
+                if (!open) return;
+                await nextTick();
+                place();
+                window.addEventListener('scroll', place, true);
+                window.addEventListener('resize', place);
+            }, { immediate: true });
+            onBeforeUnmount(stopFollowing);
+            return { trigger, popover, popoverStyle, isOpen };
+        },
         template: `
-            <button type="button" @click.stop="$emit('toggle', openTopic === topic ? '' : topic)"
-                class="settings-help-trigger" :class="[triggerClass, { 'is-open': openTopic === topic }]"
-                :aria-expanded="openTopic === topic" :aria-label="label">
+            <button ref="trigger" type="button" @click.stop="$emit('toggle', isOpen ? '' : topic)"
+                class="settings-help-trigger" :class="[triggerClass, { 'is-open': isOpen }]"
+                :aria-expanded="isOpen" :aria-label="label">
                 <svg :class="iconClass" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                         d="M9.1 9a3 3 0 115.8 1.1c-.6 1.1-1.9 1.3-2.5 2.2-.3.4-.4.8-.4 1.2M12 17h.01"></path>
                 </svg>
             </button>
-            <div v-if="openTopic === topic" class="settings-help-popover" :class="popoverClass">
-                <span class="settings-help-popover-content"><slot></slot></span>
-            </div>`
+            <teleport to="body">
+                <div v-if="isOpen" ref="popover" class="settings-help-popover" :style="popoverStyle">
+                    <span class="settings-help-popover-content"><slot></slot></span>
+                </div>
+            </teleport>`
     };
 
     // Owns the open/close animation for every modal: the overlay fades, the panel rises.
@@ -2182,7 +2217,7 @@
                             <dt>
                                 总用量
                                 <settings-help topic="totalTokens" :open-topic="helpTopic" label="查看总用量说明" icon-class=""
-                                    popover-class="token-usage-help-popover" @toggle="$emit('update:help-topic', $event)">
+                                    @toggle="$emit('update:help-topic', $event)">
                                     汇总当前类型和时间筛选范围内，输入 Token（包括缓存读取）与输出 Token 的总和。
                                 </settings-help>
                             </dt>
@@ -2375,7 +2410,7 @@
                                             <div class="relative flex items-center">
                                                 <label class="text-sm font-semibold text-gray-700">分析对话层数</label>
                                                 <settings-help topic="analysisDepth" :open-topic="helpTopic"
-                                                    label="查看分析对话层数说明" popover-class="is-above"
+                                                    label="查看分析对话层数说明"
                                                     @toggle="$emit('update:help-topic', $event)">
                                                     决定副模型分析时读取最近多少层对话。层数越多，能看到的剧情变化越完整，消耗越多；层数越少，消耗越少，但可能看不到较早发生的剧情
                                                 </settings-help>

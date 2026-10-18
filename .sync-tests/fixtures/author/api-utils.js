@@ -8,6 +8,23 @@
         return `${apiRoot}/${String(path || '').replace(/^\/+/, '')}`;
     };
 
+    const buildUserInputToolMessages = (text, callId) => [
+        {
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+                id: callId,
+                type: 'function',
+                function: { name: 'read_user_input', arguments: '{}' }
+            }]
+        },
+        {
+            role: 'tool',
+            tool_call_id: callId,
+            content: JSON.stringify({ source: 'user_input', text })
+        }
+    ];
+
     const parsePayload = (text, status) => {
         const data = JSON.parse(text);
         const error = extractApiErrorMessage(data, status);
@@ -273,6 +290,7 @@
             pendingReasoning += reasoning;
         };
         try {
+            options.onBeforeRequest?.();
             const tools = [...(options.tools || []), ...(options.replyInTool && !options.requireTool ? [replyTool] : [])];
             return await withApiResponse({ ...options, onErrorResponse: text => {
                 if (logResponse) rawResponse = text;
@@ -394,6 +412,6 @@
         }
     };
 
-    window.RPHubApiUtils = Object.freeze({ buildApiEndpoint });
+    window.RPHubApiUtils = Object.freeze({ buildApiEndpoint, buildUserInputToolMessages });
     window.RPHubApiClient = Object.freeze({ requestChatCompletion, requestJson });
 })();

@@ -1059,7 +1059,7 @@ window.RPHubUtils = {
             ]),
             imageModels: Object.freeze([
                 { value: 'nai-diffusion-4-5-full', label: 'V4.5 完整版（-1）' },
-                { value: 'nai-diffusion-5-full', label: 'V5 完整版（-8）' }
+                { value: 'nai-diffusion-5-full', label: 'V5 完整版（-6）' }
             ]),
             imageSizes: Object.freeze([
                 { value: '竖图', label: '竖图' },

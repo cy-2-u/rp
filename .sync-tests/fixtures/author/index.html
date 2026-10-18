@@ -79,7 +79,7 @@
     <div id="app" v-cloak class="h-full flex flex-col md:flex-row relative"
         :class="{ 'app-native-fullscreen': isChatFullscreen, 'mobile-keyboard-active': isMobileKeyboardOpen }">
         <component is="style" v-if="settings.fontSize">
-            .markdown-body :not(h1):not(h2):not(h3):not(h4):not(h5):not(h6):not(small):not(sub):not(sup):not(code) {
+            .markdown-body :not(h1):not(h2):not(h3):not(h4):not(h5):not(h6):not(small):not(sub):not(sup):not(code):not(.memory-cite) {
             font-size: inherit !important;
             }
         </component>
@@ -110,7 +110,7 @@
                 <!-- Character Background Layer -->
                 <div v-if="settings.useCharacterBackground && currentCharacter && currentCharacter?.avatar"
                     class="absolute -inset-4 bg-cover bg-center bg-no-repeat pointer-events-none transition-opacity duration-500 z-0 blur-[2px] char-bg-blur"
-                    :style="{ backgroundImage: `url(${JSON.stringify(currentCharacter.avatar)})`, opacity: 0.9 }">
+                    :style="{ backgroundImage: `url(${JSON.stringify(currentCharacterAvatar)})`, opacity: 0.9 }">
                 </div>
 
                 <!-- Blur Overlay for Description Panel -->
@@ -127,7 +127,7 @@
                             <button type="button" @click="editCharacter(currentCharacterIndex)"
                                 class="group flex-shrink-0 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-300"
                                 title="编辑角色">
-                                <img :src="currentCharacter?.avatar"
+                                <img :src="currentCharacterAvatar"
                                     class="w-14 h-14 rounded-xl object-cover border border-white shadow-sm transition-transform duration-200 group-hover:scale-[1.02]">
                             </button>
 
@@ -218,7 +218,7 @@
                             </button>
                             <div v-if="currentCharacter" class="flex items-center min-w-0 cursor-pointer"
                                 @click="showDescriptionPanel = !showDescriptionPanel">
-                                <img :src="currentCharacter?.avatar"
+                                <img :src="currentCharacterAvatar"
                                     class="w-9 h-9 rounded-full object-cover border border-white/20 shadow-sm flex-shrink-0">
                                 <span class="ml-2 font-medium text-white truncate drop-shadow-md">{{
                                     currentCharacter.name }}</span>
@@ -272,7 +272,7 @@
                         <button @click="currentView = 'characters'" class="modal-primary-button">前往角色管理</button>
                     </div>
                     <div v-else-if="chatHistory.length === 0" class="chat-empty">
-                        <img :src="currentCharacter?.avatar" class="chat-empty__avatar" alt="">
+                        <img :src="currentCharacterAvatar" class="chat-empty__avatar" alt="">
                         <p class="chat-empty__title">开始与 {{ currentCharacter.name }} 对话吧</p>
                     </div>
 
@@ -288,7 +288,7 @@
                             :class="['flex centered-message-shell max-w-[99%]', settings.immersiveMode ? 'immersive-message-shell' : 'standard-message-shell', messageUsesWideLayout(msg) || msg.isEditing_Message ? 'w-full' : '', msg.isSelf ? 'flex-row-reverse' : 'flex-row']">
                             <!-- Avatar -->
                             <div v-show="!settings.immersiveMode"
-                                :class="['flex-shrink-0 select-none', msg.shouldAnimate ? 'animate-message-fade-in' : '']">
+                                :class="['flex-shrink-0 select-none', msg.shouldAnimate && msg.role !== 'system' ? 'animate-message-fade-in' : '']">
                                 <div v-if="msg.role === 'user'"
                                     :class="['msg-avatar w-9 h-9 rounded-full overflow-hidden', msg.isSelf ? 'ml-2' : 'mr-2']">
                                     <img v-if="msg?.avatar || (msg?.isSelf && user?.avatar)"
@@ -301,14 +301,14 @@
                                         {{ (msg.name || user.name || 'U').charAt(0) }}
                                     </div>
                                 </div>
-                                <img v-else :src="currentCharacter?.avatar" class="msg-avatar w-9 h-9 rounded-full object-cover mr-2">
+                                <img v-else :src="currentCharacterAvatar" class="msg-avatar w-9 h-9 rounded-full object-cover mr-2">
                             </div>
 
                             <div
                                 :class="['flex flex-col min-w-0', settings.immersiveMode ? 'immersive-message-column' : '', messageUsesWideLayout(msg) || msg.isEditing_Message ? 'flex-1 w-full' : '', msg.isSelf ? 'items-end' : 'items-start']">
                                 <!-- Name (Outside Bubble) -->
                                 <div v-show="!settings.immersiveMode"
-                                    :class="['msg-name-tag truncate max-w-[210px] md:max-w-[250px]', msg.isSelf ? 'ml-auto mr-1' : 'mr-auto ml-1', msg.shouldAnimate ? 'animate-message-fade-in' : '']">
+                                    :class="['msg-name-tag truncate max-w-[210px] md:max-w-[250px]', msg.isSelf ? 'ml-auto mr-1' : 'mr-auto ml-1', msg.shouldAnimate && msg.role !== 'system' ? 'animate-message-fade-in' : '']">
                                     {{ msg.name || (msg.role === 'user' ? user.name : (currentCharacter?.name || 'Unknown')) }}
                                 </div>
                                 <!-- Message Bubble -->
@@ -316,7 +316,7 @@
                                     :class="{'w-full': messageUsesWideLayout(msg) || msg.isEditing_Message, 'message-edit-group': msg.isEditing_Message}">
                                     <div @click="handleGeneratedImageReroll($event, index)"
                                         :class="['msg-bubble-glass p-0 text-sm md:text-base leading-relaxed overflow-hidden',
-                                        msg.shouldAnimate && !(msg.role === 'assistant' && msg.reasoning) ? 'animate-message-in' : '',
+                                        msg.shouldAnimate && !(msg.role === 'assistant' && msg.reasoning) ? (msg.role === 'system' ? 'animate-bubble-swap' : 'animate-message-in') : '',
                                         messageUsesWideLayout(msg) || msg.isEditing_Message ? 'w-full' : '',
                                         msg.isSelf ? 'msg-bubble--self' : msg.role === 'system' ? 'msg-bubble--system' : '']">
 
@@ -623,7 +623,7 @@
                             :class="['flex flex-row centered-message-shell max-w-[99%]', settings.immersiveMode ? 'immersive-message-shell' : 'standard-message-shell']">
                             <div v-show="!settings.immersiveMode" class="flex-shrink-0 animate-message-in"
                                 style="animation-delay: 100ms;">
-                                <img :src="currentCharacter?.avatar" class="msg-avatar w-9 h-9 rounded-full object-cover mr-2">
+                                <img :src="currentCharacterAvatar" class="msg-avatar w-9 h-9 rounded-full object-cover mr-2">
                             </div>
                             <div :class="['flex flex-col min-w-0 items-start', settings.immersiveMode ? 'immersive-message-column' : '']">
                                 <div v-show="!settings.immersiveMode"
@@ -787,7 +787,7 @@
                                         <label class="flex cursor-pointer items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-xs font-semibold text-gray-600 transition-colors hover:bg-gray-100">
                                             <span>Gemini抗截断</span>
                                             <span class="relative inline-flex flex-none items-center">
-                                                <input v-model="settings.preventTruncation" type="checkbox" class="settings-toggle-input sr-only">
+                                                <input v-model="settings.preventTruncation" @change="$event.target.checked && (settings.stream = true)" type="checkbox" class="settings-toggle-input sr-only">
                                                 <span class="settings-toggle settings-toggle--compact settings-toggle--solid"></span>
                                             </span>
                                         </label>
@@ -796,7 +796,7 @@
                             </div>
                         </transition>
                         <textarea v-model="userInput" @input="autoResizeInput" @focus="handleChatInputFocus"
-                            @blur="handleChatInputBlur" @keydown.enter.exact.prevent="sendMessage"
+                            @blur="handleChatInputBlur" enterkeyhint="enter"
                             :placeholder="'输入消息...'"
                             class="island-input chat-input-scrollbar"
                             rows="1" ref="inputBox"></textarea>
@@ -1713,67 +1713,25 @@
                                 </div>
                             </div>
 
-                            <!-- Storage Management -->
-                            <div class="pt-6 border-t border-gray-100 mt-6">
-                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-                                    <div>
-                                        <h4 class="settings-subheading flex items-center mb-4 !mb-0">
-                                            <svg class="w-4 h-4 mr-2 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                                    d="M4 7c0 1.1 3.58 2 8 2s8-.9 8-2m-16 0c0-1.1 3.58-2 8-2s8 .9 8 2m-16 0v5c0 1.1 3.58 2 8 2s8-.9 8-2V7m-16 5v5c0 1.1 3.58 2 8 2s8-.9 8-2v-5">
-                                                </path>
-                                            </svg>
-                                            空间管理
-                                        </h4>
-                                    </div>
-                                    <div class="flex flex-wrap items-center gap-2">
-                                        <button type="button" @click="refreshStorageStats"
-                                            :disabled="storageStats.loading || storageStats.cleaning"
-                                            class="settings-action">
-                                            {{ storageStats.loading ? '统计中...' : (storageStats.hasMeasured ? '重新统计' : '统计') }}
-                                        </button>
-                                        <button type="button" @click="cleanupUnusedStorage"
-                                            :disabled="storageStats.loading || storageStats.cleaning || storageStats.orphanedItems === 0"
-                                            class="settings-action text-red-600 hover:bg-red-50">
-                                            {{ storageStats.cleaning ? '清理中...' : '清理无用残留（' + formatStorageSize(storageStats.orphanedBytes) + '）' }}
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div v-if="storageStats.error"
-                                    class="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600">
-                                    {{ storageStats.error }}
-                                </div>
-                                <div v-else class="space-y-6">
-                                    <div>
-                                        <div class="flex items-center justify-between gap-3 mb-3 text-sm">
-                                            <span class="font-bold text-gray-600">网页存储空间</span>
-                                            <span class="font-semibold text-gray-500 whitespace-nowrap">
-                                                <span class="text-gray-700">{{ formatStorageSize(storageStats.usage) }}</span>
-                                                <span class="mx-1 text-gray-300">/</span>
-                                                <span>{{ storageStats.quota ? formatStorageSize(storageStats.quota) : '未知' }}</span>
-                                            </span>
-                                        </div>
-                                        <div class="h-2 rounded-full bg-primary-50 overflow-hidden">
-                                            <div class="h-full rounded-full bg-primary-500 transition-all duration-300"
-                                                :style="{ width: Math.min(100, Math.max(storageStats.usage ? 1 : 0, storageStats.quota ? storageStats.usage / storageStats.quota * 100 : 0)) + '%' }"></div>
-                                        </div>
-                                    </div>
-
-                                    <div v-if="storageStats.categories.length"
-                                        class="border-y border-gray-100 divide-y divide-gray-100">
-                                        <div v-for="category in storageStats.categories" :key="category.key"
-                                            class="flex items-center justify-between gap-4 py-3.5 text-sm">
-                                            <div class="flex items-center min-w-0 text-gray-600">
-                                                <span class="w-1 h-5 rounded-full mr-3 flex-shrink-0"
-                                                    :style="{ backgroundColor: category.color }"></span>
-                                                <span class="truncate">{{ category.label }}</span>
-                                            </div>
-                                            <span class="font-semibold text-gray-600 tabular-nums whitespace-nowrap">
-                                                {{ formatStorageSize(category.bytes) }}
-                                            </span>
-                                        </div>
-                                    </div>
+                            <!-- Backup & Transfer: the details live in its dialog -->
+                            <div v-if="cloudBackup.enabled" class="pt-6 border-t border-gray-100 mt-6">
+                                <h4 class="settings-subheading flex items-center mb-4">
+                                    <svg class="w-4 h-4 mr-2 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12">
+                                        </path>
+                                    </svg>
+                                    备份与转移
+                                </h4>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <button type="button" @click="openCloudBackup('upload')" class="settings-action gap-2 min-h-[2.875rem]">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                                        上传备份
+                                    </button>
+                                    <button type="button" @click="openCloudBackup('download')" class="settings-action gap-2 min-h-[2.875rem]">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                        下载备份
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -2147,7 +2105,7 @@
                                     <span class="relative z-10 pointer-events-none">基础模式</span>
                                     <settings-help topic="summaryMode" :open-topic="settingsHelpTopic"
                                         label="查看基础模式说明" trigger-class="relative z-20" icon-class=""
-                                        popover-class="memory-mode-help-popover" @toggle="settingsHelpTopic = $event">
+                                        @toggle="settingsHelpTopic = $event">
                                         使用总结模型为每轮对话生成第三人称的高密度记忆。超过保留楼层后，AI 原文会由对应的本轮记忆替代。
                                     </settings-help>
                                 </div>
@@ -2158,7 +2116,7 @@
                                     <span class="relative z-10 pointer-events-none">增强模式</span>
                                     <settings-help topic="enhancedMode" :open-topic="settingsHelpTopic"
                                         label="查看增强模式说明" trigger-class="relative z-20" icon-class=""
-                                        popover-class="memory-mode-help-popover is-right" @toggle="settingsHelpTopic = $event">
+                                        @toggle="settingsHelpTopic = $event">
                                         先使用总结模型为每轮对话生成第三人称的高密度记忆，再将用户原输入与对应总结生成向量；按最新输入召回增强记忆。
                                     </settings-help>
                                 </div>
@@ -2205,7 +2163,7 @@
                                     <div class="relative flex items-center">
                                         <label class="text-sm font-semibold text-gray-700">补录并发数</label>
                                         <settings-help topic="classicConcurrency" :open-topic="settingsHelpTopic"
-                                            label="查看补录并发数说明" popover-class="is-above"
+                                            label="查看补录并发数说明"
                                             @toggle="settingsHelpTopic = $event">
                                             控制同时处理多少个总结补录任务。数值越高补录越快；它只影响处理速度，不改变总结内容和记忆顺序。
                                         </settings-help>
@@ -2225,7 +2183,7 @@
                                         <div class="relative flex items-center">
                                             <label class="text-sm font-semibold text-gray-700">保留最近楼层</label>
                                             <settings-help topic="keepFloors" :open-topic="settingsHelpTopic"
-                                                label="查看保留最近楼层说明" popover-class="is-above"
+                                                label="查看保留最近楼层说明"
                                                 @toggle="settingsHelpTopic = $event">
                                                 决定最近多少楼原始对话保留在上下文中，更早的内容会由记忆引擎替代。数值越大，保留的原文越多、上下文占用也越高。
                                             </settings-help>
@@ -2535,11 +2493,91 @@
 
         <retry-confirm-modal :state="globalConfirmModal"></retry-confirm-modal>
 
+        <!-- Backup & Transfer dialog: upload on one device, download with the key on another -->
+        <modal-shell :show="!!cloudBackup.mode" :close-on-backdrop="!cloudBackup.busy" @close="closeCloudBackup"
+            overlay-class="z-[90] p-4" panel-class="compact-modal-panel">
+            <div class="choice-modal">
+                <div class="choice-modal__head">
+                    <div>
+                        <h3>{{ cloudBackup.mode === 'upload' ? '上传备份' : '下载备份' }}</h3>
+                        <p>{{ cloudBackup.mode === 'upload' ? '全部角色卡和对应的聊天记录' : '输入上传时得到的密钥，把角色卡和聊天合并到本机' }}</p>
+                    </div>
+                    <button type="button" @click="closeCloudBackup" :disabled="cloudBackup.busy" class="modal-close-button disabled:opacity-40" aria-label="关闭">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+
+                <template v-if="cloudBackup.mode === 'upload'">
+                    <ul class="mt-4 space-y-1.5 pl-4 list-disc text-[13px] leading-relaxed text-gray-500">
+                        <li>上传后得到一个密钥，15 天内在其他设备点“下载备份”输入即可恢复</li>
+                        <li>单次最多 500MB，云端已有的相同内容会自动跳过</li>
+                        <li>重新上传会生成新密钥，这台设备上一次的密钥随即作废</li>
+                        <li>密钥相当于取件码，拿到的人都能下载这份备份，请勿外传</li>
+                    </ul>
+                    <div v-if="cloudBackup.key && !cloudBackup.progress" class="mt-5 rounded-xl border border-gray-200 bg-gray-50 px-4 py-4 text-center">
+                        <div class="text-xs text-gray-500">备份密钥</div>
+                        <div class="mt-1 font-mono text-xl font-bold tracking-widest text-gray-900 select-all">{{ cloudBackup.key }}</div>
+                        <div class="mt-1 text-xs text-gray-400">有效期至 {{ formatCloudBackupTime(cloudBackup.expiresAt) }}</div>
+                        <button type="button" @click="copyCloudBackupKey" class="settings-action mt-3">复制密钥</button>
+                    </div>
+                </template>
+
+                <template v-else>
+                    <input v-if="!cloudBackup.plan" v-model="cloudBackup.restoreKey" type="text" autocomplete="off" spellcheck="false"
+                        maxlength="24" placeholder="XXXX-XXXX-XXXX-XXXX" :disabled="cloudBackup.busy" @keydown.enter="readCloudBackup"
+                        class="mt-4 w-full bg-gray-50/60 border border-gray-300 rounded-lg px-4 py-3 text-center font-mono text-lg tracking-widest uppercase text-gray-800 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 focus:outline-none transition-all">
+                    <div v-else-if="!cloudBackup.progress" class="mt-4 space-y-2 text-sm">
+                        <div class="flex items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2.5">
+                            <span class="text-gray-600">新增</span>
+                            <b class="tabular-nums text-gray-900">{{ cloudBackup.plan.added.length }} 个</b>
+                        </div>
+                        <div class="flex items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2.5">
+                            <span class="text-gray-600">与本机完全相同，跳过并保留本机的</span>
+                            <b class="tabular-nums text-gray-900">{{ cloudBackup.plan.skipped.length }} 个</b>
+                        </div>
+                        <div class="flex items-center justify-between gap-3 rounded-lg bg-amber-50 px-3 py-2.5">
+                            <span class="text-amber-700">本机已有但内容不同，以备份为准</span>
+                            <b class="tabular-nums text-amber-700">{{ cloudBackup.plan.replaced.length }} 个</b>
+                        </div>
+                        <p class="pt-1 text-xs leading-relaxed text-gray-400">以备份为准的角色，卡片和聊天会被替换；本机其他角色不受影响。完成后页面会自动刷新。</p>
+                    </div>
+                </template>
+
+                <div v-if="cloudBackup.progress" class="mt-5">
+                    <div class="mb-2 flex items-center justify-between gap-3 text-xs font-semibold text-gray-600">
+                        <span>{{ cloudBackup.progress.label }}</span>
+                        <span class="tabular-nums">{{ Math.floor(cloudBackup.progress.percent) }}%</span>
+                    </div>
+                    <div class="h-2 overflow-hidden rounded-full bg-primary-50">
+                        <div class="h-full rounded-full bg-primary-500 transition-[width] duration-300" :style="{ width: cloudBackup.progress.percent + '%' }"></div>
+                    </div>
+                    <p class="mt-2 h-4 text-xs tabular-nums text-gray-400">{{ cloudBackup.progress.detail }}</p>
+                </div>
+
+                <div class="mt-5 flex gap-2">
+                    <button v-if="cloudBackup.mode === 'upload'" type="button" @click="startCloudBackup" :disabled="cloudBackup.busy"
+                        class="modal-primary-button flex-1 justify-center disabled:opacity-60">
+                        {{ cloudBackup.busy ? '上传中...' : (cloudBackup.key ? '重新上传' : '开始上传') }}
+                    </button>
+                    <button v-else-if="!cloudBackup.plan" type="button" @click="readCloudBackup" :disabled="cloudBackup.busy || !cloudBackup.restoreKey.trim()"
+                        class="modal-primary-button flex-1 justify-center disabled:opacity-60">
+                        {{ cloudBackup.busy ? '读取中...' : '读取备份' }}
+                    </button>
+                    <template v-else>
+                        <button type="button" @click="cloudBackup.plan = null" :disabled="cloudBackup.busy" class="modal-secondary-button flex-1 disabled:opacity-60">返回</button>
+                        <button type="button" @click="startCloudRestore" :disabled="cloudBackup.busy" class="modal-primary-button flex-1 justify-center disabled:opacity-60">
+                            {{ cloudBackup.busy ? '恢复中...' : '开始恢复' }}
+                        </button>
+                    </template>
+                </div>
+            </div>
+        </modal-shell>
+
     </div>
 
     <script>
         (function (stamp) {
-            ['built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services',
+            ['built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
                 'update-check', 'ui-components', 'app'].forEach(name => {
                 document.write('<script src="assets/js/' + name + '.js?v=' + stamp + '"><\/script>');
             });
