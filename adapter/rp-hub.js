@@ -160,11 +160,8 @@
             await original.deleteScopedStoredValue(name, id);
             if (name === 'branches') await original.deleteScopedStoredValue('image_renders', id);
         });
-        wrapped.deleteStorageKeys = (db, keys) => {
-            const extra = keys.filter(key => String(key).startsWith('rp_hub_branches_'))
-                .map(key => String(key).replace('rp_hub_branches_', 'rp_hub_image_renders_'));
-            return trackWrite('delete-keys', () => original.deleteStorageKeys(db, [...new Set([...keys, ...extra])]));
-        };
+        // 作者 2026-10 版（8403e875）移除了 deleteStorageKeys/useStorageManagement，
+        // 不再包装：RPHubStorage 上多出的原生命令经 spread 透传。
         storage = wrapped;
         return Object.freeze(wrapped);
     };
@@ -175,21 +172,8 @@
         set: next => { storageExport = wrapStorage(next); }
     });
     if (storageExport) storageExport = wrapStorage(storageExport);
-    let composables = window.RPHubComposables;
-    const wrapComposables = original => original && ({
-        ...original,
-        useStorageManagement(options) {
-            if (Array.isArray(options.scopedStorageNames) && !options.scopedStorageNames.includes('image_renders')) {
-                options.scopedStorageNames.push('image_renders');
-            }
-            return original.useStorageManagement(options);
-        }
-    });
-    Object.defineProperty(window, 'RPHubComposables', {
-        configurable: true, get: () => composables,
-        set: next => { composables = wrapComposables(next); }
-    });
-    if (composables) composables = wrapComposables(composables);
+    // 作者 2026-10 版删除了 useStorageManagement（含 image_renders 注入点），
+    // RPHubComposables 无需包装，直接使用原对象。
 
     const imageUi = config.ui?.images || {};
     const context = card => {
