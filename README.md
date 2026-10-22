@@ -41,7 +41,7 @@
 
 1. 创建一个 R2 桶。
 2. 创建 Pages 项目，构建输出目录设为 `page`，构建命令留空。
-3. 把 [`page/`](page/) 目录的四个文件上传（或推送到仓库让 Pages 自动构建）。
+3. 上传 [`page/`](page/) 目录（含 `_worker.js`、`_routes.json`、`_headers`、`magic-extension.js`、`adapter/` 与 `DB/`），或推送到仓库让 Pages 自动构建。
 4. 在项目设置里绑定 R2 桶为 `RP_SYNC_R2`。
 
 ### 访问密码（可选）
@@ -50,7 +50,7 @@
 
 ### 在线更新
 
-部署页提供"更新"按钮：输入令牌后列出账号下的本项目部署，一键刷新为仓库 `page/` 最新版（不改密码、不动数据）。更新后刷新页面即生效。
+部署页提供"更新"按钮：输入令牌后列出账号下的 Pages 项目并标注魔改版身份，一键把魔改版项目刷新为仓库 `page/` 最新版（不改密码、不动数据）。更新后刷新页面即生效。
 
 ## 部署后自检
 
@@ -63,8 +63,8 @@
 ## 技术概览
 
 - 同步协议 `rp-sync-paged-jsonl-v4`（schema 13）：数据切块为内容寻址分片（1MiB/512 条），清单分页验证，按快照校验码断点续传，根清单以 ETag CAS 切换版本；针对 Cloudflare 免费版的 CPU/子请求/连接数限制设计。
-- 部署形态：单个 `_worker.js`（Pages Worker，无构建步骤），四个前端脚本随页面注入，一份外部适配脚本从固定 Raw URL 在线读取（适配作者页面更新）。
-- 测试：11 个离线套件覆盖协议、恢复、运行时与性能预算（300MB 规模模拟），发布前本地全量回归。
+- 部署形态：单个 `_worker.js`（Pages Worker，无构建步骤）+ `DB/`、`magic-extension.js` 与 `adapter/rp-hub.js` 一起随 `page/` 发布；Worker 通过 Pages `ASSETS` 读取适配脚本，不再依赖 GitHub Raw。
+- 测试：默认回归分为 `unit-regressions` 与顺序执行的 `runtime-regressions`，另有外部作者集成、300MB 规模模拟和部署器流程测试。
 
 细节见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 

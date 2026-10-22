@@ -1,0 +1,5 @@
+/DB/*
+  Cache-Control: no-cache
+
+/magic-extension.js
+  Cache-Control: no-cache

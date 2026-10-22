@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-const source = fs.readFileSync(new URL('../DB/bootstrap.js', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../page/DB/bootstrap.js', import.meta.url), 'utf8');
 const section = (startMarker, endMarker) => {
     const start = source.indexOf(startMarker);
     const end = source.indexOf(endMarker, start);

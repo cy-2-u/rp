@@ -10,27 +10,20 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import {
+    createDocumentStub, createPrototypePatcher, createScriptRunner, findSyncModal,
+    idbGetAll, idbOpen, idbPut, installBrowserGlobals, loadFdbClasses, makeStorageClass,
+    waitFor
+} from './lib/browser-env.mjs';
+import { assertRestoreBatching } from './lib/restore-assertions.mjs';
+import { loadWorker } from './lib/worker-loader.mjs';
 
-const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const root = path.resolve(fileURLToPath(new URL('../page', import.meta.url)));
 const read = relative => fs.readFile(path.join(root, relative), 'utf8');
 
-const loadFdbClass = async name => {
-    const mod = await import(`fake-indexeddb/lib/${name}`);
-    return mod.default ?? mod[name];
-};
-const FDBFactory = await loadFdbClass('FDBFactory');
-const FDBDatabase = await loadFdbClass('FDBDatabase');
-const FDBObjectStore = await loadFdbClass('FDBObjectStore');
-const FDBTransaction = await loadFdbClass('FDBTransaction');
-const FDBIndex = await loadFdbClass('FDBIndex');
-const FDBRequest = await loadFdbClass('FDBRequest');
-const FDBOpenDBRequest = await loadFdbClass('FDBOpenDBRequest');
-const FDBVersionChangeEvent = await loadFdbClass('FDBVersionChangeEvent');
-const FDBKeyRange = await loadFdbClass('FDBKeyRange');
-const FDBCursor = await loadFdbClass('FDBCursor');
-const FDBCursorWithValue = await loadFdbClass('FDBCursorWithValue');
+const fdb = await loadFdbClasses();
+const { FDBFactory, FDBDatabase, FDBObjectStore, FDBTransaction, FDBCursor } = fdb;
 
 const MANIFEST_KEY = 'rp-sync/main/manifest.json';
 
@@ -121,84 +114,9 @@ function createMemBucket() {
     };
 }
 
-function makeStorageClass() {
-    return class Storage {
-        #map = new Map();
-        getItem(key) { key = String(key); return this.#map.has(key) ? this.#map.get(key) : null; }
-        setItem(key, value) { this.#map.set(String(key), String(value)); }
-        removeItem(key) { this.#map.delete(String(key)); }
-        clear() { this.#map.clear(); }
-        key(index) { return [...this.#map.keys()][index] ?? null; }
-        get length() { return this.#map.size; }
-    };
-}
-
-function createDomElement(tag) {
-    const listeners = {};
-    const queries = new Map();
-    const element = {
-        tagName: tag,
-        children: [],
-        parentElement: null,
-        style: {},
-        dataset: {},
-        textContent: '',
-        innerHTML: '',
-        classList: {
-            set: new Set(),
-            add(...names) { names.forEach(name => this.set.add(name)); },
-            remove(...names) { names.forEach(name => this.set.delete(name)); },
-            toggle(name, force) {
-                const enable = force === undefined ? !this.set.has(name) : Boolean(force);
-                if (enable) this.set.add(name); else this.set.delete(name);
-            },
-            contains(name) { return this.set.has(name); }
-        },
-        appendChild(child) { element.children.push(child); child.parentElement = element; return child; },
-        addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
-        removeEventListener() { },
-        setAttribute() { },
-        getAttribute() { return null; },
-        dispatch(type, event) { for (const handler of listeners[type] || []) handler(event); },
-        remove() {
-            const parent = element.parentElement;
-            if (parent) parent.children = parent.children.filter(child => child !== element);
-            element.parentElement = null;
-        },
-        focus() { },
-        select() { },
-        querySelector(selector) {
-            if (!queries.has(selector)) queries.set(selector, createDomElement(selector));
-            return queries.get(selector);
-        },
-        querySelectorAll() { return []; },
-        click() { for (const handler of listeners.click || []) handler({ preventDefault() { }, target: element }); }
-    };
-    return element;
-}
-
-function createDocumentStub() {
-    const body = createDomElement('body');
-    return {
-        readyState: 'complete',
-        body,
-        head: createDomElement('head'),
-        createElement: tag => createDomElement(tag),
-        getElementById: () => null,
-        addEventListener() { },
-        removeEventListener() { }
-    };
-}
-
-// 开屏访问门禁的锁页节点可能还挂在 body 上（异步解锁移除前），按类名定位
-// 同步面板而不是依赖 children[0] 的顺序。
-function findSyncModal(documentStub) {
-    return documentStub.body.children.find(child => String(child.className || '').includes('rp-sync-modal')) || null;
-}
-
 // ----------------------------------------------------------- prototypes ----
 
-const PATCHED_MEMBERS = [
+const { snapshot: snapshotPrototypes, restore: restorePrototypes } = createPrototypePatcher([
     [FDBFactory.prototype, 'open'],
     [FDBFactory.prototype, 'deleteDatabase'],
     [FDBObjectStore.prototype, 'put'],
@@ -209,125 +127,9 @@ const PATCHED_MEMBERS = [
     [FDBCursor.prototype, 'update'],
     [FDBCursor.prototype, 'delete'],
     [FDBTransaction.prototype, 'commit']
-];
-const snapshotPrototypes = () => PATCHED_MEMBERS.map(([proto, name]) => ({
-    proto,
-    name,
-    descriptor: Object.getOwnPropertyDescriptor(proto, name)
-}));
-const restorePrototypes = snapshot => {
-    for (const { proto, name, descriptor } of snapshot) {
-        if (descriptor) Object.defineProperty(proto, name, descriptor);
-        else delete proto[name];
-    }
-};
+]);
 
-// ------------------------------------------------------------ utilities ----
-
-const setGlobal = (name, value) => {
-    Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-};
-
-function installBrowserGlobals({ storageClass, localStorage, factory, document, location, fetchShim, locks }) {
-    const globals = {
-        indexedDB: factory,
-        // dirty-tracker 把 open/deleteDatabase 补丁打在 IDBFactory.prototype
-        // 上（WebKit 会重建 indexedDB 实例，实例级补丁会静默丢失），测试
-        // 环境必须提供与 factory 实例同一原型的构造器才等价于浏览器。
-        IDBFactory: FDBFactory,
-        IDBKeyRange: FDBKeyRange,
-        IDBDatabase: FDBDatabase,
-        IDBObjectStore: FDBObjectStore,
-        IDBTransaction: FDBTransaction,
-        IDBIndex: FDBIndex,
-        IDBCursor: FDBCursor,
-        IDBCursorWithValue: FDBCursorWithValue,
-        IDBRequest: FDBRequest,
-        IDBOpenDBRequest: FDBOpenDBRequest,
-        IDBVersionChangeEvent: FDBVersionChangeEvent,
-        Storage: storageClass,
-        localStorage,
-        document,
-        location,
-        navigator: locks ? { locks } : {},
-        fetch: fetchShim,
-        confirm: () => true,
-        alert: () => { },
-        requestAnimationFrame: handler => setTimeout(handler, 0),
-        addEventListener() { },
-        removeEventListener() { },
-        window: globalThis
-    };
-    for (const [name, value] of Object.entries(globals)) setGlobal(name, value);
-    delete globalThis.__RPH_SYNC_DIRTY_TRACKING__;
-}
-
-async function runScripts(names) {
-    for (const name of names) {
-        vm.runInThisContext(await read(name), { filename: path.join(root, name) });
-    }
-}
-
-async function waitFor(getResult, timeoutMs, label) {
-    const startedAt = Date.now();
-    for (;;) {
-        const value = getResult();
-        if (value) return value;
-        if (Date.now() - startedAt > timeoutMs) throw new Error(`timeout waiting for ${label}`);
-        await new Promise(resolve => setTimeout(resolve, 50));
-    }
-}
-
-function idbOpen(factory, dbName, version, stores) {
-    return new Promise((resolve, reject) => {
-        const request = version ? factory.open(dbName, version) : factory.open(dbName);
-        request.onupgradeneeded = () => {
-            const db = request.result;
-            for (const storeName of stores) {
-                if (!db.objectStoreNames.contains(storeName)) db.createObjectStore(storeName);
-            }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-    });
-}
-
-async function idbPut(factory, dbName, storeName, key, value) {
-    const db = await idbOpen(factory, dbName, 1, [storeName]);
-    try {
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction([storeName], 'readwrite');
-            tx.objectStore(storeName).put(value, key);
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-        });
-    } finally {
-        db.close();
-    }
-}
-
-async function idbGetAll(factory, dbName, storeName) {
-    const db = await idbOpen(factory, dbName, undefined, [storeName]);
-    try {
-        if (!db.objectStoreNames.contains(storeName)) return new Map();
-        return await new Promise((resolve, reject) => {
-            const tx = db.transaction([storeName], 'readonly');
-            const records = new Map();
-            const cursorRequest = tx.objectStore(storeName).openCursor();
-            cursorRequest.onsuccess = () => {
-                const cursor = cursorRequest.result;
-                if (cursor) {
-                    records.set(String(cursor.key), cursor.value);
-                    cursor.continue();
-                }
-            };
-            tx.oncomplete = () => resolve(records);
-            tx.onerror = () => reject(tx.error);
-        });
-    } finally {
-        db.close();
-    }
-}
+const runScripts = createScriptRunner({ root, read });
 
 async function readManifest(bucket) {
     const object = await bucket.get(MANIFEST_KEY);
@@ -372,8 +174,7 @@ const waitForUploadDone = (modal, label) => waitFor(() => {
 
 const bucket = createMemBucket();
 const env = { RP_SYNC_R2: bucket };
-const workerSource = await read('_worker.js');
-const worker = new Function('fetch', workerSource.replace('export default {', 'return {'))(globalThis.fetch);
+const worker = await loadWorker();
 const makeFetchShim = (label, targetEnv = env) => async (input, init) => {
     const url = typeof input === 'string' ? input : input.url;
     if (!url.startsWith('/api/rp-sync')) throw new Error(`unexpected fetch in ${label}: ${url}`);
@@ -444,7 +245,7 @@ const fetchShimA = async (input, init) => {
     return makeFetchShim('browser A')(input, init);
 };
 const savedPrototypes = snapshotPrototypes();
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageA,
     localStorage: localStorageA,
     factory: factoryA,
@@ -592,7 +393,7 @@ const locksB = {
     request: (name, options, callback) => Promise.resolve().then(callback),
     query: async () => ({ held: [] })
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageB,
     localStorage: localStorageB,
     factory: factoryB,
@@ -636,28 +437,7 @@ assert.equal(localStorageB.getItem('ai_chargen_flag'), 'on', 'prefixed localStor
 assert.equal(localStorageB.getItem('rp_hub_extra_local'), null, 'app keys missing remotely must be removed');
 assert.equal(localStorageB.getItem('rp_hub_sync_password_v1'), 'secret-b', 'sync password key must survive restore');
 assert.equal(localStorageB.getItem('unrelated'), 'keep-b', 'non-app keys must survive restore');
-assert.equal(restoreMetrics.snapshotParses, manifestV1.entryCount * 2,
-    'each snapshot entry must be parsed exactly once for validation and once for restore');
-const stagingReadBatches = restoreMetrics.stagingReads.filter(batch => batch.count > 0);
-const stagingWriteBatches = restoreMetrics.stagingWrites.filter(batch => batch.count > 0);
-assert.equal(stagingReadBatches.reduce((sum, batch) => sum + batch.count, 0), manifestV1.packCount,
-    'each staged pack must be read exactly once');
-assert.equal(stagingReadBatches.length, Math.ceil(manifestV1.packCount / 4),
-    'staged packs must be read in batches of four');
-assert.equal(stagingWriteBatches.reduce((sum, batch) => sum + batch.count, 0), manifestV1.packCount,
-    'each downloaded pack must be staged exactly once');
-assert.equal(stagingWriteBatches.length, Math.ceil(manifestV1.packCount / 4),
-    'downloaded packs must be staged in batches of four');
-assert.equal(restoreMetrics.cachePackWrites.reduce((sum, batch) => sum + batch.count, 0), manifestV1.packCount,
-    'each restored pack must be cached exactly once');
-assert.equal(restoreMetrics.cachePackWrites.length, Math.ceil(manifestV1.packCount / 4),
-    'restored packs must be cached in batches of four');
-assert.ok([...stagingReadBatches, ...stagingWriteBatches, ...restoreMetrics.cachePackWrites]
-    .every(batch => batch.count > 0 && batch.count <= 4), 'all pack transactions must stay bounded to four objects');
-assert.ok(restoreMetrics.maxPullInflight >= 1 && restoreMetrics.maxPullInflight <= 4,
-    `pull concurrency must stay within four requests, observed ${restoreMetrics.maxPullInflight}`);
-assert.equal(restoreMetrics.packNetworkRequests, manifestV1.packCount,
-    'first restore must fetch every pack when the local cache is empty');
+assertRestoreBatching(restoreMetrics, manifestV1);
 assert.match(modalB.innerHTML, /rp-sync-restore-actions/);
 assert.doesNotMatch(modalB.innerHTML, /上传到云端|重建本地索引|重新恢复/,
     'restore mode must expose only progress until an error occurs');
@@ -704,7 +484,7 @@ const runCachedRestoreProbe = async (label, corruptMode) => {
     const probeStorage = new StorageB();
     const probeDocument = createDocumentStub();
     const probeLocation = { pathname: '/sync-restore', replaced: null, replace(url) { this.replaced = url; }, assign() { } };
-    installBrowserGlobals({
+    installBrowserGlobals(fdb, {
         storageClass: StorageB,
         localStorage: probeStorage,
         factory: factoryB,
@@ -780,7 +560,7 @@ console.log(`phase 2 (restore): ok - ${manifestV1.entryCount} entries parsed twi
     const documentD = createDocumentStub();
     const locationD = { pathname: '/sync-restore', replaced: null, replace(url) { this.replaced = url; }, assign() { } };
     restorePrototypes(savedPrototypes);
-    installBrowserGlobals({
+    installBrowserGlobals(fdb, {
         storageClass: StorageD, localStorage: localStorageD, factory: factoryD,
         document: documentD, location: locationD, fetchShim: fetchShimB, locks: locksB
     });
@@ -878,7 +658,7 @@ const locationD = {
     replace(url) { this.replaced = url; },
     assign(url) { this.assigned = url; }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageD,
     localStorage: localStorageD,
     factory: factoryD,
@@ -913,7 +693,7 @@ const locationF = {
     replace(url) { this.replaced = url; },
     assign() { }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageF,
     localStorage: localStorageF,
     factory: factoryF,
@@ -945,7 +725,7 @@ console.log('phase 2d (partial restore remains paused): ok');
 // ------------------------------------------- phase 3: browser A increment --
 
 restorePrototypes(savedPrototypes);
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageA,
     localStorage: localStorageA,
     factory: factoryA,
@@ -1328,7 +1108,7 @@ const locationC = {
     replace(url) { this.replaced = url; },
     assign(url) { this.assigned = url; }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageC,
     localStorage: localStorageC,
     factory: factoryC,
@@ -1371,7 +1151,7 @@ const locationG = {
     replace(url) { this.replaced = url; },
     assign(url) { this.assigned = url; }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageG,
     localStorage: localStorageG,
     factory: factoryG,
@@ -1415,7 +1195,7 @@ const locationH = {
     replace(url) { this.replaced = url; },
     assign(url) { this.assigned = url; }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageH,
     localStorage: localStorageH,
     factory: factoryH,
@@ -1449,7 +1229,7 @@ const locationI = {
     replace(url) { this.replaced = url; },
     assign(url) { this.assigned = url; }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: StorageI,
     localStorage: localStorageI,
     factory: factoryI,

@@ -1,7 +1,8 @@
 const AUTHOR_BASE = 'https://sta1n156.github.io/RP-Hub/';
 
-// 生产适配地址固定；file:// 仅供本地测试 fetch mock 使用。
-const DEFAULT_ADAPTER_URL = 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.js';
+// 适配脚本随 page/ 一起发布，经 Pages ASSETS 读取；file:// 仅供本地测试。
+const ADAPTER_ASSET_PATH = '/adapter/rp-hub.js';
+const ADAPTER_ASSET_ORIGIN = 'https://assets.local';
 
 const ADAPTER_URL_ENV = 'RPHUB_ADAPTER_URL';
 const ADAPTER_PATH = '/__rphub/adapter.json';
@@ -16,7 +17,9 @@ const ADAPTER_FAILURE_TTL_MS = 5 * 1000;
 
 // ---- 云端配置与作者页面均直连 GitHub（不经过任何第三方镜像/加速反代） ----
 const ADAPTER_LASTGOOD_KEY = 'rp-adapter/last-good-script-v1.js';
-const AUTHOR_FETCH_TIMEOUT_MS = 8 * 1000;
+const AUTHOR_HEADER_TIMEOUT_MS = 8 * 1000;
+const AUTHOR_BODY_IDLE_TIMEOUT_MS = 30 * 1000;
+const AUTHOR_CACHE_TTL_SECONDS = 45;
 const ADAPTER_FETCH_TIMEOUT_MS = 10 * 1000;
 let adapterLastGoodPersisted = null;
 
@@ -29,7 +32,7 @@ async function readBoundedText(response, maxBytes, signal) {
     let total = 0;
     const decoder = new TextDecoder('utf-8', { fatal: true });
     try {
-        const declaredLength = Number(response.headers?.get?.('content-length') ?? response.size);
+        const declaredLength = Number(response.headers?.get?.('content-length') ?? 0);
         if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
             throw new Error('Response exceeds size limit.');
         }
@@ -65,11 +68,57 @@ async function fetchAdapterText(url, timeoutMs) {
 
 // 作者页面直连 GitHub Pages：任何状态码（含 304/4xx/5xx）原样交调用方处理，
 // 超时与网络错误直接抛出，不重试——作者站是唯一上游，失败即交给调用方。
+// 8 秒只约束响应头；正文按块空闲 30 秒超时，避免大文件整体被 8 秒截断。
 async function fetchAuthorUpstream(path, init, search) {
     const rel = String(path || '').replace(/^\/+/, '');
     const url = new URL(rel, AUTHOR_BASE);
     if (search) url.search = search;
-    return fetch(url, { ...init, signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS), redirect: 'follow' });
+    const response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(AUTHOR_HEADER_TIMEOUT_MS),
+        redirect: 'follow'
+    });
+    if (!response.body) return response;
+    const guarded = guardBodyIdleTimeout(response.body, AUTHOR_BODY_IDLE_TIMEOUT_MS);
+    return new Response(guarded, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+    });
+}
+
+function guardBodyIdleTimeout(body, timeoutMs) {
+    const reader = body.getReader();
+    let timer = null;
+    const clear = () => {
+        if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+        }
+    };
+    return new ReadableStream({
+        async pull(controller) {
+            clear();
+            timer = setTimeout(() => {
+                timer = null;
+                void reader.cancel().catch(() => {});
+                controller.error(new Error('Response body idle timeout.'));
+            }, timeoutMs);
+            try {
+                const { done, value } = await reader.read();
+                clear();
+                if (done) controller.close();
+                else controller.enqueue(value);
+            } catch (err) {
+                clear();
+                controller.error(err);
+            }
+        },
+        cancel(reason) {
+            clear();
+            return reader.cancel(reason);
+        }
+    });
 }
 
 function validateAdapter(adapter) {
@@ -132,9 +181,10 @@ function validateAdapter(adapter) {
     return { schema: adapter.schema, id: adapter.id, ui, image, features, capabilities };
 }
 
-function resolveAdapterUrl(env) {
+function resolveAdapterUrl(env, request) {
     const override = String(env?.[ADAPTER_URL_ENV] || '').trim();
-    return new URL(override.startsWith('file:') ? override : DEFAULT_ADAPTER_URL, AUTHOR_BASE);
+    if (override) return new URL(override, AUTHOR_BASE);
+    return new URL(ADAPTER_ASSET_PATH, request?.url || ADAPTER_ASSET_ORIGIN);
 }
 
 function adapterPublicView(adapter) {
@@ -142,8 +192,8 @@ function adapterPublicView(adapter) {
         features: adapter.features, capabilities: adapter.capabilities };
 }
 
-async function loadAdapter(env) {
-    const url = resolveAdapterUrl(env);
+async function loadAdapter(env, request) {
+    const url = resolveAdapterUrl(env, request);
     const cached = adapterCache.get(url.href);
     if (cached && cached.expiresAt > Date.now()) {
         // value 为 null 表示近期加载失败：短暂短路而不是每请求重试整条链。
@@ -183,7 +233,13 @@ async function loadAdapterFresh(env, url) {
     let adapter;
     let fromLastGood = false;
     try {
-        source = await fetchAdapterText(url, ADAPTER_FETCH_TIMEOUT_MS);
+        if (url.pathname === ADAPTER_ASSET_PATH && env?.ASSETS?.fetch) {
+            const assetResponse = await env.ASSETS.fetch(new Request(url));
+            if (!assetResponse.ok) throw new Error(`HTTP ${assetResponse.status}`);
+            source = (await readBoundedText(assetResponse, ADAPTER_MAX_BYTES)).replace(/^\uFEFF/, '');
+        } else {
+            source = await fetchAdapterText(url, ADAPTER_FETCH_TIMEOUT_MS);
+        }
         adapter = parseAdapterSource(source);
     } catch (error) {
         if (url.protocol === 'file:') throw error;
@@ -224,6 +280,7 @@ const MAX_PACK_ENTRIES = 512;
 const MANIFEST_PAGE_PACKS = 32;
 const MANIFEST_CHAIN_SEED = '0'.repeat(64);
 const GC_LIST_LIMIT = 256;
+const GC_PACK_LIST_LIMIT = 64;
 const GC_PENDING_UPLOAD_LIMIT = 16;
 const GC_BLOOM_BYTES = 32 * 1024;
 const GC_STATE_FORMAT = 'rp-sync-gc-state-v2';
@@ -234,6 +291,9 @@ const GC_CONTROL_GC_GRACE_MS = 24 * 60 * 60 * 1000;
 const GC_STATE_MAX_BYTES = 128 * 1024;
 const textEncoder = new TextEncoder();
 const SYNC_CONTROL_MAX_BYTES = 256 * 1024;
+// finalize 可携带最多 8192 个复用包校验码（约 550KiB）；控制对象本身仍按
+// 256KiB 限制，只有 JSON 请求信封放大到 1MiB。
+const SYNC_REQUEST_MAX_BYTES = 1024 * 1024;
 const SYNC_PACK_GC_GRACE_MS = 24 * 60 * 60 * 1000;
 const STREAM_SNAPSHOT_FORMAT = 'rp-sync-paged-jsonl-v4';
 const STREAM_SNAPSHOT_SCHEMA_VERSION = 13;
@@ -252,7 +312,9 @@ const IMAGE_DELETED_PREFIX = `${IMAGE_PREFIX}/_deleted`;
 const IMAGE_DELETE_MAX_TARGETS_PER_REQUEST = 20;
 const IMAGE_DELETE_MAX_KEYS_PER_REQUEST = 20;
 const IMAGE_DELETE_MAX_CHARACTER_NAMES_PER_REQUEST = 4;
-const IMAGE_MAX_BYTES = 64 * 1024 * 1024;
+// 单张图片上限：生图/转发都在 isolate 内持有正文，24MiB 给 128MiB 内存
+// 留出足够余量（旧 64MiB 叠加 base64 与复制后可能撞上限）。
+const IMAGE_MAX_BYTES = 24 * 1024 * 1024;
 // JSON/base64 同时持有编码文本与解码结果，不能沿用二进制接口的 64MiB 限额。
 const YNAI_MAX_BYTES = 16 * 1024 * 1024;
 const YNAI_JSON_MAX_BYTES = Math.ceil(YNAI_MAX_BYTES / 3) * 4 + 64 * 1024;
@@ -289,6 +351,10 @@ const IMAGE_MODELS_PATH = '/api/rp-image-models';
 const IMAGE_MODELS_CACHE_TTL_MS = 30 * 1000;
 const IMAGE_MODELS_MAX_BYTES = 256 * 1024;
 const imageModelsCache = new Map();
+const IMAGE_TOMBSTONE_CACHE_TTL_MS = 7 * 1000;
+const IMAGE_LIBRARY_CACHE_TTL_MS = 7 * 1000;
+const imageTombstoneCache = new WeakMap();
+const imageLibraryCache = new WeakMap();
 
 // ynai 中转端点只认云端适配清单（adapter.image.ynai）：中转站换域名/路径时改
 // adapter JSON 即可生效；配置缺失或形状非法时返回 null，调用方显式报错。
@@ -519,6 +585,20 @@ function buildImageUpstreamUrl(params, token) {
     return upstream.toString();
 }
 
+function createImageLimitStream(maxBytes, label) {
+    let total = 0;
+    return new TransformStream({
+        transform(chunk, controller) {
+            total += chunk.byteLength;
+            if (total > maxBytes) {
+                controller.error(Object.assign(new Error(`${label}：${total}/${maxBytes}`), { status: 413 }));
+                return;
+            }
+            controller.enqueue(chunk);
+        }
+    });
+}
+
 async function readBoundedImageBytes(message, maxBytes, label, signal) {
     const reader = message.body?.getReader();
     const cancel = () => { if (reader) void reader.cancel().catch(() => {}); };
@@ -529,7 +609,7 @@ async function readBoundedImageBytes(message, maxBytes, label, signal) {
         if (declaredLength > maxBytes) throw tooLarge(declaredLength);
         // 上游和缩略图上传基本都带 content-length：按声明值一次分配、
         // 各分片零拷贝写入，峰值内存从“分片列表+整体副本”的双倍降为
-        // 单倍（64MiB 上限图不再可能撞 128MiB isolate）；无声明或声明
+        // 单倍（24MiB 上限图不再可能撞 128MiB isolate）；无声明或声明
         // 不符时才退回倍增扩容。
         let buffer = Number.isSafeInteger(declaredLength) && declaredLength >= 1
             ? new Uint8Array(declaredLength)
@@ -595,10 +675,34 @@ function imageResponse(body, contentType, extraHeaders = {}) {
     return new Response(body, {
         headers: {
             'content-type': contentType || 'image/png',
-            'cache-control': 'public, max-age=3600, must-revalidate',
+            'cache-control': 'private, max-age=3600',
             ...extraHeaders
         }
     });
+}
+
+function imageEtag(key) {
+    const checksum = getImageChecksumFromKey(key);
+    return checksum ? `"${checksum}"` : null;
+}
+
+function isNotModified(request, etag) {
+    if (!etag) return false;
+    const header = request.headers.get('if-none-match');
+    if (!header) return false;
+    return header.split(',').some(value => value.trim() === etag || value.trim() === '*');
+}
+
+function notModifiedResponse(headers) {
+    return new Response(null, { status: 304, headers });
+}
+
+function imageCacheHeaders(etag, extra = {}) {
+    return {
+        ...(etag ? { etag } : {}),
+        'cache-control': 'private, max-age=3600',
+        ...extra
+    };
 }
 
 // ynai 中转是 OpenAI images 形状：POST JSON、b64_json 应答，解码成 PNG 字节后
@@ -701,7 +805,7 @@ async function handleImageModels(request, env) {
     if (cached && cached.expiresAt > Date.now()) {
         return json({ ok: true, data: cached.data });
     }
-    const ynai = resolveYnaiConfig(await tryLoadAdapter(env));
+    const ynai = resolveYnaiConfig(await tryLoadAdapter(env, request));
     if (!ynai) return error('中转生图配置未加载，请检查适配清单。', 503);
     let response;
     const signal = AbortSignal.timeout(15000);
@@ -754,11 +858,68 @@ function deletedImagePlaceholder(characterName) {
 </svg>`;
 }
 
+async function handleImageThumb(request, env, url) {
+    const bucket = getBucket(env);
+    const key = url.searchParams.get('key') || '';
+    if (!isValidImageObjectKey(key)) return error('\u56fe\u7247\u8def\u5f84\u65e0\u6548\u3002', 400);
+    const thumbKey = createImageThumbKeyFromImageKey(key);
+    if (!thumbKey) return error('\u56fe\u7247\u8def\u5f84\u65e0\u6548\u3002', 400);
+    const etag = imageEtag(key);
+
+    if (request.method === 'PUT' || request.method === 'POST') {
+        const token = normalizeImageParam(
+            url.searchParams.get('token') || request.headers.get('x-rp-image-token'),
+            1000
+        );
+        // 适配层没有图库管理会话；缩略图回写用生图密钥作为轻量授权，
+        // 但仍要求原图存在，避免向任意键写对象。
+        if (!token) return error('\u7f3a\u5c11\u751f\u56fe\u5bc6\u94a5\u3002', 401);
+        if (!await bucket.head(key)) return error('\u539f\u56fe\u4e0d\u5b58\u5728\uff0c\u4e0d\u80fd\u4fdd\u5b58\u7f29\u7565\u56fe\u3002', 404);
+        let bytes;
+        try {
+            bytes = await readThumbnailBytes(request);
+        } catch (err) {
+            return error(err instanceof Error ? err.message : '\u7f29\u7565\u56fe\u5927\u5c0f\u5f02\u5e38\u3002', err?.status === 413 ? 413 : 400);
+        }
+        await putImageThumbnail(bucket, key, bytes);
+        return json({ ok: true, thumbUrl: `/api/rp-image?key=${encodeURIComponent(key)}&thumb=1` });
+    }
+    if (request.method !== 'GET' && request.method !== 'HEAD') return error('Method not allowed.', 405);
+
+    const deleted = await bucket.head(createImageDeletedKey(
+        getImageCharacterFromKey(key), getImageChecksumFromKey(key)
+    ));
+    if (deleted) return error('\u56fe\u7247\u5df2\u6e05\u7406\u3002', 404);
+    if (request.method === 'HEAD') {
+        const head = await bucket.head(thumbKey);
+        if (!head) return error('\u7f29\u7565\u56fe\u4e0d\u5b58\u5728\u3002', 404);
+        const headers = imageCacheHeaders(etag, {
+            'content-type': head.httpMetadata?.contentType || 'image/webp',
+            'content-length': String(head.size || 0),
+            'cache-control': 'private, max-age=86400, immutable'
+        });
+        if (isNotModified(request, etag)) return notModifiedResponse(headers);
+        return imageResponse(null, head.httpMetadata?.contentType || 'image/webp', headers);
+    }
+    const object = await bucket.get(thumbKey);
+    if (!object) return error('\u7f29\u7565\u56fe\u4e0d\u5b58\u5728\u3002', 404);
+    const headers = imageCacheHeaders(etag, {
+        'content-length': String(object.size || 0),
+        'cache-control': 'private, max-age=86400, immutable'
+    });
+    if (isNotModified(request, etag)) {
+        try { await object.body?.cancel?.(); } catch (_) { }
+        return notModifiedResponse(headers);
+    }
+    return imageResponse(object.body, object.httpMetadata?.contentType || 'image/webp', headers);
+}
+
 async function handleImageRender(request, env) {
     if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'POST') {
         return error('Method not allowed.', 405);
     }
     const url = new URL(request.url);
+    if (url.searchParams.get('thumb') === '1') return handleImageThumb(request, env, url);
     const bucket = getBucket(env);
     const token = normalizeImageParam(url.searchParams.get('token'), 1000);
     // 生图只接受 POST：GET/HEAD 一律只读（读缓存或 404），链接预取、
@@ -769,7 +930,7 @@ async function handleImageRender(request, env) {
     // 不再二次加载。
     const imageKey = url.searchParams.get('key');
     if (imageKey && (generateOnMiss || !isValidImageObjectKey(imageKey))) return error('图片读取路径无效。', 400);
-    const ynaiConfig = !imageKey && isYnaiImageToken(token) ? resolveYnaiConfig(await tryLoadAdapter(env)) : null;
+    const ynaiConfig = !imageKey && isYnaiImageToken(token) ? resolveYnaiConfig(await tryLoadAdapter(env, request)) : null;
     const params = buildImageParams(url, token, ynaiConfig?.defaultModel || null);
     const primary = imageKey ? {
         key: imageKey,
@@ -777,34 +938,54 @@ async function handleImageRender(request, env) {
         params: { character_name: getImageCharacterFromKey(imageKey) }
     } : await buildImageLookupCandidate(params);
     const identityHeaders = { 'x-rp-image-key': encodeURIComponent(primary.key) };
+    const etag = imageEtag(primary.key);
+
+    if (request.method === 'HEAD') {
+        // 墓碑优先，且 HEAD 不拉起任何正文流。
+        const [deleted, head] = await Promise.all([
+            bucket.head(primary.deletedKey),
+            bucket.head(primary.key)
+        ]);
+        if (deleted) {
+            return imageResponse(null, 'image/svg+xml; charset=utf-8', {
+                ...identityHeaders, 'cache-control': 'private, max-age=60'
+            });
+        }
+        if (!head) {
+            return new Response(null, { status: 404, headers: { 'cache-control': 'no-store' } });
+        }
+        const headers = imageCacheHeaders(etag, {
+            ...identityHeaders,
+            'content-type': head.httpMetadata?.contentType || 'image/png',
+            'content-length': String(head.size || 0)
+        });
+        if (isNotModified(request, etag)) return notModifiedResponse(headers);
+        return imageResponse(null, head.httpMetadata?.contentType || 'image/png', headers);
+    }
+
     // 墓碑优先：删除请求先写墓碑、后台再清理原图，所以“原图还在”不能
-    // 证明未删除。两个 get 并行发出（浏览热路径少一个 R2 往返），命中
-    // 判定仍按墓碑优先。
+    // 证明未删除。墓碑用 head，浏览热路径不必拉起墓碑正文；命中原图时
+    // 只花 2 个 R2 操作（墓碑 head + 原图 get）。
     const [deleted, cached] = await Promise.all([
-        bucket.get(primary.deletedKey),
+        bucket.head(primary.deletedKey),
         bucket.get(primary.key)
     ]);
     if (deleted) {
-        // 走占位图时原图流与墓碑流都不再使用，主动取消释放。
         try { await cached?.body?.cancel?.(); } catch (_) { }
-        try { await deleted?.body?.cancel?.(); } catch (_) { }
-        return imageResponse(request.method === 'HEAD' ? null : deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
-            ...identityHeaders, 'cache-control': 'public, max-age=3600'
+        return imageResponse(deletedImagePlaceholder(primary.params.character_name), 'image/svg+xml; charset=utf-8', {
+            ...identityHeaders, 'cache-control': 'private, max-age=60'
         });
     }
-    // 非删除路径：命中原图（最常见的浏览路径）只花 2 个 R2 get（原图 +
-    // 墓碑），未命中的生图请求也需要墓碑来排除“已删除”。
     if (cached) {
-        if (request.method === 'HEAD') {
-            // HEAD 的 Response 不携带正文：显式取消 R2 流，不留 给 GC。
-            try { await cached.body?.cancel?.(); } catch (_) { }
-            return imageResponse(null, cached.httpMetadata?.contentType, {
-                ...identityHeaders, 'content-length': String(cached.size || 0)
-            });
-        }
-        return imageResponse(cached.body, cached.httpMetadata?.contentType, {
-            ...identityHeaders, 'content-length': String(cached.size || 0)
+        const headers = imageCacheHeaders(etag, {
+            ...identityHeaders,
+            'content-length': String(cached.size || 0)
         });
+        if (isNotModified(request, etag)) {
+            try { await cached.body?.cancel?.(); } catch (_) { }
+            return notModifiedResponse(headers);
+        }
+        return imageResponse(cached.body, cached.httpMetadata?.contentType, headers);
     }
 
     if (!generateOnMiss) {
@@ -824,31 +1005,56 @@ async function handleImageRender(request, env) {
     } else {
         result = await fetchImageWithTimeout(buildImageUpstreamUrl(primary.params, token), {}, async (upstreamResponse, signal) => {
             if (!upstreamResponse.ok) {
-                return error(`\u751f\u56fe\u670d\u52a1\u8fd4\u56de\u5f02\u5e38\uff1aHTTP ${upstreamResponse.status}`, upstreamResponse.status);
+                return error(`生图服务返回异常：HTTP ${upstreamResponse.status}`, upstreamResponse.status);
             }
             const contentType = upstreamResponse.headers.get('content-type') || 'image/png';
             if (!contentType.toLowerCase().startsWith('image/')) {
-                return error('\u751f\u56fe\u670d\u52a1\u6ca1\u6709\u8fd4\u56de\u56fe\u7247\u3002', 502);
+                return error('生图服务没有返回图片。', 502);
             }
-            try {
-                const bytes = await readBoundedImageBytes(upstreamResponse, IMAGE_MAX_BYTES, '图片过大', signal);
-                if (!bytes.byteLength) return error('生图服务返回了空图片。', 502);
-                return { bytes, contentType };
-            } catch (err) {
-                if (err.status === 413) return error(err.message, 413);
-                throw err;
+            if (!upstreamResponse.body) return error('生图服务返回了空图片。', 502);
+            // 声明长度已超限时不必拉起正文；声明偏小/缺失仍由下面的
+            // TransformStream 逐块计数兜底。
+            const declaredLength = Number(upstreamResponse.headers.get('content-length') || 0);
+            if (Number.isFinite(declaredLength) && declaredLength > IMAGE_MAX_BYTES) {
+                return error('图片过大。', 413);
             }
+            // 二进制上游直接计数并 tee：一份流写 R2，一份流直接作为本次
+            // 响应正文，客户端不必为了拿图再发一次 GET；超过上限时两个
+            // 分支一起失败，不会把半张图写进缓存。
+            const [forR2, forClient] = upstreamResponse.body
+                .pipeThrough(createImageLimitStream(IMAGE_MAX_BYTES, '图片过大'))
+                .tee();
+            return {
+                stream: forClient,
+                contentType,
+                put: bucket.put(primary.key, forR2, { httpMetadata: { contentType } })
+            };
         });
     }
     if (result instanceof Response) return result;
+    if (result.stream) {
+        try {
+            await result.put;
+        } catch (err) {
+            try { await result.stream.cancel(); } catch (_) { }
+            return error(err?.status === 413 ? err.message : '生图图片写入失败。', err?.status === 413 ? 413 : 503);
+        }
+        return imageResponse(result.stream, result.contentType, {
+            ...identityHeaders,
+            ...(etag ? { etag } : {}),
+            'cache-control': 'private, max-age=31536000, immutable'
+        });
+    }
     const { bytes, contentType } = result;
-
     await bucket.put(primary.key, bytes, {
         httpMetadata: { contentType }
     });
 
     return imageResponse(bytes, contentType, {
-        ...identityHeaders, 'content-length': String(bytes.byteLength)
+        ...identityHeaders,
+        ...(etag ? { etag } : {}),
+        'content-length': String(bytes.byteLength),
+        'cache-control': 'private, max-age=31536000, immutable'
     });
 }
 
@@ -1257,20 +1463,33 @@ async function listImageObjects(bucket, prefix = `${IMAGE_OBJECT_PREFIX}/`, curs
     do {
         const page = await bucket.list({ prefix, cursor: nextCursor, limit: 1000 });
         for (const object of page.objects || []) rawObjects.push(object);
-        nextCursor = page.truncated ? page.cursor : undefined;
+        nextCursor = page.truncated ? getNextSyncCursor(page, nextCursor) : undefined;
     } while (nextCursor);
     return { objects: rawObjects.map(normalizeImageObject), cursor: null };
 }
 
-async function listImageTombstoneKeys(bucket) {
+async function listImageTombstoneKeys(bucket, fresh = false) {
+    if (!fresh) {
+        const cached = imageTombstoneCache.get(bucket);
+        if (cached && cached.expiresAt > Date.now()) return cached.keys;
+    }
     const keys = new Set();
     let cursor;
     do {
         const page = await bucket.list({ prefix: `${IMAGE_DELETED_PREFIX}/`, cursor, limit: 1000 });
         for (const object of page.objects || []) keys.add(object.key);
-        cursor = page.truncated ? page.cursor : undefined;
+        cursor = page.truncated ? getNextSyncCursor(page, cursor) : undefined;
     } while (cursor);
+    imageTombstoneCache.set(bucket, { keys, expiresAt: Date.now() + IMAGE_TOMBSTONE_CACHE_TTL_MS });
     return keys;
+}
+
+function invalidateImageTombstones(bucket) {
+    imageTombstoneCache.delete(bucket);
+}
+
+function invalidateImageLibrary(bucket) {
+    imageLibraryCache.delete(bucket);
 }
 
 async function getImageDeleteTargets(bucket, keys, characterNames, cursor) {
@@ -1330,6 +1549,8 @@ async function writeImageTombstone(bucket, key) {
     await bucket.put(createImageDeletedKey(characterName, checksum), '1', {
         httpMetadata: { contentType: 'text/plain; charset=utf-8' }
     });
+    invalidateImageTombstones(bucket);
+    invalidateImageLibrary(bucket);
 }
 
 async function deleteImageObjectFiles(bucket, objects) {
@@ -1356,6 +1577,8 @@ async function handleImageAdmin(request, env, url, ctx) {
 
     const bucket = getBucket(env);
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/library`) {
+        const cachedLibrary = imageLibraryCache.get(bucket);
+        if (cachedLibrary && cachedLibrary.expiresAt > Date.now()) return json(cachedLibrary.value);
         const [{ objects: allObjects }, tombstoneSet] = await Promise.all([
             listImageObjects(bucket),
             listImageTombstoneKeys(bucket)
@@ -1372,23 +1595,38 @@ async function handleImageAdmin(request, env, url, ctx) {
             else await cleanup;
         }
         const totalBytes = objects.reduce((sum, object) => sum + object.size, 0);
-        return json({
+        const value = {
             ok: true,
             totalCount: objects.length,
             totalBytes,
             totalHuman: formatBytes(totalBytes),
             characters: buildImageLibrary(objects)
-        });
+        };
+        imageLibraryCache.set(bucket, { value, expiresAt: Date.now() + IMAGE_LIBRARY_CACHE_TTL_MS });
+        return json(value);
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/image`) {
         const key = url.searchParams.get('key') || '';
         if (!isValidImageObjectKey(key)) return error('\u56fe\u7247\u8def\u5f84\u65e0\u6548\u3002', 400);
+        const etag = imageEtag(key);
+        if (request.method === 'HEAD') {
+            const head = await bucket.head(key);
+            if (!head) return error('\u56fe\u7247\u4e0d\u5b58\u5728\u3002', 404);
+            const headers = imageCacheHeaders(etag, {
+                'content-type': head.httpMetadata?.contentType || 'image/png',
+                'content-length': String(head.size || 0)
+            });
+            if (isNotModified(request, etag)) return notModifiedResponse(headers);
+            return imageResponse(null, head.httpMetadata?.contentType || 'image/png', headers);
+        }
         const object = await bucket.get(key);
         if (!object) return error('\u56fe\u7247\u4e0d\u5b58\u5728\u3002', 404);
-        return imageResponse(request.method === 'HEAD' ? null : object.body, object.httpMetadata?.contentType, {
-            'content-length': String(object.size || 0),
-            'cache-control': 'private, max-age=3600'
-        });
+        const headers = imageCacheHeaders(etag, { 'content-length': String(object.size || 0) });
+        if (isNotModified(request, etag)) {
+            try { await object.body?.cancel?.(); } catch (_) { }
+            return notModifiedResponse(headers);
+        }
+        return imageResponse(object.body, object.httpMetadata?.contentType, headers);
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/thumb`) {
         const key = url.searchParams.get('key') || '';
@@ -1396,15 +1634,32 @@ async function handleImageAdmin(request, env, url, ctx) {
         const thumbKey = createImageThumbKeyFromImageKey(key);
         if (!thumbKey) return error('\u56fe\u7247\u8def\u5f84\u65e0\u6548\u3002', 400);
         if (request.method === 'GET' || request.method === 'HEAD') {
+            const etag = imageEtag(key);
+            if (request.method === 'HEAD') {
+                const head = await bucket.head(thumbKey);
+                if (!head) return error('\u7f29\u7565\u56fe\u4e0d\u5b58\u5728\u3002', 404);
+                const headers = imageCacheHeaders(etag, {
+                    'content-type': head.httpMetadata?.contentType || 'image/webp',
+                    'content-length': String(head.size || 0),
+                    'cache-control': 'private, max-age=86400'
+                });
+                if (isNotModified(request, etag)) return notModifiedResponse(headers);
+                return imageResponse(null, head.httpMetadata?.contentType || 'image/webp', headers);
+            }
             const object = await bucket.get(thumbKey);
             if (!object) return error('\u7f29\u7565\u56fe\u4e0d\u5b58\u5728\u3002', 404);
-            return imageResponse(request.method === 'HEAD' ? null : object.body, object.httpMetadata?.contentType || 'image/webp', {
+            const headers = imageCacheHeaders(etag, {
                 'content-length': String(object.size || 0),
                 'cache-control': 'private, max-age=86400'
             });
+            if (isNotModified(request, etag)) {
+                try { await object.body?.cancel?.(); } catch (_) { }
+                return notModifiedResponse(headers);
+            }
+            return imageResponse(object.body, object.httpMetadata?.contentType || 'image/webp', headers);
         }
         if (request.method !== 'PUT' && request.method !== 'POST') return error('Method not allowed.', 405);
-        // 只需存在性判断：head 代替 get，避免把原图（可达 64MiB）的流拉起来又不消费。
+        // 只需存在性判断：head 代替 get，避免把原图（可达 24MiB）的流拉起来又不消费。
         if (!await bucket.head(key)) return error('\u539f\u56fe\u4e0d\u5b58\u5728\uff0c\u4e0d\u80fd\u4fdd\u5b58\u7f29\u7565\u56fe\u3002', 404);
         const bytes = await readThumbnailBytes(request);
         await putImageThumbnail(bucket, key, bytes);
@@ -1618,6 +1873,11 @@ async function getMigrationState(bucket) {
 const migrationStateCache = new WeakMap();
 const manifestStateCache = new Map();
 const MANIFEST_STATE_CACHE_MAX = 8;
+// 根清单很短但读得非常频繁：isolate 内缓存 1.5 秒，写路径（finalize /
+// 迁移）主动失效；GC 一律 fresh 读取，避免用过期根做删除判断。
+const manifestStateByBucket = new WeakMap();
+const MANIFEST_STATE_TTL_MS = 1500;
+const UPLOAD_SESSION_CACHE_TTL_MS = 1000;
 // 内容寻址 Bloom 的已验字节缓存：键是自校验的 checksum。
 const verifiedBloomCache = new Map();
 const VERIFIED_BLOOM_CACHE_MAX = 4;
@@ -1626,7 +1886,23 @@ const VERIFIED_BLOOM_CACHE_MAX = 4;
 // 请求省掉一次仅为 legacy 比对存在的根 head。
 const legacyStateExcluded = new WeakSet();
 
-async function getManifestState(bucket) {
+async function getManifestState(bucket, options = {}) {
+    if (options.fresh !== true) {
+        const cached = manifestStateByBucket.get(bucket);
+        if (cached && cached.expiresAt > Date.now()) return cached.state;
+    }
+    const state = await loadManifestState(bucket);
+    if (options.fresh !== true) {
+        manifestStateByBucket.set(bucket, { state, expiresAt: Date.now() + MANIFEST_STATE_TTL_MS });
+    }
+    return state;
+}
+
+function invalidateManifestState(bucket) {
+    manifestStateByBucket.delete(bucket);
+}
+
+async function loadManifestState(bucket) {
     const migration = await getMigrationState(bucket);
     if (!migration) return { manifest: null, etag: null, resetRequired: true };
     // 正常态 legacyEtag 为 null（非 legacy 库），head 只为与 legacy etag
@@ -1667,8 +1943,8 @@ async function getManifestState(bucket) {
     return { ...state, etag };
 }
 
-async function getManifest(bucket) {
-    return (await getManifestState(bucket)).manifest;
+async function getManifest(bucket, fresh = false) {
+    return (await getManifestState(bucket, { fresh })).manifest;
 }
 
 function buildRemoteInfo(manifest) {
@@ -1724,6 +2000,11 @@ async function handleInitializeStorage(bucket, body) {
         httpMetadata: { contentType: 'application/json; charset=utf-8' },
         onlyIf: { etagDoesNotMatch: '*' }
     });
+    migrationStateCache.set(bucket, {
+        legacyEtag: marker.legacyEtag,
+        createdAt: marker.createdAt
+    });
+    invalidateManifestState(bucket);
     return json({ ok: true, resetRequired: false });
 }
 
@@ -1815,7 +2096,31 @@ async function handlePullManifestPage(bucket, body) {
     });
 }
 
-async function handlePullPack(bucket, body) {
+function packCacheRequest(requestUrl, checksum) {
+    return new Request(new URL(`/__rphub-pack-cache/${checksum}`, requestUrl.origin), { method: 'GET' });
+}
+
+function writePackCache(ctx, requestUrl, checksum, body, pack) {
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (!cache || typeof cache.put !== 'function') {
+        void body.cancel?.().catch?.(() => {});
+        return;
+    }
+    const headers = new Headers({
+        'content-type': 'application/octet-stream',
+        'cache-control': 'public, max-age=31536000, immutable',
+        'content-length': String(pack.length),
+        'x-rp-pack-entry-count': String(pack.entryCount),
+        'x-rp-pack-checksum': pack.checksum
+    });
+    const putting = cache.put(packCacheRequest(requestUrl, checksum), new Response(body, {
+        status: 200,
+        headers
+    })).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(putting);
+}
+
+async function handlePullPack(request, bucket, body, ctx) {
     const root = await getManifest(bucket);
     if (!root) return error('服务器当前没有可同步的数据。', 404);
     const version = Number(body.version);
@@ -1836,6 +2141,26 @@ async function handlePullPack(bucket, body) {
         || expectedEntryCount !== pack.entryCount) {
         return error('下载数据包与已验证清单不一致。', 409);
     }
+    const requestUrl = new URL(request.url);
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (cache && typeof cache.match === 'function') {
+        try {
+            const cached = await cache.match(packCacheRequest(requestUrl, pack.checksum));
+            if (cached
+                && Number(cached.headers.get('content-length')) === pack.length
+                && Number(cached.headers.get('x-rp-pack-entry-count')) === pack.entryCount) {
+                return new Response(cached.body, {
+                    status: 200,
+                    headers: {
+                        'content-type': 'application/octet-stream',
+                        'cache-control': 'no-store',
+                        'content-length': String(pack.length),
+                        'x-rp-pack-checksum': pack.checksum
+                    }
+                });
+            }
+        } catch (_) { }
+    }
     const storedPack = await bucket.get(createPackKey(pack.checksum));
     if (!storedPack) return error('R2 同步数据不存在。', 404);
     const byteLength = Number(storedPack.size || 0);
@@ -1843,7 +2168,13 @@ async function handlePullPack(bucket, body) {
         || Number(storedPack.customMetadata?.entryCount) !== pack.entryCount) {
         return error('R2 同步数据元数据校验失败。', 409);
     }
-    return new Response(storedPack.body, {
+    let responseBody = storedPack.body;
+    if (cache && typeof cache.put === 'function' && responseBody) {
+        const [clientBody, cacheBody] = responseBody.tee();
+        responseBody = clientBody;
+        writePackCache(ctx, requestUrl, pack.checksum, cacheBody, pack);
+    }
+    return new Response(responseBody, {
         status: 200,
         headers: {
             'content-type': 'application/octet-stream',
@@ -1905,7 +2236,7 @@ function createSyncRequestReader(request, maxBytes) {
 }
 
 async function readSyncJsonBody(request) {
-    const reader = createSyncRequestReader(request, SYNC_CONTROL_MAX_BYTES);
+    const reader = createSyncRequestReader(request, SYNC_REQUEST_MAX_BYTES);
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let text = '';
     try {
@@ -1979,17 +2310,9 @@ async function handleUploadPack(request, bucket, url) {
     }
 
     const key = createPackKey(checksum);
-    const existing = await bucket.head(key);
-    if (existing) {
-        if (Number(existing.size) === length
-            && Number(existing.customMetadata?.entryCount) === entryCount) {
-            if (request.body.cancel) await request.body.cancel();
-            rememberVerifiedPack(checksum, length, entryCount);
-            return new Response(null, { status: 204 });
-        }
-        if (request.body.cancel) await request.body.cancel();
-        return error('内容寻址数据包已存在但元数据不同。', 409);
-    }
+    // 正常路径先写：内容寻址对象不可变，etagDoesNotMatch:* 让 R2 直接给出
+    // “新建成功 / 已存在”两种结果。仅当已存在时才补一次 head 核对元数据，
+    // 把逐包稳态从 read session + head + put 降到单次 put。
     const stored = await bucket.put(key, request.body, {
         sha256: checksumBytes(checksum),
         httpMetadata: { contentType: 'application/octet-stream' },
@@ -2000,13 +2323,14 @@ async function handleUploadPack(request, bucket, url) {
         rememberVerifiedPack(checksum, length, entryCount);
         return new Response(null, { status: 204 });
     }
-    const raced = await bucket.head(key);
-    if (raced && Number(raced.size) === length
-        && Number(raced.customMetadata?.entryCount) === entryCount) {
+    const existing = await bucket.head(key);
+    if (existing && Number(existing.size) === length
+        && Number(existing.customMetadata?.entryCount) === entryCount) {
         rememberVerifiedPack(checksum, length, entryCount);
         return new Response(null, { status: 204 });
     }
-    return error('内容寻址数据包已被其他元数据占用。', 409);
+    if (existing) return error('内容寻址数据包已存在但元数据不同。', 409);
+    return error('内容寻址数据包写入未确认，请重试。', 503);
 }
 
 function normalizeUploadSession(value) {
@@ -2048,14 +2372,49 @@ function normalizeUploadSession(value) {
     return { format: UPLOAD_SESSION_FORMAT, ...fields };
 }
 
-async function readUploadSession(bucket, uploadId, includeExpired = false) {
+// 上传会话在逐包/逐页上传期间被每个子请求读取，isolate 内缓存 1 秒；
+// 本 isolate 每次写会话都会显式失效，跨 isolate 的更新最多晚 1 秒可见。
+const uploadSessionCache = new WeakMap();
+
+function invalidateUploadSession(bucket, uploadId) {
+    const sessions = uploadSessionCache.get(bucket);
+    if (!sessions) return;
+    sessions.delete(uploadId);
+    if (!sessions.size) uploadSessionCache.delete(bucket);
+}
+
+async function readUploadSession(bucket, uploadId, includeExpired = false, fresh = false) {
+    let sessions = uploadSessionCache.get(bucket);
+    const cached = !fresh && sessions ? sessions.get(uploadId) : null;
+    if (cached && Date.now() - cached.cachedAt < UPLOAD_SESSION_CACHE_TTL_MS) {
+        if (cached.stored && !cached.stored.expired) return cached.stored;
+        if (cached.stored && includeExpired) return cached.stored;
+        if (!cached.stored) return null;
+    }
     const stored = await readSmallJsonObject(bucket, createUploadSessionKey(uploadId), 16 * 1024);
-    if (!stored) return null;
+    if (!stored) {
+        if (!sessions) {
+            sessions = new Map();
+            uploadSessionCache.set(bucket, sessions);
+        }
+        sessions.set(uploadId, { stored: null, cachedAt: Date.now() });
+        return null;
+    }
     const session = normalizeUploadSession(stored.value);
     if (!session) throw new SyncRequestError('上传会话损坏。', 409);
-    const expired = gcSessionExpired(session, stored);
-    if (expired && !includeExpired) return null;
-    return { session, etag: stored.etag, uploaded: stored.uploaded, expired };
+    const value = {
+        session,
+        etag: stored.etag,
+        uploaded: stored.uploaded,
+        expired: gcSessionExpired(session, stored)
+    };
+    if (!sessions) {
+        sessions = new Map();
+        uploadSessionCache.set(bucket, sessions);
+    }
+    sessions.set(uploadId, { stored: value, cachedAt: Date.now() });
+    if (value.expired && !includeExpired) return null;
+    return value;
 }
 
 function uploadSessionInfo(session) {
@@ -2135,6 +2494,7 @@ async function beginUpload(bucket, body) {
     const existing = await readUploadSession(bucket, checksum, true);
     if (existing?.expired) {
         try { await bucket.delete(createUploadSessionKey(checksum)); } catch (_) { }
+        invalidateUploadSession(bucket, checksum);
     }
     if (existing && !existing.expired) {
         const session = existing.session;
@@ -2180,7 +2540,7 @@ async function beginUpload(bucket, body) {
         onlyIf: { etagDoesNotMatch: '*' }
     });
     if (!stored) {
-        const raced = await readUploadSession(bucket, checksum);
+        const raced = await readUploadSession(bucket, checksum, false, true);
         if (!raced) return error('上传会话创建失败。', 503);
         if (raced.session.bloomChecksum !== bloomChecksum || raced.session.totalBytes !== totalBytes
             || raced.session.packCount !== packCount || raced.session.entryCount !== entryCount
@@ -2189,6 +2549,7 @@ async function beginUpload(bucket, body) {
         }
         return json({ ok: true, committed: false, ...uploadSessionInfo(raced.session) });
     }
+    invalidateUploadSession(bucket, checksum);
     return json({ ok: true, committed: false, ...uploadSessionInfo(session) });
 }
 
@@ -2332,7 +2693,7 @@ async function handleUploadManifestPage(bucket, body) {
         onlyIf: stored.etag ? { etagMatches: stored.etag } : undefined
     });
     if (!updated) {
-        const raced = await readUploadSession(bucket, uploadId);
+        const raced = await readUploadSession(bucket, uploadId, false, true);
         if (!raced) return error('上传会话推进结果未知，请稍后查询同步状态。', 503);
         if (raced.session.nextPage > pageIndex) {
             return json({ ok: true, ...uploadSessionInfo(raced.session), missingPacks: [] });
@@ -2344,13 +2705,14 @@ async function handleUploadManifestPage(bucket, body) {
             onlyIf: raced.etag ? { etagMatches: raced.etag } : undefined
         });
         if (!updated) {
-            const latest = await readUploadSession(bucket, uploadId);
+            const latest = await readUploadSession(bucket, uploadId, false, true);
             if (latest?.session.nextPage > pageIndex) {
                 return json({ ok: true, ...uploadSessionInfo(latest.session), missingPacks: [] });
             }
             return error('上传会话推进结果未知，请稍后查询同步状态。', 503);
         }
     }
+    invalidateUploadSession(bucket, uploadId);
     return json({ ok: true, ...uploadSessionInfo(next), missingPacks: [] });
 }
 
@@ -2369,9 +2731,57 @@ async function handleUploadBloom(request, bucket, url) {
     return new Response(null, { status: 204 });
 }
 
+function normalizeFinalizeReusedPacks(value) {
+    if (value == null) return [];
+    if (!Array.isArray(value) || value.length > MAX_OBJECT_COUNT) return null;
+    const unique = new Set();
+    for (const item of value) {
+        const checksum = String(item || '').toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(checksum)) return null;
+        unique.add(checksum);
+    }
+    return [...unique];
+}
+
+async function verifyReusedPacks(bucket, uploadId, session, reusedPacks) {
+    if (!reusedPacks.length) return null;
+    // Reused packs already referenced by the current root are protected by the
+    // root Bloom. Only the remaining old objects can race with a GC that read
+    // session protection before this upload began, so head just those.
+    let atRisk = reusedPacks;
+    const current = await getManifest(bucket, true);
+    if (current) {
+        const currentBloom = await readBloomFilter(bucket, current);
+        atRisk = reusedPacks.filter(checksum => !bloomHasChecksum(currentBloom, checksum));
+    }
+    const checked = await runConcurrent(atRisk, 6, async checksum => {
+        try {
+            const object = await bucket.head(createPackKey(checksum));
+            return object ? null : checksum;
+        } catch (_) {
+            return { error: true };
+        }
+    });
+    if (checked.some(item => item && item.error)) {
+        return error('同步数据包复核失败，请重试。', 503);
+    }
+    const missing = checked.filter(Boolean);
+    if (!missing.length) return null;
+    // The immutable packs are gone; keeping the completed session would make
+    // every later finalize fail the same way. Clear it so the next sync can
+    // re-upload from the local cache.
+    try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+    invalidateUploadSession(bucket, uploadId);
+    return error('同步数据包已失效，请重新上传。', 409, {
+        ...uploadSessionInfo(session), missingPacks: missing
+    });
+}
+
 async function handleFinalizeUpload(bucket, body) {
     const uploadId = String(body.uploadId || '').toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(uploadId)) return error('上传会话无效。', 400);
+    const reusedPacks = normalizeFinalizeReusedPacks(body.reusedPacks);
+    if (!reusedPacks) return error('上传数据包复核参数无效。', 400);
     const stored = await readUploadSession(bucket, uploadId);
     if (!stored) {
         const current = await getManifest(bucket);
@@ -2385,15 +2795,19 @@ async function handleFinalizeUpload(bucket, body) {
         return error('上传清单尚未验证完成。', 409, uploadSessionInfo(session));
     }
     await readBloomFilter(bucket, session);
+    const reusedError = await verifyReusedPacks(bucket, uploadId, session, reusedPacks);
+    if (reusedError) return reusedError;
 
     // 根清单仍使用 R2 ETag 条件写，避免一次写入覆盖另一次尚未观察到的写入。
     // 个人存档不把 CAS 失败暴露给用户，而是重新读取当前根并继续提交；
     // 无竞争时首轮必成功，3 轮足以吸收 GC/begin 的偶发交叉。
     for (let attempt = 0; attempt < 3; attempt += 1) {
-        const manifestState = await getManifestState(bucket);
+        const manifestState = await getManifestState(bucket, { fresh: true });
         if (manifestState.resetRequired) return error('同步存储尚未初始化。', 409, { resetRequired: true });
         if (manifestState.manifest?.checksum === session.checksum) {
             try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+            invalidateUploadSession(bucket, uploadId);
+            invalidateManifestState(bucket);
             return json({ ok: true, remote: buildRemoteInfo(manifestState.manifest) });
         }
         const currentVersion = Number(manifestState.manifest?.version || 0);
@@ -2421,15 +2835,19 @@ async function handleFinalizeUpload(bucket, body) {
             });
         } catch (error) {
             // R2 响应丢失时先核对根清单；只有无法证明提交成功才上报未知结果。
-            const observed = await getManifest(bucket);
+            const observed = await getManifest(bucket, true);
             if (observed?.checksum === session.checksum) {
                 try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+                invalidateUploadSession(bucket, uploadId);
+                invalidateManifestState(bucket);
                 return json({ ok: true, remote: buildRemoteInfo(observed) });
             }
             throw error;
         }
         if (committed) {
             try { await bucket.delete(createUploadSessionKey(uploadId)); } catch (_) { }
+            invalidateUploadSession(bucket, uploadId);
+            invalidateManifestState(bucket);
             return json({ ok: true, remote: buildRemoteInfo(root) });
         }
     }
@@ -2469,56 +2887,66 @@ async function readActiveUploadProtection(bucket) {
         prefix: `${UPLOAD_SESSION_PREFIX}/`,
         limit: GC_PENDING_UPLOAD_LIMIT
     });
-    const activeSessionChecksums = new Set();
-    const activeBloomChecksums = new Set();
-    const protectedBloom = new Uint8Array(GC_BLOOM_BYTES);
-    if (listed.truncated) return {
+    const failure = () => ({
         complete: false,
         bloom: null,
-        sessionChecksums: activeSessionChecksums,
-        bloomChecksums: activeBloomChecksums
-    };
-    for (const object of listed.objects || []) {
-        const key = typeof object?.key === 'string' ? object.key : '';
-        if (!key.startsWith(`${UPLOAD_SESSION_PREFIX}/`)) continue;
-        let stored;
+        sessionChecksums: new Set(),
+        bloomChecksums: new Set()
+    });
+    if (listed.truncated) return failure();
+    const objects = (listed.objects || []).filter(object =>
+        typeof object?.key === 'string' && object.key.startsWith(`${UPLOAD_SESSION_PREFIX}/`));
+    const sessionChecksums = new Set();
+    const bloomChecksums = new Set();
+    const now = Date.now();
+    const readings = await runConcurrent(objects, 6, async object => {
         try {
-            stored = await readSmallJsonObject(bucket, key, 16 * 1024);
-        } catch (_) {
-            return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
-        }
-        const session = stored && normalizeUploadSession(stored.value);
-        if (!session) return {
-            complete: false,
-            bloom: null,
-            sessionChecksums: activeSessionChecksums,
-            bloomChecksums: activeBloomChecksums
-        };
-        if (gcSessionExpired(session, stored)) continue;
-        activeSessionChecksums.add(session.checksum);
-        activeBloomChecksums.add(session.bloomChecksum);
-        try {
-            const bloomObject = await bucket.get(createManifestBloomKey(session.bloomChecksum));
-            if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) {
-                return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
+            const stored = await readSmallJsonObject(bucket, object.key, 16 * 1024);
+            const session = stored && normalizeUploadSession(stored.value);
+            if (!session) {
+                // 损坏会话只有超过 TTL 才允许被 uploads 阶段删除；删除前它
+                // 仍可能“本应保护”某些对象，所以新鲜损坏一律按保护不完整处理。
+                const lastActivity = Math.max(
+                    gcObjectTimestamp(object.uploaded),
+                    gcObjectTimestamp(stored?.uploaded)
+                );
+                return { corrupt: true, expired: lastActivity > 0 && lastActivity < now - GC_UPLOAD_SESSION_TTL_MS };
             }
+            if (gcSessionExpired(session, { ...stored, uploaded: object.uploaded })) return { expired: true };
+            return { session };
+        } catch (_) {
+            return { error: true };
+        }
+    });
+    for (const reading of readings) {
+        if (reading?.error) return failure();
+        if (reading?.corrupt && !reading.expired) return failure();
+        if (!reading?.session) continue;
+        sessionChecksums.add(reading.session.checksum);
+        bloomChecksums.add(reading.session.bloomChecksum);
+    }
+    const uniqueBlooms = [...bloomChecksums];
+    const bloomResults = await runConcurrent(uniqueBlooms, 6, async checksum => {
+        try {
+            const bloomObject = await bucket.get(createManifestBloomKey(checksum));
+            if (!bloomObject || Number(bloomObject.size) !== GC_BLOOM_BYTES) return null;
             const bytes = new Uint8Array(await new Response(bloomObject.body).arrayBuffer());
-            if (bytes.byteLength !== GC_BLOOM_BYTES
-                || await sha256Bytes(bytes) !== session.bloomChecksum) {
-                return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
-            }
-            for (let index = 0; index < protectedBloom.length; index += 1) {
-                protectedBloom[index] |= bytes[index];
-            }
+            if (bytes.byteLength !== GC_BLOOM_BYTES || await sha256Bytes(bytes) !== checksum) return null;
+            return bytes;
         } catch (_) {
-            return { complete: false, bloom: null, sessionChecksums: activeSessionChecksums, bloomChecksums: activeBloomChecksums };
+            return null;
         }
+    });
+    if (bloomResults.some(bytes => !bytes)) return failure();
+    const protectedBloom = new Uint8Array(GC_BLOOM_BYTES);
+    for (const bytes of bloomResults) {
+        for (let index = 0; index < protectedBloom.length; index += 1) protectedBloom[index] |= bytes[index];
     }
     return {
         complete: true,
         bloom: protectedBloom,
-        sessionChecksums: activeSessionChecksums,
-        bloomChecksums: activeBloomChecksums
+        sessionChecksums,
+        bloomChecksums
     };
 }
 
@@ -2591,33 +3019,43 @@ async function writeGcState(bucket, state, etag = null) {
 }
 
 // R2 批量删除没有条件写；候选来自本轮扫描并已通过引用与宽限复核，删除
-// 本身幂等。分成小批推进，失败在下一轮 gc-step 里按同样依据重判即可。
+// 本身幂等。返回成功/失败数量，调用方只有在没有失败时才推进游标；失败
+// 留到下一轮按同样依据重判。
 async function gcDeleteCandidates(bucket, keys) {
     let deleted = 0;
+    let failed = 0;
     for (let start = 0; start < keys.length; start += GC_LIST_LIMIT) {
+        const batch = keys.slice(start, start + GC_LIST_LIMIT);
         try {
-            await bucket.delete(keys.slice(start, start + GC_LIST_LIMIT));
+            await bucket.delete(batch);
+            deleted += batch.length;
         } catch (_) {
-            continue;
+            failed += batch.length;
         }
-        deleted += Math.min(GC_LIST_LIMIT, keys.length - start);
     }
-    return deleted;
+    return { deleted, failed };
 }
 
 async function handleGcStep(bucket) {
-    const root = await getManifest(bucket);
+    // GC 的删除判断必须基于最新根：TTL 缓存只服务读路径。
+    const root = await getManifest(bucket, true);
     if (!root) return json({ ok: true, done: true, deletedCount: 0, stage: 'done' });
     const storedState = await readSmallJsonObject(bucket, GC_STATE_KEY, GC_STATE_MAX_BYTES);
     const state = normalizeGcState(storedState?.value, root.checksum);
     if (state.stage === 'done') return json({ ok: true, done: true, deletedCount: 0, stage: 'done' });
 
-    let deletedCount = 0;
     const stage = state.stage;
     const cursor = state.cursors[stage] || undefined;
     const now = Date.now();
     const controlCutoff = now - GC_CONTROL_GC_GRACE_MS;
+    const blocked = (extra = {}) => json({
+        ok: true, done: false, stage, deletedCount: 0, blocked: true, ...extra
+    });
+    const needsRescan = (extra = {}) => json({
+        ok: true, done: false, stage, deletedCount: 0, needsRescan: true, ...extra
+    });
 
+    let deletedCount = 0;
     if (stage === 'uploads') {
         const page = await bucket.list({ prefix: `${UPLOAD_SESSION_PREFIX}/`, cursor, limit: GC_SESSION_GC_LIMIT });
         const nextCursor = getNextSyncCursor(page, cursor);
@@ -2629,10 +3067,19 @@ async function handleGcStep(bucket) {
             try {
                 stored = await readSmallJsonObject(bucket, object.key, 16 * 1024);
             } catch (_) {
-                continue;
+                stored = null;
             }
             const session = stored && normalizeUploadSession(stored.value);
-            if (!session || session.uploadId !== uploadId || session.checksum === root.checksum) continue;
+            if (!session) {
+                // 损坏会话不能继续恢复，超过 TTL 后与过期会话一样回收。
+                const lastActivity = Math.max(
+                    gcObjectTimestamp(object.uploaded),
+                    gcObjectTimestamp(stored?.uploaded)
+                );
+                if (lastActivity > 0 && lastActivity < now - GC_UPLOAD_SESSION_TTL_MS) candidates.push(object.key);
+                continue;
+            }
+            if (session.uploadId !== uploadId || session.checksum === root.checksum) continue;
             if (gcSessionExpired(session, { ...stored, uploaded: object.uploaded })) candidates.push(object.key);
         }
         // Re-read each candidate immediately before deletion. This avoids deleting a
@@ -2644,18 +3091,28 @@ async function handleGcStep(bucket) {
             try {
                 stored = await readSmallJsonObject(bucket, key, 16 * 1024);
             } catch (_) {
-                continue;
+                stored = null;
             }
             const session = stored && normalizeUploadSession(stored.value);
-            if (session && session.uploadId === uploadId && session.checksum !== root.checksum
+            if (!session) {
+                const lastActivity = gcObjectTimestamp(stored?.uploaded);
+                if (lastActivity > 0 && lastActivity < now - GC_UPLOAD_SESSION_TTL_MS) safeCandidates.push(key);
+                continue;
+            }
+            if (session.uploadId === uploadId && session.checksum !== root.checksum
                 && gcSessionExpired(session, stored)) safeCandidates.push(key);
         }
-        deletedCount = await gcDeleteCandidates(bucket, safeCandidates);
+        const outcome = await gcDeleteCandidates(bucket, safeCandidates);
+        deletedCount = outcome.deleted;
+        if (outcome.failed) {
+            return json({ ok: true, done: false, stage, deletedCount, failedCount: outcome.failed });
+        }
         state.cursors.uploads = nextCursor;
         if (!nextCursor) state.stage = 'done';
     } else if (stage === 'packs') {
         const bloom = await readBloomFilter(bucket, root);
-        const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_LIST_LIMIT });
+        // 包数量最多；用更小的扫描批压缩“扫描后会话新建/复用包”的竞态窗口。
+        const page = await bucket.list({ prefix: `${PACK_PREFIX}/`, cursor, limit: GC_PACK_LIST_LIMIT });
         const nextCursor = getNextSyncCursor(page, cursor);
         const candidates = [];
         for (const object of page.objects || []) {
@@ -2664,47 +3121,78 @@ async function handleGcStep(bucket) {
             const uploadedAt = gcObjectTimestamp(object.uploaded);
             if (uploadedAt && uploadedAt < now - SYNC_PACK_GC_GRACE_MS) candidates.push(object.key);
         }
-        // 在删除前复核：保护仍可能 finalize 的活动上传，并确认根清单没有
-        // 在扫描期间切换。任一保护不完整就整体跳过删除，只推进游标。
+        // 删除前复核：活动上传会话的 Bloom 必须完整枚举，根不能在扫描期间
+        // 切换。任何一项不完整都不推进游标，下一轮从同一位置重扫。
         const protection = await readActiveUploadProtection(bucket);
-        const latestRoot = await getManifest(bucket);
-        if (latestRoot && latestRoot.checksum === root.checksum && protection.complete) {
-            const safe = candidates.filter(key => {
-                const checksum = parseGcPackKey(key);
-                return checksum && !bloomHasChecksum(bloom, checksum)
-                    && !bloomHasChecksum(protection.bloom, checksum);
-            });
-            deletedCount = await gcDeleteCandidates(bucket, safe);
+        const latestRoot = await getManifest(bucket, true);
+        if (!latestRoot || latestRoot.checksum !== root.checksum) return needsRescan();
+        if (!protection.complete) return blocked({ failedCount: 0 });
+        const safe = candidates.filter(key => {
+            const checksum = parseGcPackKey(key);
+            return checksum && !bloomHasChecksum(bloom, checksum)
+                && !bloomHasChecksum(protection.bloom, checksum);
+        });
+        // 第二轮确认：重新枚举活动会话。第一轮读取后新开始的会话会在这里
+        // 补进保护集合；随后才读取候选对象时间，让时间复核尽量贴近删除。
+        const finalProtection = await readActiveUploadProtection(bucket);
+        const finalRoot = await getManifest(bucket, true);
+        if (!finalRoot || finalRoot.checksum !== root.checksum) return needsRescan();
+        if (!finalProtection.complete) return blocked({ failedCount: 0 });
+        const finalSafe = safe.filter(key => {
+            const checksum = parseGcPackKey(key);
+            return checksum && !bloomHasChecksum(finalProtection.bloom, checksum);
+        });
+        // 删除前逐个重读对象时间：若对象在扫描后被重新写入（新 uploaded），
+        // 本轮不删，留给下一轮按新时间重新判断。head 失败同样保守跳过。
+        const confirmed = await runConcurrent(finalSafe, 6, async key => {
+            try {
+                const head = await bucket.head(key);
+                if (!head) return null;
+                const uploadedAt = gcObjectTimestamp(head.uploaded);
+                return uploadedAt && uploadedAt < now - SYNC_PACK_GC_GRACE_MS ? key : null;
+            } catch (_) {
+                return { error: true };
+            }
+        });
+        if (confirmed.some(item => item && item.error)) return blocked();
+        const outcome = await gcDeleteCandidates(bucket, confirmed.filter(Boolean));
+        deletedCount = outcome.deleted;
+        if (outcome.failed) {
+            return json({ ok: true, done: false, stage, deletedCount, failedCount: outcome.failed });
         }
         state.cursors.packs = nextCursor;
         if (!nextCursor) state.stage = GC_STAGE_NAMES[1];
     } else {
         // manifest-pages / blooms：控制对象按内容寻址，只有「不属于当前根、
         // 也不属于任何仍可恢复的上传会话」且超过宽限期的才能删除。活动
-        // 会话枚举或对象校验失败时保护不完整，本步只推进游标不删除。
+        // 会话枚举或对象校验失败时保护不完整，本步不推进游标。
         const isPages = stage === 'manifest-pages';
         const prefix = isPages ? `${MANIFEST_PAGE_PREFIX}/` : `${BLOOM_PREFIX}/`;
         const page = await bucket.list({ prefix, cursor, limit: GC_LIST_LIMIT });
         const nextCursor = getNextSyncCursor(page, cursor);
         const protection = await readActiveUploadProtection(bucket);
-        const latestRoot = await getManifest(bucket);
-        if (latestRoot && latestRoot.checksum === root.checksum && protection.complete) {
-            const candidates = [];
-            for (const object of page.objects || []) {
-                const key = typeof object?.key === 'string' ? object.key : '';
-                const uploadedAt = gcObjectTimestamp(object.uploaded);
-                if (!uploadedAt || uploadedAt >= controlCutoff) continue;
-                if (isPages) {
-                    const parsed = parseGcManifestPageKey(key);
-                    if (parsed && parsed.rootChecksum !== root.checksum
-                        && !protection.sessionChecksums.has(parsed.rootChecksum)) candidates.push(key);
-                } else {
-                    const checksum = parseGcBloomKey(key);
-                    if (checksum && checksum !== root.bloomChecksum
-                        && !protection.bloomChecksums.has(checksum)) candidates.push(key);
-                }
+        const latestRoot = await getManifest(bucket, true);
+        if (!latestRoot || latestRoot.checksum !== root.checksum) return needsRescan();
+        if (!protection.complete) return blocked();
+        const candidates = [];
+        for (const object of page.objects || []) {
+            const key = typeof object?.key === 'string' ? object.key : '';
+            const uploadedAt = gcObjectTimestamp(object.uploaded);
+            if (!uploadedAt || uploadedAt >= controlCutoff) continue;
+            if (isPages) {
+                const parsed = parseGcManifestPageKey(key);
+                if (parsed && parsed.rootChecksum !== root.checksum
+                    && !protection.sessionChecksums.has(parsed.rootChecksum)) candidates.push(key);
+            } else {
+                const checksum = parseGcBloomKey(key);
+                if (checksum && checksum !== root.bloomChecksum
+                    && !protection.bloomChecksums.has(checksum)) candidates.push(key);
             }
-            deletedCount = await gcDeleteCandidates(bucket, candidates);
+        }
+        const outcome = await gcDeleteCandidates(bucket, candidates);
+        deletedCount = outcome.deleted;
+        if (outcome.failed) {
+            return json({ ok: true, done: false, stage, deletedCount, failedCount: outcome.failed });
         }
         state.cursors[stage] = nextCursor;
         if (!nextCursor) state.stage = isPages ? GC_STAGE_NAMES[2] : GC_STAGE_NAMES[3];
@@ -2737,7 +3225,7 @@ async function runConcurrent(items, limit, worker) {
     return results;
 }
 
-async function handleJsonApi(request, env) {
+async function handleJsonApi(request, env, ctx) {
     if (request.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: { allow: 'POST, OPTIONS' } });
     }
@@ -2751,7 +3239,7 @@ async function handleJsonApi(request, env) {
     if (body.action === 'prepare-upload' || body.action === 'pull-manifest') return handleStatus(bucket, body);
     if (body.action === 'initialize-storage') return handleInitializeStorage(bucket, body);
     if (body.action === 'pull-manifest-page') return handlePullManifestPage(bucket, body);
-    if (body.action === 'pull-pack') return handlePullPack(bucket, body);
+    if (body.action === 'pull-pack') return handlePullPack(request, bucket, body, ctx);
     if (body.action === 'begin-upload') return beginUpload(bucket, body);
     if (body.action === 'upload-manifest-page') return handleUploadManifestPage(bucket, body);
     if (body.action === 'finalize-upload') return handleFinalizeUpload(bucket, body);
@@ -2759,7 +3247,7 @@ async function handleJsonApi(request, env) {
     return error('Unsupported action.', 404);
 }
 
-async function handleApi(request, env, url) {
+async function handleApi(request, env, url, ctx) {
     try {
         const action = url.searchParams.get('action');
         if (action === 'upload-pack' || action === 'upload-bloom') {
@@ -2770,7 +3258,7 @@ async function handleApi(request, env, url) {
                 ? await handleUploadPack(request, bucket, url)
                 : await handleUploadBloom(request, bucket, url);
         }
-        return await handleJsonApi(request, env);
+        return await handleJsonApi(request, env, ctx);
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unexpected server error.';
         const status = err instanceof SyncRequestError
@@ -2788,9 +3276,9 @@ async function serveStatic(request, env) {
     if (!assetResponse || assetResponse.status !== 200) return assetResponse;
     // 同步客户端的全部代码都在这三个部署文件里。409 版本门的
     // “请刷新页面后重试”只有在刷新必然拿到当前部署副本时才成立：
-    // HTML 与 app.js 已是 no-store；这三个文件约 234KB 且每次部署
-    // etag 必然变化，no-cache 协商缓存让未变化请求直接 304，
-    // 部署后也不会回放旧客户端。
+    // 作者 HTML 为 no-store，app.js/静态资产为 no-cache；这三个文件约
+    // 227,846B（222.5KiB）且每次部署 etag 必然变化，no-cache 协商缓存让
+    // 未变化请求直接 304，部署后也不会回放旧客户端。
     const headers = new Headers(assetResponse.headers);
     headers.set('cache-control', 'no-cache');
     return new Response(assetResponse.body, {
@@ -2809,9 +3297,9 @@ function serveSyncRestorePage() {
     });
 }
 
-async function tryLoadAdapter(env) {
+async function tryLoadAdapter(env, request) {
     try {
-        return await loadAdapter(env);
+        return await loadAdapter(env, request);
     } catch (_) {
         return null;
     }
@@ -2850,7 +3338,7 @@ async function serveAdapterConfig(request, env) {
         return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } });
     }
     try {
-        const adapter = await loadAdapter(env);
+        const adapter = await loadAdapter(env, request);
         const response = json(adapterPublicView(adapter));
         return request.method === 'HEAD'
             ? new Response(null, { status: response.status, headers: response.headers })
@@ -2863,7 +3351,37 @@ async function serveAdapterConfig(request, env) {
     }
 }
 
-async function serveAuthor(request, env) {
+function authorCacheRequest(requestUrl) {
+    return new Request(new URL(`/__rphub-author-cache${requestUrl.pathname}${requestUrl.search}`, requestUrl.origin), {
+        method: 'GET'
+    });
+}
+
+async function matchAuthorCache(requestUrl) {
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (!cache || typeof cache.match !== 'function') return null;
+    try {
+        return await cache.match(authorCacheRequest(requestUrl));
+    } catch {
+        return null;
+    }
+}
+
+function cacheAuthorResponse(ctx, requestUrl, response) {
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (!cache || typeof cache.put !== 'function') return;
+    const headers = new Headers(response.headers);
+    // Cache API 的 TTL 用 max-age 表达；对外响应仍会改回 no-cache。
+    headers.set('cache-control', `public, max-age=${AUTHOR_CACHE_TTL_SECONDS}`);
+    const putting = cache.put(authorCacheRequest(requestUrl), new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    })).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(putting);
+}
+
+async function serveAuthor(request, env, ctx) {
     const requestUrl = new URL(request.url);
     let upstreamPath = requestUrl.pathname;
     if (upstreamPath === '/') upstreamPath = '/index.html';
@@ -2878,27 +3396,34 @@ async function serveAuthor(request, env) {
 
     const isAuthorScript = /\.js$/i.test(requestUrl.pathname);
     const isPage = !/\.[a-z0-9]+$/i.test(requestUrl.pathname) || requestUrl.pathname.endsWith('.html');
-    if (isAuthorScript || isPage) {
-        upstreamHeaders.delete('if-none-match');
-        upstreamHeaders.delete('if-modified-since');
+    const mayUseCache = request.method === 'GET' && (isAuthorScript || isPage)
+        && !request.headers.has('if-none-match') && !request.headers.has('if-modified-since');
+    let response = mayUseCache ? await matchAuthorCache(requestUrl) : null;
+    if (!response) {
+        response = await fetchAuthorUpstream(upstreamPath, {
+            method: request.method,
+            headers: upstreamHeaders,
+            body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
+            redirect: 'follow'
+        }, requestUrl.search);
+        // 上游没有 ETag/Last-Modified 时没有协商缓存可用，用 45 秒 Cache API
+        // 兜底，避免每次页面/脚本请求都回源；有验证器时交给条件请求。
+        if (request.method === 'GET' && response.status === 200
+            && !response.headers.get('etag') && !response.headers.get('last-modified')) {
+            cacheAuthorResponse(ctx, requestUrl, response.clone());
+        }
     }
-    const response = await fetchAuthorUpstream(upstreamPath, {
-        method: request.method,
-        headers: upstreamHeaders,
-        body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
-        redirect: 'follow'
-    }, requestUrl.search);
     const contentType = response.headers.get('content-type') || '';
     const isHtml = contentType.toLowerCase().includes('text/html');
     const headers = new Headers(response.headers);
-    if (isAuthorScript || isPage || isHtml) headers.set('cache-control', 'no-store');
+    if (isAuthorScript || isPage || isHtml) headers.set('cache-control', 'no-cache');
     if (request.method === 'HEAD' || [204, 205, 304].includes(response.status)) {
         return new Response(null, { status: response.status, statusText: response.statusText, headers });
     }
     const proxied = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
     if (!response.ok || !isHtml) return proxied;
     const adapter = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html'
-        ? await tryLoadAdapter(env) : null;
+        ? await tryLoadAdapter(env, request) : null;
     return rewriteAuthorHtml(proxied, requestUrl.pathname, adapter);
 }
 
@@ -2930,7 +3455,7 @@ export default {
             }
         }
         if (url.pathname === API_PATH) {
-            return handleApi(request, env, url);
+            return handleApi(request, env, url, ctx);
         }
         if (url.pathname === '/sync-restore') {
             return serveSyncRestorePage();
@@ -2940,6 +3465,6 @@ export default {
         // 不再维护硬编码的代理路径清单。
         const assetResponse = await serveStatic(request, env);
         if (assetResponse && assetResponse.status !== 404) return assetResponse;
-        return serveAuthor(request, env);
+        return serveAuthor(request, env, ctx);
     }
 };

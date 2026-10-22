@@ -72,6 +72,8 @@
     const failedWrites = new Map();
     const hooks = new Map();
     const saveWatchers = new Set();
+    const SAVE_MARKERS = ['_memorySettingsSaveTimer', 'debouncedCharacterSave', 'debouncedSave', 'scheduleChatHistorySave'];
+    const FEATURE_NAMES = ['sync', 'images', 'navigation', 'settings', 'scroll', 'preserveSettings'];
     let timerScope = false;
     let setupScope = false;
     let state = null;
@@ -192,6 +194,75 @@
             busy: Boolean(value(state.isConversationBusy))
         };
     };
+    const imageObserver = typeof IntersectionObserver === 'function'
+        ? new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                const image = entry.target;
+                imageObserver.unobserve(image);
+                const src = image.dataset.rphDeferredSrc;
+                if (src) image.src = src;
+            }
+        }, { rootMargin: '300px' })
+        : null;
+    const setCardImageSource = (image, src) => {
+        if (!image || !src) return;
+        image.loading = 'lazy';
+        image.decoding = 'async';
+        image.setAttribute('loading', 'lazy');
+        image.setAttribute('decoding', 'async');
+        if (imageObserver) {
+            image.dataset.rphDeferredSrc = src;
+            imageObserver.observe(image);
+        } else {
+            delete image.dataset.rphDeferredSrc;
+            image.src = src;
+        }
+    };
+    const thumbBackfill = (card, image, task) => {
+        const imageKey = image.dataset.rphImageKey || '';
+        let token = '';
+        try {
+            token = new URL(task?.requestUrl || '', location.href).searchParams.get('token') || '';
+        } catch (_) { }
+        if (!imageKey) return;
+        const backfill = window.RPH_MAGIC_BACKFILL_THUMB;
+        if (typeof backfill !== 'function') return;
+        card.classList.add('is-image-thumb-pending');
+        backfill(imageKey, token).then(thumbUrl => {
+            image.dataset.rphThumbFailed = '';
+            image.dataset.rphThumbSrc = thumbUrl;
+            card.classList.remove('is-image-thumb-failed', 'is-image-thumb-pending');
+            setCardImageSource(image, `${thumbUrl}${thumbUrl.includes('?') ? '&' : '?'}_rph_retry=${Date.now()}`);
+        }).catch(() => {
+            card.classList.remove('is-image-thumb-pending');
+            card.classList.add('is-image-thumb-failed');
+        });
+    };
+    const bindThumbEvents = (card, image, task) => {
+        if (!image || image.dataset.rphThumbBound === '1') return;
+        image.dataset.rphThumbBound = '1';
+        image.addEventListener('error', () => {
+            const thumbSrc = image.dataset.rphThumbSrc || '';
+            if (!thumbSrc || image.dataset.rphThumbFailed === '1') return;
+            if (!String(image.currentSrc || image.src || '').includes(thumbSrc.split('?')[0])) return;
+            // 缩略图还没生成：先显示占位，后台回填 480px WebP；绝不自动
+            // 回退到原图，避免聊天列表一次拉取几十张大图。
+            image.dataset.rphThumbFailed = '1';
+            image.removeAttribute('src');
+            card.classList.add('is-image-thumb-failed');
+            thumbBackfill(card, image, task);
+        });
+        // 显式“查看大图”才加载原图。
+        image.addEventListener('click', () => {
+            if (image.dataset.rphThumbFailed !== '1') return;
+            const fullSrc = image.dataset.rphFullSrc || '';
+            if (!fullSrc) return;
+            image.dataset.rphThumbFailed = '';
+            card.classList.remove('is-image-thumb-failed');
+            setCardImageSource(image, fullSrc);
+        }, true);
+    };
     const renderImage = (card, task, job) => {
         if (!card?.isConnected) return task.cards?.delete(card);
         card.dataset.imageJobState = job.status;
@@ -199,7 +270,25 @@
         card.classList.toggle('is-generation-error', job.status === 'failed');
         if (job.imageUrl) {
             const image = card.querySelector('img');
-            if (image) { image.style.height = '100%'; image.src = new URL(job.imageUrl, task.baseUrl || location.href).href; }
+            if (image) {
+                const fullSrc = new URL(job.imageUrl, task.baseUrl || location.href).href;
+                const thumbSrc = job.thumbUrl
+                    ? new URL(job.thumbUrl, task.baseUrl || location.href).href
+                    : '';
+                image.style.height = '100%';
+                image.dataset.rphFullSrc = fullSrc;
+                image.dataset.rphImageKey = (() => {
+                    try { return new URL(fullSrc).searchParams.get('key') || ''; } catch (_) { return ''; }
+                })();
+                if (thumbSrc) {
+                    image.dataset.rphThumbSrc = thumbSrc;
+                    bindThumbEvents(card, image, task);
+                    if (image.dataset.rphThumbFailed !== '1') setCardImageSource(image, thumbSrc);
+                } else {
+                    delete image.dataset.rphThumbSrc;
+                    setCardImageSource(image, fullSrc);
+                }
+            }
         }
         const label = card.querySelector('.generated-image-progress-label');
         if (label) label.textContent = job.error || (job.status === 'done' ? '' : '生成中');
@@ -242,7 +331,7 @@
             if (!setupScope || typeof callback !== 'function') return watch(source, callback, options);
             // 仅捕获当前适配版本的四种保存入口，其他动画、网络和轮询定时器保持原行为。
             const body = Function.prototype.toString.call(callback);
-            const saveKind = ['_memorySettingsSaveTimer', 'debouncedCharacterSave', 'debouncedSave', 'scheduleChatHistorySave'].find(marker => body.includes(marker));
+            const saveKind = SAVE_MARKERS.find(marker => body.includes(marker));
             if (saveKind) {
                 saveWatchers.add(saveKind);
                 if (saveKind === 'scheduleChatHistorySave') scheduleChatSave = () => scoped(() => callback());
@@ -292,7 +381,8 @@
         };
     }
     const flush = async () => {
-        if (!enabled('sync') || !mounted || startupFailed || !storage || saveWatchers.size !== 4) {
+        if (!enabled('sync') || !mounted || startupFailed || !storage
+            || !SAVE_MARKERS.every(marker => saveWatchers.has(marker))) {
             throw new Error('作者保存接口未就绪，当前页面不能确认内存数据已保存。');
         }
         if (value(state.isConversationBusy) || value(state.storyBranchSwitching) || value(state.switchingCharacterIndex) >= 0) {
@@ -323,7 +413,33 @@
     const external = {
         version: 1, config, flush, context, describeCard,
         register(name, handler) { hooks.set(name, handler); return () => { if (hooks.get(name) === handler) hooks.delete(name); }; },
-        capabilities() { return { flush: enabled('sync') && mounted && !startupFailed && saveWatchers.size === 4, context: Boolean(state), images: Boolean(enabled('images') && imageUi.card && imageUi.row && state && hooks.has('image-request')) }; },
+        capabilities() {
+            const features = Object.fromEntries(FEATURE_NAMES.map(name => [name, enabled(name)]));
+            const saveMarkers = Object.fromEntries(SAVE_MARKERS.map(name => [name, saveWatchers.has(name)]));
+            const contextReady = Boolean(state);
+            const storageReady = Boolean(storage);
+            const mountedReady = mounted && !startupFailed;
+            const imagesReady = features.images && Boolean(imageUi.card && imageUi.row && contextReady && hooks.has('image-request'));
+            const missing = [];
+            if (!mountedReady) missing.push(startupFailed ? 'startup' : 'mounted');
+            if (!contextReady) missing.push('context');
+            if (!storageReady) missing.push('storage');
+            for (const name of SAVE_MARKERS) if (!saveMarkers[name]) missing.push(name);
+            if (features.images && !imagesReady) missing.push('images');
+            return {
+                ...features,
+                saveMarkers,
+                context: contextReady,
+                storage: storageReady,
+                mounted: mountedReady,
+                images: imagesReady,
+                missing,
+                // 任何保存入口缺失都视为不可同步：宁可显式失败，也不提交
+                // 一份可能漏掉内存修改的快照。
+                flush: features.sync && contextReady && storageReady && mountedReady
+                    && SAVE_MARKERS.every(name => saveMarkers[name])
+            };
+        },
         imageKey: () => String(value(state?.settings)?.imageGenKey || ''),
         installUi: null
     };
@@ -413,7 +529,9 @@
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
             '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}',
             // [RPHub 修改] 生成中的重掷按钮置灰且不可点，与 renderImage 里的 disabled 一致。
-            '.generated-image-card.is-generating ' + (imageUi.reroll || '.generated-image-reroll') + '{opacity:.45;pointer-events:none}'
+            '.generated-image-card.is-generating ' + (imageUi.reroll || '.generated-image-reroll') + '{opacity:.45;pointer-events:none}',
+            '.generated-image-card.is-image-thumb-failed img{opacity:.18;filter:grayscale(1)}',
+            '.generated-image-card.is-image-thumb-failed::after{content:"缩略图生成中…";position:absolute;inset:auto 0 12px 0;text-align:center;font-size:12px;color:#64748b}'
         ].join('');
         document.head.appendChild(style);
     };

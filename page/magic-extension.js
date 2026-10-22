@@ -365,6 +365,12 @@
     const imageCardBindings = new WeakMap();
     const SLOT_TASK_CACHE_LIMIT = 128;
 
+    const revokeJobObjectUrl = job => {
+        if (typeof job?.imageUrl === 'string' && job.imageUrl.startsWith('blob:')) {
+            URL.revokeObjectURL(job.imageUrl);
+        }
+    };
+
     // 已结算的槽位任务只用于复用渲染；超限后按插入顺序淘汰已完成的
     // 条目，进行中的任务保留。被淘汰的槽位重新渲染时走已保存记录的
     // 完成态路径，不会重新生成。
@@ -373,6 +379,7 @@
         for (const [key, task] of imageSlotTasks) {
             if (imageSlotTasks.size <= SLOT_TASK_CACHE_LIMIT) break;
             if (task.job?.status === 'running') continue;
+            revokeJobObjectUrl(task.job);
             imageSlotTasks.delete(key);
         }
     };
@@ -387,7 +394,7 @@
         return job;
     };
 
-    const createCompletedImageTask = (requestUrl, imageUrl, render) => {
+    const createCompletedImageTask = (requestUrl, imageUrl, render, thumbUrl = '') => {
         const task = {
             requestUrl,
             baseUrl: location.origin,
@@ -397,6 +404,8 @@
             job: {
                 status: 'done',
                 imageUrl,
+                thumbUrl,
+                thumbFailed: false,
                 generationProgress: { percent: 100 }
             },
             promise: null
@@ -426,9 +435,39 @@
         const existing = imageGenerationTasks.get(key);
         if (existing) return existing;
         const promise = requestImageGeneration(requestUrl)
-            .then(imageKey => ({
-                status: 'done', imageKey, imageUrl: imageKey ? `/api/rp-image?key=${encodeURIComponent(imageKey)}` : key, generationProgress: { percent: 100 }
-            }))
+            .then(async ({ imageKey, blob }) => {
+                let objectUrl = '';
+                try {
+                    if (typeof URL.createObjectURL === 'function') objectUrl = URL.createObjectURL(blob);
+                } catch (_) {
+                    // 少数受限 WebView 没有 object URL，直接回退到内容寻址读取。
+                }
+                let thumbUrl = '';
+                let imageUrl = objectUrl || (imageKey ? buildImageReadUrl(imageKey) : '');
+                try {
+                    if (!imageKey) throw new Error('missing image key');
+                    const token = new URL(requestUrl, location.href).searchParams.get('token') || '';
+                    const thumbBlob = await createImageThumbnailBlob(blob);
+                    await uploadImageThumbnail(imageKey, token, thumbBlob);
+                    thumbUrl = buildImageThumbUrl(imageKey);
+                    // 缩略图已落 R2：卡片走缩略图，不再为原图发第二次 GET；
+                    // 本次 blob URL 只用于缩略图生成期间，立即释放。
+                    if (objectUrl) URL.revokeObjectURL(objectUrl);
+                    imageUrl = buildImageReadUrl(imageKey);
+                } catch (_) {
+                    // 生成缩略图/上传失败时保留 blob URL（或内容寻址 URL）
+                    // 展示原图；记录 thumbFailed 让卡片显示占位并进入回填
+                    // 队列，而不是重新下载一次大图。
+                }
+                return {
+                    status: 'done',
+                    imageKey,
+                    imageUrl,
+                    thumbUrl,
+                    thumbFailed: Boolean(imageKey && !thumbUrl),
+                    generationProgress: { percent: 100 }
+                };
+            })
             .catch(error => ({
                 status: 'failed',
                 error: error?.message || '生成失败',
@@ -441,14 +480,74 @@
         return promise;
     };
 
+    const buildImageReadUrl = imageKey => `/api/rp-image?key=${encodeURIComponent(imageKey)}`;
+    const buildImageThumbUrl = imageKey => `${buildImageReadUrl(imageKey)}&thumb=1`;
+
+    const createImageThumbnailBlob = async blob => {
+        const targetWidth = 480;
+        const canvas = document.createElement('canvas');
+        let source;
+        let release = () => { };
+        if (typeof createImageBitmap === 'function') {
+            source = await createImageBitmap(blob);
+            release = () => source.close?.();
+        } else {
+            const objectUrl = URL.createObjectURL(blob);
+            source = await new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => resolve(image);
+                image.onerror = () => reject(new Error('缩略图源图解码失败'));
+                image.src = objectUrl;
+            });
+            release = () => URL.revokeObjectURL(objectUrl);
+        }
+        try {
+            const width = Number(source.width) || targetWidth;
+            const height = Number(source.height) || targetWidth;
+            const scale = Math.min(1, targetWidth / Math.max(1, width));
+            canvas.width = Math.max(1, Math.round(width * scale));
+            canvas.height = Math.max(1, Math.round(height * scale));
+            const context = canvas.getContext('2d');
+            if (!context) throw new Error('缩略图画布不可用');
+            context.drawImage(source, 0, 0, canvas.width, canvas.height);
+        } finally {
+            release();
+        }
+        const thumb = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.82));
+        if (!thumb) throw new Error('缩略图编码失败');
+        return thumb;
+    };
+
+    const uploadImageThumbnail = async (imageKey, token, blob) => {
+        if (!token) throw new Error('missing image token');
+        const url = new URL('/api/rp-image', location.origin);
+        url.searchParams.set('key', imageKey);
+        url.searchParams.set('thumb', '1');
+        url.searchParams.set('token', token);
+        const response = await fetch(url, {
+            method: 'PUT',
+            headers: { 'content-type': 'image/webp' },
+            body: blob
+        });
+        if (!response.ok) throw new Error(`缩略图上传失败：HTTP ${response.status}`);
+    };
+
     const requestImageGeneration = async generateUrl => {
         const response = await fetch(generateUrl, { method: 'POST' });
         if (!response.ok) {
             const payload = await response.json().catch(() => null);
             throw new Error(payload?.error || `生图失败：HTTP ${response.status}`);
         }
-        if (response.body) await response.body.cancel().catch(() => undefined);
-        return response.headers.get('x-rp-image-key') ? decodeURIComponent(response.headers.get('x-rp-image-key')) : '';
+        // 生成响应正文就是图片：直接 blob 化并转成 object URL，避免再发
+        // 一次 GET 拉原图；缩略图上传成功后再替换为内容寻址 URL。
+        const blob = await response.blob();
+        if (!blob.size) throw new Error('生图服务返回了空图片');
+        return {
+            imageKey: response.headers.get('x-rp-image-key')
+                ? decodeURIComponent(response.headers.get('x-rp-image-key'))
+                : '',
+            blob
+        };
     };
 
     const commitGeneratedRecord = async (state, record, previous, persistRequested) => {
@@ -473,6 +572,7 @@
     const createGenerationTask = ({ slotKey, sourcePromptHash, record, previous = null, state = null, characterId = state?.id || '', token = '', render, persistRequested = false }) => {
         const generateUrl = buildRecordUrl(record, token, true);
         const readUrl = buildRecordUrl(record);
+        const previousTask = imageSlotTasks.get(slotKey);
         const task = {
             sourcePromptHash,
             record,
@@ -494,6 +594,7 @@
                 state.transientRecords.delete(record.key);
             }
             if (imageSlotTasks.get(slotKey) !== task) return job;
+            if (job.status === 'done' && previousTask && previousTask !== task) revokeJobObjectUrl(previousTask.job);
             if (job.status === 'done') {
                 record.imageKey = job.imageKey || record.imageKey;
                 try {
@@ -511,7 +612,8 @@
     // 共用同一份装配逻辑。
     const resumeRecordedImageTask = (record, descriptor, slotKey, token, render, state, characterId = state?.id || '') => {
         const readUrl = buildRecordUrl(record);
-        const task = createCompletedImageTask(readUrl, readUrl, render);
+        const thumbUrl = record.imageKey ? buildImageThumbUrl(record.imageKey) : '';
+        const task = createCompletedImageTask(readUrl, readUrl, render, thumbUrl);
         Object.assign(task, { record, state, characterId: String(characterId || ''), sourcePromptHash: descriptor.promptHash });
         imageSlotTasks.set(slotKey, task);
         pruneSlotTasks();
@@ -652,6 +754,33 @@
         return deferredTask;
     };
 
+    // 旧图/跨设备浏览时 R2 可能还没有缩略图：卡片先显示占位，按 2 路
+    // 并发回填（拉原图 → 480px WebP → PUT），成功后只替换一次 src。
+    const thumbBackfillQueue = [];
+    let thumbBackfillActive = 0;
+    const pumpThumbBackfill = () => {
+        while (thumbBackfillActive < 2 && thumbBackfillQueue.length) {
+            const task = thumbBackfillQueue.shift();
+            thumbBackfillActive += 1;
+            (async () => {
+                const response = await fetch(buildImageReadUrl(task.imageKey), { cache: 'force-cache' });
+                if (!response.ok) throw new Error(`原图读取失败：HTTP ${response.status}`);
+                const blob = await response.blob();
+                const thumb = await createImageThumbnailBlob(blob);
+                await uploadImageThumbnail(task.imageKey, task.token, thumb);
+                return buildImageThumbUrl(task.imageKey);
+            })().then(task.resolve, task.reject).finally(() => {
+                thumbBackfillActive -= 1;
+                pumpThumbBackfill();
+            });
+        }
+    };
+    window.RPH_MAGIC_BACKFILL_THUMB = (imageKey, token = '') => new Promise((resolve, reject) => {
+        if (!imageKey) return reject(new Error('missing image key'));
+        thumbBackfillQueue.push({ imageKey, token, resolve, reject });
+        pumpThumbBackfill();
+    });
+
     window.RPH_MAGIC_FLUSH_IMAGES = async () => {
         await Promise.all([...imageStores.values()].map(async state => {
             await state.loadPromise;
@@ -675,6 +804,7 @@
         imageStores.delete(id);
         for (const [key, task] of imageSlotTasks) {
             if (task.characterId === id) {
+                revokeJobObjectUrl(task.job);
                 task.cards.clear();
                 imageSlotTasks.delete(key);
             }

@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const root = path.resolve(fileURLToPath(new URL('../page', import.meta.url)));
 const PREFIX = 'rp-sync/main';
 const FORMAT = 'rp-sync-paged-jsonl-v4';
 const PAGE_FORMAT = 'rp-sync-manifest-page-v1';
@@ -32,7 +32,6 @@ const encoder = new TextEncoder();
 const keys = {
     manifest: `${PREFIX}/manifest.json`,
     migration: `${PREFIX}/migration-v13.done`,
-    gc: `${PREFIX}/maintenance/gc-v1.json`,
     pack: checksum => `${PREFIX}/packs/${checksum}.bin`,
     page: (checksum, index) => `${PREFIX}/manifests/${checksum}/${String(index).padStart(4, '0')}.json`,
     bloom: checksum => `${PREFIX}/blooms/${checksum}.bin`,
@@ -280,10 +279,22 @@ function createBucket() {
             const accounting = charge();
             return settle(accounting, undefined);
         },
-        async list() {
+        async list({ prefix = '', cursor, limit } = {}) {
             const accounting = charge();
             assert.ok(listResult, 'budget fixture must precompute R2 list results');
-            return settle(accounting, listResult);
+            // 与 R2 一致：按 prefix 过滤并真正遵守 limit/cursor，否则 GC
+            // 的 64 条扫描批次会退化成一次处理全部 256 条。
+            const all = (listResult.objects || []).filter(object => String(object?.key || '').startsWith(prefix));
+            const start = Number(cursor) || 0;
+            const end = Number.isInteger(limit) && limit > 0 ? Math.min(all.length, start + limit) : all.length;
+            const objects = all.slice(start, end);
+            const truncated = end < all.length;
+            return settle(accounting, {
+                ...listResult,
+                objects,
+                truncated,
+                cursor: truncated ? String(end) : undefined
+            });
         }
     };
     return bucket;
@@ -328,14 +339,14 @@ async function invoke(bucket, request) {
     return { response, wallMs, ...accounting };
 }
 
-async function benchmark({ name, setup, status, minSubrequests = 1 }) {
+async function benchmark({ name, setup, status, minSubrequests = 1, maxSubrequestBudget = 50 }) {
     const bucket = createBucket();
     const execute = async record => {
         const request = setup(bucket);
         const result = await invoke(bucket, request);
         assert.equal(result.response.status, status, `${name} returned ${result.response.status}`);
         assert.ok(result.subrequests >= minSubrequests, `${name} skipped expected R2 work`);
-        assert.ok(result.subrequests <= 50, `${name} used ${result.subrequests} subrequests`);
+        assert.ok(result.subrequests <= maxSubrequestBudget, `${name} used ${result.subrequests} subrequests`);
         assert.ok(result.maxInflight <= 6, `${name} used ${result.maxInflight} concurrent R2 operations`);
         await result.response.body?.cancel();
         if (record) return result;
@@ -360,7 +371,8 @@ async function benchmark({ name, setup, status, minSubrequests = 1 }) {
 await benchmark({
     name: 'upload-pack (1MiB direct stream)',
     status: 204,
-    minSubrequests: 3,
+    // 稳态：会话与清单页命中 isolate 缓存，put-first 只付 1 次条件写。
+    minSubrequests: 1,
     setup(bucket) {
         bucket.reset();
         bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
@@ -385,10 +397,10 @@ await benchmark({
     name: 'upload-manifest-page (32 packs)',
     status: 200,
     // 首个样本付 Bloom get+hash（1），WARMUPS 后 Bloom 命中 isolate 缓存；
-    // 稳态 = 1 session get + 31 pack head + 1 page put + 1 session CAS put = 34。
-    // 32 包里 pack[0] 已被前面的 upload-pack 基准验证并记入 verifiedPackCache，
-    // 页提交复核只对缓存外的 31 包照常 head。
-    minSubrequests: 34,
+    // 会话/清单页同样命中缓存后不再重读。32 包里 pack[0] 已被前面的
+    // upload-pack 基准验证并记入 verifiedPackCache，页提交复核只对缓存外
+    // 的 31 包照常 head，再加 1 page put + 1 session CAS put = 33。
+    minSubrequests: 33,
     setup(bucket) {
         bucket.reset();
         bucket.seed(keys.session(fixture.snapshot.checksum), JSON.stringify(fixture.session));
@@ -420,9 +432,8 @@ await benchmark({
     name: 'pull-manifest-page (32 packs)',
     status: 200,
     // 清单页在 isolate 内按 (根校验码, 页码) 缓存：稳态样本不再重读页对象；
-    // 迁移标记与根清单也按 key/etag 缓存，首个样本后根清单读取同样省去，
-    // 稳态只剩页缓存未命中时的 1 次页读取（WARMUPS 后通常 0 次）。
-    minSubrequests: 1,
+    // 迁移标记与根清单也按 key/etag 缓存（1.5s TTL），稳态样本可能 0 次 R2。
+    minSubrequests: 0,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);
@@ -455,9 +466,11 @@ await benchmark({
 await benchmark({
     name: 'gc-step (256 listed packs)',
     status: 200,
-    // migration/manifest 按 key/etag 缓存后，稳态 = 1 list + 1 GC state 读 +
-    // 候选删除（孤儿 pack 每 256 个一次 delete = 1 批）+ 无候选时写游标 1 put。
+    // 扫描批固定 64 条；每条候选在删除前都要 head 复核 uploaded 时间。
+    // 稳态 = 根/迁移读取 + GC state 读 + 根 Bloom 读 + 1 list + 活动上传保护
+    // list + 最新根复核 + 64 次候选 head + 1 批 delete + 1 次 CAS 写。
     minSubrequests: 4,
+    maxSubrequestBudget: 80,
     setup(bucket) {
         bucket.reset();
         seedCommitted(bucket);

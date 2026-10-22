@@ -1,15 +1,28 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { marked } from 'marked';
 import createDOMPurify from 'dompurify';
 import { JSDOM } from 'jsdom';
 import * as fakeIdb from 'fake-indexeddb';
 const { IDBFactory, IDBKeyRange } = fakeIdb;
-const root = fileURLToPath(new URL('..', import.meta.url));
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
+const root = path.join(projectRoot, 'page');
 const upstream = process.env.RPHUB_UPSTREAM_DIR;
-const fixture = path.join(root, '.sync-tests/fixtures/author');
+const fixture = path.join(projectRoot, '.sync-tests/fixtures/author');
+if (!upstream) {
+    // 样本清单是离线测试可信度的一部分：字节数或 SHA-256 任一漂移都说明
+    // fixture 被意外编辑，而不是作者上游变化。
+    const manifest = JSON.parse(await fs.readFile(path.join(fixture, 'manifest.json'), 'utf8'));
+    for (const entry of manifest.files || []) {
+        const bytes = await fs.readFile(path.join(fixture, entry.file));
+        assert.equal(bytes.byteLength, entry.bytes, `fixture ${entry.file} byte length drifted`);
+        assert.equal(createHash('sha256').update(bytes).digest('hex'), entry.sha256,
+            `fixture ${entry.file} SHA-256 drifted`);
+    }
+}
 const read = name => fs.readFile(path.join(root, name), 'utf8');
 const adapterSource = await read('adapter/rp-hub.js');
 const config = JSON.parse(adapterSource.match(/^\/\* RPHUB_ADAPTER_CONFIG\s*([\s\S]*?)\*\//)[1]);
@@ -50,12 +63,18 @@ const requests = [];
 w.fetch = async (url, options = {}) => {
     requests.push({ url: String(url), options });
     const parsed = new URL(String(url), w.location.href);
-    if (parsed.pathname === '/api/rp-image') return new Response(new Uint8Array([1]), { status: 200 });
+    if (parsed.pathname === '/api/rp-image') return new Response(new Uint8Array([1]), {
+        status: 200,
+        headers: {
+            'content-type': 'image/png',
+            'x-rp-image-key': encodeURIComponent(`rp-images/characters/Offline/${'a'.repeat(64)}`)
+        }
+    });
     if (parsed.pathname === '/api/rp-image-models') return new Response(JSON.stringify({ data: [{ id: 'offline-model' }] }), { headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ data: [], status: 'offline', quota: 0 }), { headers: { 'content-type': 'application/json' } });
 };
 try {
-    w.eval(await read('.sync-tests/node_modules/vue/dist/vue.global.prod.js'));
+    w.eval(await fs.readFile(path.join(projectRoot, '.sync-tests/node_modules/vue/dist/vue.global.prod.js'), 'utf8'));
     const createApp = w.Vue.createApp;
     let authorProxy;
     w.Vue.createApp = (options, ...args) => {
@@ -89,6 +108,9 @@ try {
         await Promise.race([readyPromise, new Promise((_, reject) => { mountTimer = setTimeout(() => reject(new Error('author mount timeout')), 10000); })]);
     } finally { clearTimeout(mountTimer); }
     assert.equal(w.RPHubExternal.capabilities().flush, true);
+    const readyCapabilities = w.RPHubExternal.capabilities();
+    assert.equal(readyCapabilities.missing.length, 0, 'ready adapter reports no missing markers');
+    assert.equal(Array.from(Object.values(readyCapabilities.saveMarkers)).every(Boolean), true);
     const app = authorProxy;
     assert.equal(app.settings.temperature, 0.61, 'startup retains saved temperature');
     assert.equal(app.settings.stream, false, 'startup retains saved stream selection');
@@ -120,6 +142,10 @@ try {
     container.appendChild(row);
     for (let i = 0; i < 100 && card.dataset.imageJobState !== 'done'; i++) await new Promise(resolve => setImmediate(resolve));
     assert.equal(card.dataset.imageJobState, 'done', 'external adapter hydrates author image card');
+    const cardImage = card.querySelector('img');
+    assert.equal(cardImage.getAttribute('loading'), 'lazy');
+    assert.equal(cardImage.getAttribute('decoding'), 'async');
+    assert.ok(cardImage.dataset.rphDeferredSrc, 'card image waits for the intersection observer before loading');
     assert.equal(requests.filter(item => item.url.startsWith('/api/rp-image?') || item.url.startsWith('https://offline.invalid/api/rp-image?')).length, 1);
     assert.equal(requests.filter(item => item.url.startsWith('https://nai.sta1n.cn/api/jobs')).length, 0, 'no duplicate author generation');
     await w.RPH_MAGIC_FLUSH_IMAGES();
@@ -212,7 +238,9 @@ for (const missing of ['runtime', 'image-selectors']) {
         fw.eval(adapterSource);
         await assert.rejects(fw.RPHubExternal.flush(), /作者保存接口未就绪/);
         assert.equal(fw.RPHubExternal.context(fw.document.getElementById('app')), null);
-        assert.equal(fw.RPHubExternal.capabilities().flush, false);
+        const caps = fw.RPHubExternal.capabilities();
+        assert.equal(caps.flush, false);
+        assert.ok(caps.missing.length > 0, 'unavailable adapter must enumerate missing markers');
     } finally { fallback.window.close(); }
 }
 console.log('external-author-integration: unavailable author capabilities reject synchronization');

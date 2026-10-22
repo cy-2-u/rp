@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { IDBFactory } from 'fake-indexeddb';
 
-const source = await readFile(new URL('../magic-extension.js', import.meta.url), 'utf8');
+const source = await readFile(new URL('../page/magic-extension.js', import.meta.url), 'utf8');
 
 const hashText = value => {
     let hash = 2166136261;
@@ -60,7 +60,12 @@ function harness(
             assert.equal(options.method, 'POST');
             return new Promise((resolve, reject) => requests.push({
                 url, reject,
-                succeed: () => resolve({ ok: true, headers: new Headers({ 'x-rp-image-key': encodeURIComponent('rp-images/characters/Offline/' + 'a'.repeat(64)) }), body: { cancel: async () => {} } }),
+                succeed: () => resolve({
+                    ok: true,
+                    headers: new Headers({ 'x-rp-image-key': encodeURIComponent('rp-images/characters/Offline/' + 'a'.repeat(64)) }),
+                    body: { cancel: async () => {} },
+                    blob: async () => new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' })
+                }),
                 fail: () => resolve({ ok: false, status: 503, json: async () => ({ error: 'offline failure' }) })
             }));
         }
@@ -330,7 +335,7 @@ test('author-switch-off still shows previously saved images', async () => {
     const task = h.start({ autoImageGen: false });
     const job = await task.promise;
     assert.equal(job.status, 'done');
-    assert.equal(job.imageUrl, new URL(firstJob.imageUrl, 'https://offline.invalid').href);
+    assert.equal(new URL(job.imageUrl, 'https://offline.invalid').searchParams.get('key'), firstJob.imageKey);
     assert.equal(task.testCard.testClasses.has('magic-image-suppressed'), false);
     assert.equal(h.requests.length, 1);
 });
@@ -404,7 +409,7 @@ test('fixed-off replays a previously saved record without generating', async () 
     h.setFixed(false);
     h.evict();
     const replay = await h.start().promise;
-    assert.equal(replay.imageUrl, new URL(saved.imageUrl, 'https://offline.invalid').href);
+    assert.equal(new URL(replay.imageUrl, 'https://offline.invalid').searchParams.get('key'), saved.imageKey);
     assert.equal(h.requests.length, 1);
     assert.equal(h.state().records.length, 1);
 });

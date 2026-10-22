@@ -758,11 +758,11 @@ function createAutoSaveScheduler(options = {}) {
         maxSnapshotBytes: 1024 * 1024 * 1024,
         // One request still carries exactly one 1 MiB pack (the Worker forwards
         // the request stream directly into R2 without copying or scanning it);
-        // four packs may be in flight at once to overlap network round trips.
-        uploadBatchConcurrency: 4,
+        // six packs may be in flight at once to use the full outbound budget.
+        uploadBatchConcurrency: 6,
         uploadBatchMaxPacks: 1,
         uploadBatchMaxBytes: 1024 * 1024,
-        downloadPackConcurrency: 4,
+        downloadPackConcurrency: 6,
         requestTimeoutMs: 60_000,
         packTransferTimeoutMs: 120_000,
         commitTimeoutMs: 120_000,
@@ -1055,6 +1055,10 @@ function createAutoSaveScheduler(options = {}) {
             && key === 'rp_hub_presets';
     }
 
+    function compareCodeUnits(a, b) {
+        return a < b ? -1 : a > b ? 1 : 0;
+    }
+
     function readLocalStorageSnapshot() {
         const entries = [];
         for (let index = 0; index < localStorage.length; index += 1) {
@@ -1065,7 +1069,7 @@ function createAutoSaveScheduler(options = {}) {
                 value: localStorage.getItem(key)
             });
         }
-        entries.sort((a, b) => a.key.localeCompare(b.key));
+        entries.sort((a, b) => compareCodeUnits(a.key, b.key));
         return entries;
     }
 
@@ -1094,7 +1098,7 @@ function createAutoSaveScheduler(options = {}) {
         if (type === 'number' || type === 'boolean' || type === 'bigint') return 24;
         if (value instanceof Date) return 24;
         if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value.byteLength + 24;
-        if (depth >= 3) return 512;
+        if (depth >= 8) return 512;
         let bytes = 64;
         if (Array.isArray(value)) {
             for (const item of value) bytes += estimateRecordBytes(item, depth + 1);
@@ -1270,6 +1274,14 @@ function createAutoSaveScheduler(options = {}) {
     function serializeSnapshotObject(value) {
         const seen = new Set();
         const canonical = item => {
+            // Date 是作者数据里合法且常见的类型；JSON 本身没有日期，统一转
+            // ISO 字符串，保证同一时刻在不同浏览器得到相同 canonical 字节。
+            if (item instanceof Date) {
+                if (!Number.isFinite(item.getTime())) {
+                    throw new Error('数据包含无效日期，已停止同步以避免丢失。');
+                }
+                return item.toISOString();
+            }
             if (item === null || typeof item !== 'object') {
                 if (item === undefined || (typeof item === 'number' && !Number.isFinite(item))
                     || typeof item === 'bigint' || typeof item === 'function' || typeof item === 'symbol') {
@@ -1423,6 +1435,15 @@ function createAutoSaveScheduler(options = {}) {
         tx.objectStore(LOCAL_CACHE_STATE_STORE).clear();
         tx.objectStore(LOCAL_CACHE_PACK_STORE).clear();
         return waitForTransaction(tx, '本地同步索引清理失败。');
+    }
+
+    // 恢复失败时已下载并校验的包仍然有效：只清派生索引（entries/state），
+    // 保留 packs 供下一次恢复/上传复用，避免整库重新下载。
+    function cacheClearDerived(db) {
+        const tx = db.transaction([LOCAL_CACHE_ENTRY_STORE, LOCAL_CACHE_STATE_STORE], 'readwrite');
+        tx.objectStore(LOCAL_CACHE_ENTRY_STORE).clear();
+        tx.objectStore(LOCAL_CACHE_STATE_STORE).clear();
+        return waitForTransaction(tx, '本地同步派生索引清理失败。');
     }
 
     function stableHash(value) {
@@ -1588,7 +1609,7 @@ function createAutoSaveScheduler(options = {}) {
         const order = new Map((state.groups || []).map((group, index) => [group, index]));
         return packItems.slice().sort((a, b) => (
             (order.get(a.group) ?? 999999) - (order.get(b.group) ?? 999999)
-            || String(a.bucketKey).localeCompare(String(b.bucketKey))
+            || compareCodeUnits(String(a.bucketKey), String(b.bucketKey))
             || Number(a.part) - Number(b.part)
         ));
     }
@@ -2183,7 +2204,14 @@ function createAutoSaveScheduler(options = {}) {
         }
 
         async queueStoreRecord(storeState, record) {
-            storeState.incomingKeys.add(stableKeyToken(record.key));
+            const token = stableKeyToken(record.key);
+            // 校验路径也要发现重复键：真实恢复写入时后一条会覆盖前一条，
+            // 静默接受会让“校验通过”和服务端快照语义不一致。
+            if (storeState.incomingKeys.has(token)) {
+                throw new Error('服务器同步包含重复的对象键。');
+            }
+            storeState.incomingKeys.add(token);
+            if (this.validateOnly) return;
             storeState.batch.push(record);
             storeState.batchBytes += estimateRecordBytes(record.value);
             if (storeState.batch.length >= CONFIG.restoreBatchSize || storeState.batchBytes >= CONFIG.scanBatchBytes) {
@@ -2250,14 +2278,12 @@ function createAutoSaveScheduler(options = {}) {
         }
 
         async flushStore(storeState) {
-            if (storeState.batch.length === 0) return;
+            if (this.validateOnly || storeState.batch.length === 0) return;
             const batch = storeState.batch;
             storeState.batch = [];
             storeState.batchBytes = 0;
-            if (!this.validateOnly) {
-                await writeObjectStoreRecordBatch(this.currentDatabase.db, storeState.definition, batch);
-                await this.yieldIfNeeded();
-            }
+            await writeObjectStoreRecordBatch(this.currentDatabase.db, storeState.definition, batch);
+            await this.yieldIfNeeded();
         }
 
         async finishStore(line) {
@@ -2626,7 +2652,7 @@ function createAutoSaveScheduler(options = {}) {
             await window.RPH_SYNC_TRACKER.acknowledge(dirtyState.watermark);
         } catch (error) {
             restorer.abort();
-            await cacheClear(cacheDb);
+            await cacheClearDerived(cacheDb);
             throw error;
         } finally {
             cacheDb.close();
@@ -2881,6 +2907,9 @@ function createAutoSaveScheduler(options = {}) {
         // 一次 IndexedDB，大库恢复续传时反复付开库开销；分片齐全的常见
         // 续传路径则一次都不用开。
         let cacheDb = null;
+        // 本次上传中服务端已存在、因而没有重新写入的包。finalize 只对
+        // 这些包做存在性复核，避免 GC 在会话保护建立前误删旧对象。
+        const reusedPacks = [];
         try {
             for (let pageIndex = Number(begin.nextPage || 0); pageIndex < snapshot.pageCount; pageIndex += 1) {
                 const packs = snapshot.packManifest.slice(
@@ -2890,8 +2919,10 @@ function createAutoSaveScheduler(options = {}) {
                 let pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
                     timeoutMs: CONFIG.commitTimeoutMs
                 });
-                if (Array.isArray(pageResult.missingPacks) && pageResult.missingPacks.length) {
-                    const missing = new Set(pageResult.missingPacks);
+                const missing = new Set(
+                    Array.isArray(pageResult.missingPacks) ? pageResult.missingPacks : []
+                );
+                if (missing.size) {
                     const pageStart = progress.uploadStart + Math.round(
                         (pageIndex / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
                     );
@@ -2913,13 +2944,16 @@ function createAutoSaveScheduler(options = {}) {
                     });
                     if (pageResult.missingPacks?.length) throw new Error('服务器仍缺少刚上传的同步分片。');
                 }
+                for (const pack of packs) {
+                    if (!missing.has(pack.checksum)) reusedPacks.push(pack.checksum);
+                }
                 const ratio = snapshot.pageCount ? (pageIndex + 1) / snapshot.pageCount : 1;
                 updateProgress(progress.uploadStart + Math.round(ratio * (progress.commit - progress.uploadStart)), '正在分页校验…');
             }
         } finally {
             cacheDb?.close();
         }
-        const finalized = await postSync({ action: 'finalize-upload', uploadId }, {
+        const finalized = await postSync({ action: 'finalize-upload', uploadId, reusedPacks }, {
             retryCount: 1,
             timeoutMs: CONFIG.commitTimeoutMs
         });

@@ -16,8 +16,11 @@ const tempFile = path.join(root, `page.zip.${process.pid}.tmp`);
 const FILES = [
   ['_worker.js', '_worker.js'],
   ['magic-extension.js', 'magic-extension.js'],
+  ['adapter/rp-hub.js', 'adapter/rp-hub.js'],
   ['DB/bootstrap.js', 'DB/bootstrap.js'],
   ['DB/dirty-tracker.js', 'DB/dirty-tracker.js'],
+  ['_routes.json', '_routes.json'],
+  ['_headers', '_headers'],
 ];
 
 let failed = 0;
@@ -26,15 +29,7 @@ function ok(cond, name, extra) {
   else { failed++; console.log('FAIL', name, extra || ''); }
 }
 
-// 1) page/ 与根目录正本逐字节核对
-for (const [src] of FILES) {
-  const canonical = src === '_worker.js' ? '_worker.js' : src;
-  const a = fs.readFileSync(path.join(root, canonical));
-  const b = fs.readFileSync(path.join(pageDir, src));
-  ok(Buffer.compare(a, b) === 0, `page/${src} 与根目录正本一致`);
-}
-
-// 2) 构建条目（DEFLATE，正斜杠，归档根级）
+// 1) 构建条目（DEFLATE，正斜杠，归档根级）
 const encoder = new TextEncoder();
 const localParts = [];
 const centralParts = [];
@@ -94,7 +89,7 @@ eocd.writeUInt32LE(centralSize, 12);
 eocd.writeUInt32LE(centralStart, 16);
 fs.writeFileSync(tempFile, Buffer.concat([...localParts, ...centralBufs, eocd]));
 
-// 3) 回读校验临时归档，失败时不碰现有 page.zip
+// 2) 回读校验临时归档，失败时不碰现有 page.zip
 const zip = fs.readFileSync(tempFile);
 const centralEntries = [];
 for (let i = 0; i < zip.length - 4; i++) {
@@ -109,9 +104,9 @@ for (let i = 0; i < zip.length - 4; i++) {
     });
   }
 }
-ok(centralEntries.length === FILES.length, 'zip 条目数 = 4', String(centralEntries.length));
+ok(centralEntries.length === FILES.length, `zip 条目数 = ${FILES.length}`, String(centralEntries.length));
 const names = centralEntries.map(e => e.name).sort();
-ok(JSON.stringify(names) === JSON.stringify(['DB/bootstrap.js', 'DB/dirty-tracker.js', '_worker.js', 'magic-extension.js']),
+ok(JSON.stringify(names) === JSON.stringify(['DB/bootstrap.js', 'DB/dirty-tracker.js', '_headers', '_routes.json', '_worker.js', 'adapter/rp-hub.js', 'magic-extension.js']),
   '条目名全部为正斜杠且在归档根级', JSON.stringify(names));
 for (const e of centralEntries) {
   const src = FILES.find(f => f[1] === e.name)[0];

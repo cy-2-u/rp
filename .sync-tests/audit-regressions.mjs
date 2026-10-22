@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(new URL('../DB/bootstrap.js', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../page/DB/bootstrap.js', import.meta.url), 'utf8');
 const start = source.indexOf('    async function prepareLocalSnapshot(');
 const end = source.indexOf('    async function runGcMaintenance(', start);
 assert.ok(start >= 0 && end > start, 'prepareLocalSnapshot source boundaries');
@@ -47,7 +47,6 @@ for (const stage of ['dirty', 'state']) {
         ...positions('await deleteObjectStoreKeys(cacheDb, LOCAL_CACHE_ENTRY_STORE')
     ];
     assert.equal(mutations.length, flushes.length, 'expected one flush per durable mutation site');
-    assert.equal(flushes.length, mutations.length, 'expected one flush per durable mutation site');
     for (const pos of mutations) {
         assert.ok(flushes.some(flush => flush < pos),
             'every durable cache mutation must be preceded by a pendingBuckets flush');
@@ -96,7 +95,7 @@ for (const stage of ['dirty', 'state']) {
     };
     const context = vm.createContext({
         CONFIG: { commitTimeoutMs: 1 },
-        SNAPSHOT_SCHEMA_VERSION: 12,
+        SNAPSHOT_SCHEMA_VERSION: 13,
         postSync: async payload => {
             calls.push(payload.action);
             if (payload.action === 'prepare-upload') return { resetRequired: true, remote: null };
@@ -113,10 +112,6 @@ for (const stage of ['dirty', 'state']) {
         'remote migration must wait for successful local snapshot preparation');
     console.log('PASS local snapshot failure preserves remote migration state');
 }
-
-// 跨文件协议常量互为副本（纯静态文件没有构建注入，bootstrap 与
-// dirty-tracker 头部各自持有一份字面量）。这里逐字比较两侧声明，
-// 任一侧单方面改名立即在此失败，而不是等到运行时静默失效。
 
 // Restore batches must flush on estimated bytes even when the record count is
 // below the ordinary batch count, bounding transient IndexedDB write payloads.
@@ -146,7 +141,7 @@ for (const stage of ['dirty', 'state']) {
     });
     vm.runInContext(restorerSource, context);
     const Restorer = context.__Restorer;
-    const restorer = new Restorer(2, { validateOnly: true });
+    const restorer = new Restorer(2, {});
     await restorer.consume({
         type: 'database', name: 'RPHubDB',
         stores: [{ name: 'store', keyPath: null, autoIncrement: false }]
@@ -272,7 +267,7 @@ for (const stage of ['dirty', 'state']) {
 }
 
 {
-    const trackerSource = fs.readFileSync(new URL('../DB/dirty-tracker.js', import.meta.url), 'utf8');
+    const trackerSource = fs.readFileSync(new URL('../page/DB/dirty-tracker.js', import.meta.url), 'utf8');
     const sharedLiterals = [
         '__rp_sync_journal_v2',
         'rp_sync_intent_v2:',
@@ -309,7 +304,7 @@ for (const stage of ['dirty', 'state']) {
 // 任一侧单方面增删字段或调整顺序，两端校验和立即失配，服务器会以
 // “校验失败，已停止读写以保护数据”拒绝服务。
 {
-    const workerSource = fs.readFileSync(new URL('../_worker.js', import.meta.url), 'utf8');
+    const workerSource = fs.readFileSync(new URL('../page/_worker.js', import.meta.url), 'utf8');
     const declares = (text, literal) => text.includes(`'${literal}'`) || text.includes(`"${literal}"`);
     for (const literal of ['rp-sync-paged-jsonl-v4', 'rp-sync-manifest-page-v1', 'rp_hub_sync_password_v1']) {
         assert.ok(declares(source, literal), `bootstrap.js must declare ${literal}`);

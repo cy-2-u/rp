@@ -6,12 +6,12 @@ import { test } from 'node:test';
 
 const bundle = json => '/* RPHUB_ADAPTER_CONFIG\n' + json + '\n*/\nwindow.RPHubExternal = external;';
 // All fetches and R2 operations are local mocks; never contact an upstream.
-const source = await readFile(new URL('../_worker.js', import.meta.url), 'utf8');
+const source = await readFile(new URL('../page/_worker.js', import.meta.url), 'utf8');
 function load(overrides = {}) {
     const timers = new Map();
     let nextTimer = 0;
     const context = vm.createContext({
-        URL, Headers, Request, Response, ReadableStream, Uint8Array, ArrayBuffer,
+        URL, Headers, Request, Response, ReadableStream, TransformStream, Uint8Array, ArrayBuffer,
         TextEncoder, TextDecoder, AbortController, DOMException, crypto: webcrypto,
         atob, AbortSignal,
         fetch: () => { throw new Error('Unexpected network access'); },
@@ -27,10 +27,18 @@ function bucket() {
     const writes = [], deletes = [], reads = [];
     return {
         writes, deletes, reads,
-        async get(k) { reads.push(k); return { body: new Uint8Array([1]), size: 1 }; },
-        async head(k) { reads.push(k); return { key: k, size: 1 }; },
+        async get(k) { reads.push(k); return { body: new Uint8Array([1]), size: 1, httpMetadata: { contentType: 'image/png' } }; },
+        async head(k) {
+            reads.push(k);
+            return k.includes('/_deleted/') ? null : { key: k, size: 1, httpMetadata: { contentType: 'image/png' } };
+        },
         async list({ prefix }) { return { objects: key.startsWith(prefix) ? [{ key, size: 1 }] : [], truncated: false }; },
-        async put(...args) { writes.push(args); },
+        async put(k, value, options) {
+            const bytes = value instanceof Uint8Array
+                ? value
+                : new Uint8Array(await new Response(value).arrayBuffer());
+            writes.push([k, bytes, options]);
+        },
         async delete(keys) { deletes.push(...keys); }
     };
 }
@@ -94,15 +102,15 @@ for (const length of [null, '1']) {
         assert.ok(stream.pulled <= 3, `read ${stream.pulled} chunks`);
         assert.equal(stream.cancelled, true);
     });
-    test(`image stops at 64 MiB with content-length ${length}`, async () => {
-        const stream = streamFixture(64);
+    test(`image stops at 24 MiB with content-length ${length}`, async () => {
+        const stream = streamFixture(24);
         const headers = { 'content-type': 'image/png' };
         if (length !== null) headers['content-length'] = length;
         const { context, timers } = load({ fetch: async () => new Response(stream.body, { headers }) });
         const store = bucket(); store.get = async () => null;
         const result = await context.handleImageRender(new Request('https://offline.invalid/api/rp-image?token=fake&tag=test', { method: 'POST' }), { RP_SYNC_R2: store });
         assert.equal(result.status, 413);
-        assert.ok(stream.pulled <= 65, `read ${stream.pulled} chunks`);
+        assert.ok(stream.pulled <= 25, `read ${stream.pulled} chunks`);
         assert.equal(stream.cancelled, true);
         assert.equal(store.writes.length, 0);
         assert.equal(timers.size, 0);
@@ -171,7 +179,17 @@ test('generated image key is returned and its GET replay reads the same R2 objec
             const bytes = objects.get(objectKey);
             return bytes ? { body: bytes, size: bytes.byteLength, httpMetadata: { contentType: 'image/png' } } : null;
         },
-        async put(objectKey, bytes) { objects.set(objectKey, new Uint8Array(bytes)); }
+        async head(objectKey) {
+            reads.push(objectKey);
+            if (objectKey.includes('/_deleted/')) return null;
+            const bytes = objects.get(objectKey);
+            return bytes ? { key: objectKey, size: bytes.byteLength, httpMetadata: { contentType: 'image/png' } } : null;
+        },
+        async put(objectKey, value) {
+            objects.set(objectKey, value instanceof Uint8Array
+                ? value
+                : new Uint8Array(await new Response(value).arrayBuffer()));
+        }
     };
     const env = { RP_SYNC_R2: store };
     const bodyOf = async response => Buffer.from(await response.arrayBuffer()).toString();
@@ -193,21 +211,22 @@ test('generated image key is returned and its GET replay reads the same R2 objec
     assert.deepEqual(reads.slice(-2), [`rp-images/_deleted/A..B/${key.split('/').pop()}.json`, key]);
 });
 
-test('image accepts exactly 64 MiB, stores once and clears deadline', async () => {
-    const { context, timers } = load({ fetch: async () => new Response(new Uint8Array(64 * 1024 * 1024), { headers: { 'content-type': 'image/png' } }) });
+test('image accepts exactly 24 MiB, stores once and clears deadline', async () => {
+    const size = 24 * 1024 * 1024;
+    const { context, timers } = load({ fetch: async () => new Response(new Uint8Array(size), { headers: { 'content-type': 'image/png' } }) });
     const store = bucket(); store.get = async () => null;
     const result = await context.handleImageRender(new Request('https://offline.invalid/api/rp-image?token=fake&tag=test', { method: 'POST' }), { RP_SYNC_R2: store });
     assert.equal(result.status, 200);
     assert.equal(store.writes.length, 1);
-    assert.equal(store.writes[0][1].byteLength, 64 * 1024 * 1024);
+    assert.equal(store.writes[0][1].byteLength, size);
     assert.equal(timers.size, 0);
 });
 for (const scenario of [
     { status: 503, type: 'image/png', expected: 503 },
     { status: 200, type: 'text/plain', expected: 502 },
-    { status: 200, type: 'image/png', length: String(64 * 1024 * 1024 + 1), expected: 413 }
+    { status: 200, type: 'image/png', length: String(24 * 1024 * 1024 + 1), expected: 413 }
 ]) {
-    test(`upstream rejection ${scenario.expected} cancels unread body and clears deadline`, async () => {
+    test(`upstream rejection ${scenario.expected} cancels the body and clears deadline`, async () => {
         const stream = streamFixture(64);
         const headers = { 'content-type': scenario.type };
         if (scenario.length) headers['content-length'] = scenario.length;
@@ -215,7 +234,9 @@ for (const scenario of [
         const store = bucket(); store.get = async () => null;
         const result = await context.handleImageRender(new Request('https://offline.invalid/api/rp-image?token=fake&tag=test', { method: 'POST' }), { RP_SYNC_R2: store });
         assert.equal(result.status, scenario.expected);
-        assert.equal(stream.pulled, 0);
+        // 非 200 / 非图片 / 声明超限都在读取正文前拒绝；声明偏小时才由
+        // 流式计数在读到上限时中断（不信任 content-length）。
+        assert.equal(stream.pulled, 0, `read ${stream.pulled} chunks`);
         assert.equal(stream.cancelled, true);
         assert.equal(timers.size, 0);
         assert.equal(store.writes.length, 0);
@@ -308,6 +329,17 @@ test('ynai endpoints follow the cloud adapter config', async () => {
     const res = await context.handleImageModels(new Request('https://offline.invalid/api/rp-image-models', { headers: { 'x-rp-image-token': YNAI_TOKEN } }), env);
     assert.deepEqual(await res.json(), { ok: true, data: [{ id: 'm1' }] });
     assert.equal(captured.url, 'https://relay.example/v9/models', '云端 adapter 覆盖中转地址与模型路径');
+});
+test('ynai endpoints are sourced only from the adapter manifest', async () => {
+    const adapterSource = await readFile(new URL('../page/adapter/rp-hub.js', import.meta.url), 'utf8');
+    const config = JSON.parse(adapterSource.match(/^\/\* RPHUB_ADAPTER_CONFIG\s*([\s\S]*?)\*\//)[1]);
+    assert.deepEqual(config.image.ynai, {
+        base: 'https://nai.rinko.ai',
+        modelsPath: '/v1/models',
+        generatePath: '/v1/images/generations',
+        defaultModel: 'nai-diffusion-4-5-full'
+    });
+    assert.doesNotMatch(source, /nai\.rinko\.ai/, 'worker must not hardcode the relay host');
 });
 test('ynai keys route generation to the relay with the OpenAI images shape', async () => {
     let captured;
@@ -480,7 +512,11 @@ test('key-switching lifecycle: sta1n → ynai → sta1n keeps every era image di
     const store = {
         writes: [],
         async get(k) { const v = objects.get(k); return v ? { body: v, size: v.byteLength, httpMetadata: { contentType: 'image/png' } } : null; },
-        async put(k, v) { objects.set(k, v); this.writes.push([k, v]); },
+        async put(k, v) {
+            const bytes = v instanceof Uint8Array ? v : new Uint8Array(await new Response(v).arrayBuffer());
+            objects.set(k, bytes);
+            this.writes.push([k, bytes]);
+        },
         async head() { return null; },
         async list() { return { objects: [], truncated: false }; },
         async delete() { }
@@ -654,18 +690,21 @@ test('model list response without content-length is bounded and cancelled', asyn
     assert.equal(stream.cancelled, true, 'oversized model list response is cancelled');
     assert.ok(stream.pulled <= 1, `read ${stream.pulled} chunks`);
 });
-test('adapter load succeeds against the direct GitHub source only', async () => {
+test('adapter load reads the bundled ASSETS source without external hosts', async () => {
     const valid = JSON.stringify({ schema: 2, id: 'rp-hub' });
     const contacted = [];
     const { context } = load({ fetch: async url => {
-        const u = String(url);
-        contacted.push(u);
-        if (u.startsWith('https://raw.githubusercontent.com')) return new Response(bundle(valid), { headers: { 'content-type': 'application/json' } });
-        return new Response('mirror host must not be contacted', { status: 200 });
+        contacted.push(`fetch:${String(url)}`);
+        return new Response('external host must not be contacted', { status: 500 });
     } });
-    const adapter = await context.loadAdapter({});
+    const adapter = await context.loadAdapter({
+        ASSETS: { fetch: async request => {
+            contacted.push(`assets:${String(request.url)}`);
+            return new Response(bundle(valid), { headers: { 'content-type': 'application/json' } });
+        } },
+    });
     assert.equal(adapter.id, 'rp-hub');
-    assert.equal(contacted.length, 1, '只访问 raw.githubusercontent.com，不访问任何镜像域名');
+    assert.deepEqual(contacted, ['assets:https://assets.local/adapter/rp-hub.js']);
 });
 test('adapter metadata is normalized to supported fields', () => {
     const { context } = load();

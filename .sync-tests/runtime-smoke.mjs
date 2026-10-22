@@ -5,14 +5,15 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const projectRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const root = path.join(projectRoot, 'page');
 const read = relative => fs.readFile(path.join(root, relative), 'utf8');
 const defaultAdapterUrl = pathToFileURL(path.join(root, 'adapter', 'rp-hub.js')).href;
 const configuredAdapterUrl = process.env.RPHUB_ADAPTER_URL?.trim() || defaultAdapterUrl;
 const upstreamRoot = process.env.RPHUB_UPSTREAM_DIR?.trim()
-    || [path.join(path.dirname(root), 'RP-Hub-main')].find(candidate => existsSync(candidate));
+    || [path.join(projectRoot, 'RP-Hub-main')].find(candidate => existsSync(candidate));
 const upstreamFile = relative => upstreamRoot ? path.join(upstreamRoot, relative)
-    : path.join(root, '.sync-tests/fixtures/author', path.basename(relative));
+    : path.join(projectRoot, '.sync-tests/fixtures/author', path.basename(relative));
 
 const adapterMetadata = text => JSON.parse(text.match(/^\/\* RPHUB_ADAPTER_CONFIG\s*([\s\S]*?)\*\//)[1]);
 
@@ -63,7 +64,7 @@ async function testAdapterFromFileUrl() {
     const source = await read('_worker.js');
     const api = new Function(source.replace('export default {', 'const unusedWorker = {')
         + '; return { validateAdapter, parseAdapterSource, resolveAdapterUrl };')();
-    assert.equal(api.resolveAdapterUrl({}).href, 'https://raw.githubusercontent.com/cy-2-u/rp/main/adapter/rp-hub.js');
+    assert.equal(api.resolveAdapterUrl({}).href, 'https://assets.local/adapter/rp-hub.js');
     assert.equal(api.resolveAdapterUrl({ RPHUB_ADAPTER_URL: configuredAdapterUrl }).protocol, 'file:');
     const script = await fs.readFile(localAdapterPath(), 'utf8');
     const adapter = api.parseAdapterSource(script);
@@ -163,7 +164,7 @@ async function testAuthorScriptPassthrough() {
     const calls = [];
     const worker = await loadWorker(async (input, init) => {
         calls.push({ input: String(input), init });
-        assert.equal(new Headers(init.headers).has('if-none-match'), false);
+        assert.equal(new Headers(init.headers).get('if-none-match'), 'stale');
         return new Response(init.method === 'HEAD' ? null : author, { headers: { 'content-type': 'application/javascript' } });
     });
     for (const method of ['GET', 'HEAD', 'GET']) {
@@ -171,7 +172,7 @@ async function testAuthorScriptPassthrough() {
             method, headers: { 'if-none-match': 'stale' }
         }), {}, {});
         assert.equal(await response.text(), method === 'HEAD' ? '' : author);
-        assert.equal(response.headers.get('cache-control'), 'no-store');
+        assert.equal(response.headers.get('cache-control'), 'no-cache');
     }
     assert.equal(calls.length, 3);
     assert.ok(calls.every(call => call.input.endsWith('app.js?v=123')));
@@ -259,17 +260,9 @@ function makeR2BucketMock(objects, hooks = {}) {
             return { key };
         },
         delete: async keys => {
-            if (hooks.throwOnDelete) throw hooks.throwOnDelete;
             for (const key of keys) objects.delete(key);
         },
         list: async ({ prefix, cursor, limit = 1000 } = {}) => {
-            // throwOnList: number of list calls that succeed before the
-            // simulated degradation kicks in (the commit verification loop
-            // always performs the first list call).
-            if (typeof hooks.throwOnList === 'number') {
-                hooks.listCalls = (hooks.listCalls || 0) + 1;
-                if (hooks.listCalls > hooks.throwOnList) throw new Error('list degraded');
-            }
             const keys = [...objects.keys()].sort().filter(key => key.startsWith(prefix));
             const nextIndex = cursor ? keys.findIndex(key => key > cursor) : 0;
             const start = nextIndex < 0 ? keys.length : nextIndex;
@@ -442,10 +435,10 @@ async function testImageAdminInlineScriptSyntax() {
 async function testImageRenderApi() {
     const objects = new Map();
     const bucket = makeR2BucketMock(objects);
-    const counters = { upstream: 0, r2Get: 0, r2Put: 0 };
+    const counters = { upstream: 0, r2Get: 0, r2Head: 0, r2Put: 0 };
     const putKeys = [];
     const countedBucket = {
-        head: bucket.head,
+        head: async key => { counters.r2Head += 1; return bucket.head(key); },
         delete: bucket.delete,
         list: bucket.list,
         get: async key => { counters.r2Get += 1; return bucket.get(key); },
@@ -474,7 +467,7 @@ async function testImageRenderApi() {
 
     const plainMiss = await worker.fetch(new Request(targetUrl), env, {});
     assert.equal(plainMiss.status, 404, 'a read without generate must not fabricate data');
-    assert.equal(counters.r2Get, 2, 'a miss costs one original get plus one tombstone get');
+    assert.equal(counters.r2Get, 1, 'a miss costs one tombstone head plus one original get');
 
     const noToken = await worker.fetch(new Request(imageUrl({ character_name: 'Cat' }), { method: 'POST' }), env, {});
     assert.equal(noToken.status, 401);
@@ -493,7 +486,7 @@ async function testImageRenderApi() {
     counters.r2Get = 0;
     const cached = await worker.fetch(new Request(targetUrl), env, {});
     assert.equal(await cached.text(), 'png-bytes');
-    assert.equal(counters.r2Get, 2, 'a cache hit must read the tombstone first and then the original');
+    assert.equal(counters.r2Get, 1, 'a cache hit reads the tombstone via head and the original via get');
     assert.equal(counters.upstream, 1, 'cached reads must not call the generation service');
     const headHit = await worker.fetch(new Request(targetUrl, { method: 'HEAD' }), env, {});
     assert.equal(headHit.status, 200);
@@ -516,7 +509,7 @@ async function testImageRenderApi() {
     assert.equal(deletedRead.status, 200, 'a tombstoned image must render the placeholder');
     assert.match(deletedRead.headers.get('content-type') || '', /svg/);
     assert.match(await deletedRead.text(), /图片已清理/);
-    assert.equal(counters.r2Get, 2, 'tombstone and image lookups issue two gets (parallel hot path)');
+    assert.equal(counters.r2Get, 1, 'tombstone head and original get are issued in parallel');
     assert.equal(counters.upstream, 2, 'reads of deleted images must not regenerate them');
 
     const deletedGenerate = await worker.fetch(new Request(targetUrl, { method: 'POST' }), env, {});
@@ -562,7 +555,7 @@ async function testImageRenderApi() {
     const badMethod = await worker.fetch(new Request(targetUrl, { method: 'PUT' }), env, {});
     assert.equal(badMethod.status, 405);
     assert.equal(counters.r2Put, 2, 'failed generations must not write anything');
-    assert.equal(counters.upstream, 5, 'exactly the three failed generation attempts may call the upstream again');
+    assert.equal(counters.upstream, 5, 'exactly five upstream calls may occur (1 success + 1 reroll + 3 failures)');
 }
 
 // catch-all 代理：本地资源直出、作者未来新增页面自动回源、注入面最小化。

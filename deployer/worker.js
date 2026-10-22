@@ -131,6 +131,9 @@ const ASSETS = [
   { path: 'DB/bootstrap.js', ext: 'js', type: 'application/javascript' },
   { path: 'DB/dirty-tracker.js', ext: 'js', type: 'application/javascript' },
   { path: 'magic-extension.js', ext: 'js', type: 'application/javascript' },
+  { path: 'adapter/rp-hub.js', ext: 'js', type: 'application/javascript' },
+  { path: '_routes.json', ext: 'json', type: 'application/json' },
+  { path: '_headers', ext: 'txt', type: 'text/plain; charset=utf-8' },
 ];
 const WORKER_FILE = '_worker.js';
 const R2_NAME = 'rphub';
@@ -140,6 +143,9 @@ const API = 'https://api.cloudflare.com/client/v4';
 const RAW_BASE = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_REPO}/${REPO_BRANCH}/${REPO_DIR}/`;
 const FRONTEND_URL = 'https://cy-2-u.github.io/rp/';
 const REQUEST_MAX_BYTES = 4096;
+const CF_REQUEST_TIMEOUT_MS = 15 * 1000;
+const DEPLOY_POLL_DEADLINE_MS = 15 * 1000;
+const DEPLOY_POLL_INTERVAL_MS = 1500;
 
 function json(data, status, origin) {
   const headers = { 'Content-Type': 'application/json; charset=utf-8' };
@@ -211,7 +217,11 @@ async function cfApi(token, path, init) {
   init = init || {};
   let r;
   try {
-    r = await fetch(API + path, { ...init, headers: { Authorization: 'Bearer ' + token, ...(init.headers || {}) } });
+    r = await fetch(API + path, {
+      ...init,
+      headers: { Authorization: 'Bearer ' + token, ...(init.headers || {}) },
+      signal: AbortSignal.timeout(CF_REQUEST_TIMEOUT_MS),
+    });
   } catch (e) {
     return { ok: false, status: 0, errors: [{ message: '网络异常' }] };
   }
@@ -263,8 +273,8 @@ function isModProject(projectResult) {
 async function fetchDeployFiles() {
   try {
     const fetched = await Promise.all([
-      fetch(RAW_BASE + WORKER_FILE),
-      ...ASSETS.map(a => fetch(RAW_BASE + a.path)),
+      fetch(RAW_BASE + WORKER_FILE, { signal: AbortSignal.timeout(CF_REQUEST_TIMEOUT_MS) }),
+      ...ASSETS.map(a => fetch(RAW_BASE + a.path, { signal: AbortSignal.timeout(CF_REQUEST_TIMEOUT_MS) })),
     ]);
     const bad = fetched.find(r => !r.ok);
     if (bad) return { error: `拉取部署文件失败（HTTP ${bad.status}），请稍后再试。` };
@@ -349,8 +359,10 @@ async function uploadDeployment(token, accountId, projectName, workerBytes, asse
 }
 
 async function pollDeployment(token, accountId, projectName, depId) {
-  for (let i = 0; i < 6; i++) {
-    await new Promise(r => setTimeout(r, 1500));
+  const deadline = Date.now() + DEPLOY_POLL_DEADLINE_MS;
+  while (Date.now() < deadline) {
+    const wait = Math.min(DEPLOY_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
+    await new Promise(r => setTimeout(r, wait));
     const st = await cfApi(token, `/accounts/${accountId}/pages/projects/${projectName}/deployments/${depId}`);
     if (!st.ok || !st.result || !st.result.latest_stage) continue;
     const ls = st.result.latest_stage;

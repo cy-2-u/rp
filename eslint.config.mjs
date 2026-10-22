@@ -17,7 +17,7 @@ const webGlobals = {
     URL: 'readonly', URLSearchParams: 'readonly',
     TextEncoder: 'readonly', TextDecoder: 'readonly',
     fetch: 'readonly', Headers: 'readonly', Request: 'readonly', Response: 'readonly',
-    ReadableStream: 'readonly', WritableStream: 'readonly',
+    ReadableStream: 'readonly', WritableStream: 'readonly', TransformStream: 'readonly',
     FormData: 'readonly', File: 'readonly',
     crypto: 'readonly', console: 'readonly',
     setTimeout: 'readonly', clearTimeout: 'readonly',
@@ -39,6 +39,7 @@ const clientGlobals = {
     IDBCursor: 'readonly', IDBTransaction: 'readonly', IDBRequest: 'readonly',
     Storage: 'readonly',
     IntersectionObserver: 'readonly', MutationObserver: 'readonly',
+    Image: 'readonly', createImageBitmap: 'readonly',
     requestAnimationFrame: 'readonly', cancelAnimationFrame: 'readonly',
     confirm: 'readonly', alert: 'readonly'
 };
@@ -52,7 +53,7 @@ const nodeTestGlobals = {
     URL: 'readonly', URLSearchParams: 'readonly', Blob: 'readonly',
     TextEncoder: 'readonly', TextDecoder: 'readonly',
     Request: 'readonly', Response: 'readonly', Headers: 'readonly', FormData: 'readonly', File: 'readonly',
-    ReadableStream: 'readonly', WritableStream: 'readonly',
+    ReadableStream: 'readonly', WritableStream: 'readonly', TransformStream: 'readonly',
     Uint8Array: 'readonly', ArrayBuffer: 'readonly',
     crypto: 'readonly', atob: 'readonly', btoa: 'readonly',
     DOMException: 'readonly', structuredClone: 'readonly',
@@ -62,20 +63,20 @@ const nodeTestGlobals = {
 
 export default [
     {
-        ignores: ['node_modules/**', '.zcode/**', 'page/**', 'docs/**', '.sync-tests/fixtures/**', '**/*.json']
+        ignores: ['node_modules/**', '.zcode/**', 'docs/**', '.sync-tests/fixtures/**', '**/*.json']
     },
     {
-        files: ['_worker.js', 'deployer/worker.js'],
+        files: ['page/_worker.js', 'deployer/worker.js'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: workerGlobals },
         rules: gate
     },
     {
-        files: ['magic-extension.js', 'DB/**/*.js', 'adapter/**/*.js'],
+        files: ['page/magic-extension.js', 'page/DB/**/*.js', 'page/adapter/**/*.js'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'script', globals: clientGlobals },
         rules: gate
     },
     {
-        files: ['eslint.config.mjs', 'deployer/*.mjs', '.sync-tests/*.mjs'],
+        files: ['eslint.config.mjs', 'deployer/*.mjs', '.sync-tests/**/*.mjs'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: nodeTestGlobals },
         rules: gate
     }

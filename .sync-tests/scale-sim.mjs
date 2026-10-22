@@ -15,30 +15,22 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import vm from 'node:vm';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
+import {
+    createDocumentStub, createPrototypePatcher, createScriptRunner, idbBulkPut, idbGet,
+    installBrowserGlobals, loadFdbClasses, makeStorageClass, writeTransaction
+} from './lib/browser-env.mjs';
+import { assertRestoreBatching } from './lib/restore-assertions.mjs';
+import { loadWorker } from './lib/worker-loader.mjs';
 
-const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const root = path.resolve(fileURLToPath(new URL('../page', import.meta.url)));
 const read = relative => fs.readFile(path.join(root, relative), 'utf8');
 
-const loadFdbClass = async name => {
-    const mod = await import(`fake-indexeddb/lib/${name}`);
-    return mod.default ?? mod[name];
-};
-const FDBFactory = await loadFdbClass('FDBFactory');
-const FDBDatabase = await loadFdbClass('FDBDatabase');
-const FDBObjectStore = await loadFdbClass('FDBObjectStore');
-const FDBIndex = await loadFdbClass('FDBIndex');
-const FDBRequest = await loadFdbClass('FDBRequest');
-const FDBOpenDBRequest = await loadFdbClass('FDBOpenDBRequest');
-const FDBVersionChangeEvent = await loadFdbClass('FDBVersionChangeEvent');
-const FDBCursor = await loadFdbClass('FDBCursor');
-const FDBCursorWithValue = await loadFdbClass('FDBCursorWithValue');
-const FDBTransaction = await loadFdbClass('FDBTransaction');
-const FDBKeyRange = await loadFdbClass('FDBKeyRange');
+const fdb = await loadFdbClasses();
+const { FDBFactory, FDBDatabase, FDBObjectStore, FDBTransaction, FDBCursor } = fdb;
 
-const PATCHED_MEMBERS = [
+const { snapshot: snapshotPrototypes, restore: restorePrototypes } = createPrototypePatcher([
     [FDBFactory.prototype, 'open'],
     [FDBFactory.prototype, 'deleteDatabase'],
     [FDBObjectStore.prototype, 'put'],
@@ -51,18 +43,7 @@ const PATCHED_MEMBERS = [
     [FDBCursor.prototype, 'update'],
     [FDBCursor.prototype, 'delete'],
     [FDBTransaction.prototype, 'commit']
-];
-const snapshotPrototypes = () => PATCHED_MEMBERS.map(([proto, name]) => ({
-    proto,
-    name,
-    descriptor: Object.getOwnPropertyDescriptor(proto, name)
-}));
-const restorePrototypes = snapshot => {
-    for (const { proto, name, descriptor } of snapshot) {
-        if (descriptor) Object.defineProperty(proto, name, descriptor);
-        else delete proto[name];
-    }
-};
+]);
 const savedPrototypes = snapshotPrototypes();
 
 const MANIFEST_KEY = 'rp-sync/main/manifest.json';
@@ -213,179 +194,13 @@ function createAccountedBucket() {
     };
 }
 
-function makeStorageClass() {
-    return class Storage {
-        #map = new Map();
-        getItem(key) { key = String(key); return this.#map.has(key) ? this.#map.get(key) : null; }
-        setItem(key, value) { this.#map.set(String(key), String(value)); }
-        removeItem(key) { this.#map.delete(key); }
-        clear() { this.#map.clear(); }
-        key(index) { return [...this.#map.keys()][index] ?? null; }
-        get length() { return this.#map.size; }
-    };
-}
-
-function createDomElement(tag) {
-    const listeners = {};
-    const queries = new Map();
-    const element = {
-        tagName: tag,
-        children: [],
-        parentElement: null,
-        style: {},
-        dataset: {},
-        textContent: '',
-        innerHTML: '',
-        classList: {
-            set: new Set(),
-            add(...names) { names.forEach(name => this.set.add(name)); },
-            remove(...names) { names.forEach(name => this.set.delete(name)); },
-            toggle(name, force) {
-                const enable = force === undefined ? !this.set.has(name) : Boolean(force);
-                if (enable) this.set.add(name); else this.set.delete(name);
-            },
-            contains(name) { return this.set.has(name); }
-        },
-        appendChild(child) { element.children.push(child); child.parentElement = element; return child; },
-        addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
-        removeEventListener() { },
-        setAttribute() { },
-        getAttribute() { return null; },
-        remove() { },
-        focus() { },
-        select() { },
-        querySelector(selector) {
-            if (!queries.has(selector)) queries.set(selector, createDomElement(selector));
-            return queries.get(selector);
-        },
-        querySelectorAll() { return []; },
-        click() { for (const handler of listeners.click || []) handler({ preventDefault() { }, target: element }); }
-    };
-    return element;
-}
-
-function createDocumentStub() {
-    const body = createDomElement('body');
-    return {
-        readyState: 'complete',
-        body,
-        head: createDomElement('head'),
-        createElement: tag => createDomElement(tag),
-        getElementById: () => null,
-        addEventListener() { },
-        removeEventListener() { }
-    };
-}
-
-const setGlobal = (name, value) => {
-    Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-};
-
-function installBrowserGlobals({ storageClass, localStorage, factory, document, location, fetchShim, locks = null }) {
-    const globals = {
-        indexedDB: factory,
-        // dirty-tracker 把 open/deleteDatabase 补丁打在 IDBFactory.prototype
-        // 上（WebKit 会重建 indexedDB 实例，实例级补丁会静默丢失），测试
-        // 环境必须提供与 factory 实例同一原型的构造器才等价于浏览器。
-        IDBFactory: FDBFactory,
-        IDBKeyRange: FDBKeyRange,
-        IDBDatabase: FDBDatabase,
-        IDBObjectStore: FDBObjectStore,
-        IDBTransaction: FDBTransaction,
-        IDBIndex: FDBIndex,
-        IDBRequest: FDBRequest,
-        IDBOpenDBRequest: FDBOpenDBRequest,
-        IDBVersionChangeEvent: FDBVersionChangeEvent,
-        IDBCursor: FDBCursor,
-        IDBCursorWithValue: FDBCursorWithValue,
-        Storage: storageClass,
-        localStorage,
-        document,
-        location,
-        navigator: locks ? { locks } : {},
-        fetch: fetchShim,
-        confirm: () => true,
-        alert: () => { },
-        requestAnimationFrame: handler => setTimeout(handler, 0),
-        addEventListener() { },
-        removeEventListener() { },
-        window: globalThis
-    };
-    for (const [name, value] of Object.entries(globals)) setGlobal(name, value);
-    delete globalThis.__RPH_SYNC_DIRTY_TRACKING__;
-}
-
-async function runScripts(names) {
-    for (const name of names) {
-        vm.runInThisContext(await read(name), { filename: path.join(root, name) });
-    }
-}
-
-// ---------------------------------------------------------- idb helpers ----
-
-async function idbOpen(factory, dbName, version, stores) {
-    return new Promise((resolve, reject) => {
-        const request = version ? factory.open(dbName, version) : factory.open(dbName);
-        request.onupgradeneeded = () => {
-            const db = request.result;
-            for (const storeName of stores) {
-                if (!db.objectStoreNames.contains(storeName)) db.createObjectStore(storeName);
-            }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-    });
-}
-
-// Seeding bulk put: one connection, 500 records per transaction.
-async function idbBulkPut(factory, dbName, storeName, records) {
-    const db = await idbOpen(factory, dbName, 1, [storeName]);
-    try {
-        for (let start = 0; start < records.length; start += 500) {
-            const batch = records.slice(start, start + 500);
-            await new Promise((resolve, reject) => {
-                const tx = db.transaction([storeName], 'readwrite');
-                for (const [key, value] of batch) tx.objectStore(storeName).put(value, key);
-                tx.oncomplete = resolve;
-                tx.onerror = () => reject(tx.error);
-            });
-        }
-    } finally { db.close(); }
-}
-
-async function idbGet(factory, dbName, storeName, key) {
-    const db = await idbOpen(factory, dbName, undefined, [storeName]);
-    try {
-        const tx = db.transaction(storeName, 'readonly');
-        const request = tx.objectStore(storeName).get(key);
-        return await new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve(request.result);
-            tx.onerror = () => reject(tx.error);
-        });
-    } finally { db.close(); }
-}
-
-// Incremental-phase writes must go through this entry: after bootstrap.js
-// loads, factory.open is the dirty-tracker facade, so these writes land in
-// the change journal and get picked up by the next push.
-async function writeTransaction(name, store, action) {
-    const db = await idbOpen(globalThis.indexedDB, name, 1, [store]);
-    try {
-        await new Promise((resolve, reject) => {
-            const tx = db.transaction(store, 'readwrite');
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error);
-            action(tx.objectStore(store), tx);
-        });
-    } finally { db.close(); }
-}
+const runScripts = createScriptRunner({ root, read });
 
 // ------------------------------------------------------------- setup ------
 
 const bucket = createAccountedBucket();
 const env = { RP_SYNC_R2: bucket };
-const workerSource = await read('_worker.js');
-const worker = new Function('fetch', workerSource.replace('export default {', 'return {'))(globalThis.fetch);
+const worker = await loadWorker();
 
 const requests = [];
 let clientInflight = 0;
@@ -536,7 +351,7 @@ localStorage.setItem('unrelated', 'keep');
 
 const documentStub = createDocumentStub();
 const locationStub = { pathname: '/', replaced: null, assign() { }, replace() { } };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: Storage,
     localStorage,
     factory,
@@ -644,8 +459,8 @@ const phase1MaxSubrequests = Math.max(...phase1Slices.map(entry => entry.subrequ
 assert.ok(phase1MaxSubrequests <= LIMITS.subrequestsPerRequest,
     `subrequest budget exceeded: ${phase1MaxSubrequests}`);
 assert.ok(maxClientInflight <= LIMITS.outboundConnections, 'client concurrency must stay within 6 outbound connections');
-assert.equal(maxClientInflight, 4, 'the bounded engine must keep exactly four batches in flight');
-assert.ok(bucket.stats.maxInflightPutBytes <= 4 * 1024 * 1024 + 1024, 'R2 writes must stay within the 4-put concurrency bound');
+assert.equal(maxClientInflight, 6, 'the bounded engine must keep exactly six batches in flight');
+assert.ok(bucket.stats.maxInflightPutBytes <= 6 * 1024 * 1024 + 1024, 'R2 writes must stay within the 6-put concurrency bound');
 console.log(`  requests: ${phase1Requests} (~${(phase1Requests / LIMITS.requestsPerDay * 100).toFixed(3)}% of daily 100k), max wall ${Math.max(...phase1Slices.map(e=>e.wallMs)).toFixed(2)} ms, max subrequests ${phase1MaxSubrequests}`);
 console.log(`  R2 ops this phase: A=${phase1Slices.reduce((t, e) => t + e.classA, 0)}, B=${phase1Slices.reduce((t, e) => t + e.classB, 0)}`);
 console.log(`phase 1 (first ${SCALE_MB}MB upload): ok`);
@@ -867,7 +682,7 @@ const restoreFetch = async (input, init) => {
         if (counted) restoreMetrics.pullInflight -= 1;
     }
 };
-installBrowserGlobals({
+installBrowserGlobals(fdb, {
     storageClass: RestoreStorage,
     localStorage: restoreStorage,
     factory: restoreFactory,
@@ -901,22 +716,11 @@ await new Promise((resolve, reject) => {
     }, 250);
 });
 const restoreDurationMs = Date.now() - restoreStartedAt;
+assertRestoreBatching(restoreMetrics, restoreManifest, {
+    label: 'scale restore',
+    parsesKey: 'parses'
+});
 const stagingReads = restoreMetrics.stagingReads.filter(batch => batch.count > 0);
-const stagingWrites = restoreMetrics.stagingWrites.filter(batch => batch.count > 0);
-assert.equal(restoreMetrics.parses, restoreManifest.entryCount * 2,
-    'scale restore must parse each snapshot entry exactly twice');
-assert.equal(stagingReads.reduce((sum, batch) => sum + batch.count, 0), restoreManifest.packCount,
-    'scale restore must read each staged pack once');
-assert.equal(stagingReads.length, Math.ceil(restoreManifest.packCount / 4),
-    'scale restore staging reads must be batched by four');
-assert.equal(stagingWrites.length, Math.ceil(restoreManifest.packCount / 4),
-    'scale restore staging writes must be batched by four');
-assert.equal(restoreMetrics.cachePackWrites.length, Math.ceil(restoreManifest.packCount / 4),
-    'scale restore cache pack writes must be batched by four');
-assert.equal(restoreMetrics.pullRequests, restoreManifest.pageCount + restoreManifest.packCount,
-    'scale restore must request each manifest page and pack exactly once');
-assert.ok(restoreMetrics.maxPullInflight <= 4,
-    `scale restore pull concurrency must stay at four, observed ${restoreMetrics.maxPullInflight}`);
 assert.ok(restorePacks.length === restoreManifest.packCount);
 const restoredSettings = await idbGet(restoreFactory, 'RPHubDB', 'store', 'settings');
 const restoredTail = await idbGet(restoreFactory, 'RPHubDB', 'store', recordKey(RECORD_COUNT + 9));

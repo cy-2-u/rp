@@ -1,312 +1,16 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import {
+    BLOOM_BYTES, MANIFEST_KEY, MIGRATION_KEY, SCHEMA,
+    bloomHas, bloomKey, buildSnapshot, pageKey, packKey, sessionKey
+} from './lib/protocol.mjs';
+import { createR2Mock } from './lib/r2-bucket.mjs';
+import { loadWorker } from './lib/worker-loader.mjs';
+import {
+    begin, createBarrier, finishPages, initialize, makeApi, prepareSnapshot,
+    seedPack, submitPage, uploadBloom, uploadPack
+} from './lib/sync-api.mjs';
 
-const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const FORMAT = 'rp-sync-paged-jsonl-v4';
-const SCHEMA = 13;
-const PAGE_FORMAT = 'rp-sync-manifest-page-v1';
-const PAGE_PACKS = 32;
-const CHAIN_SEED = '0'.repeat(64);
-const BLOOM_BYTES = 32 * 1024;
-const PREFIX = 'rp-sync/main';
-const MANIFEST_KEY = `${PREFIX}/manifest.json`;
-const MIGRATION_KEY = `${PREFIX}/migration-v13.done`;
 const encoder = new TextEncoder();
-
-async function sha256Bytes(bytes) {
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    return Buffer.from(digest).toString('hex');
-}
-
-const sha256Text = text => sha256Bytes(encoder.encode(text));
-const packKey = checksum => `${PREFIX}/packs/${checksum}.bin`;
-const pageKey = (checksum, pageIndex) => `${PREFIX}/manifests/${checksum}/${String(pageIndex).padStart(4, '0')}.json`;
-const bloomKey = checksum => `${PREFIX}/blooms/${checksum}.bin`;
-const sessionKey = uploadId => `${PREFIX}/uploads/${uploadId}.json`;
-const tuple = pack => [pack.bucketKey, pack.group, pack.part, pack.checksum, pack.length, pack.entryCount];
-const pageSource = (pageIndex, previousPageHash, packs) => JSON.stringify([
-    PAGE_FORMAT, pageIndex, previousPageHash, packs.map(tuple)
-]);
-const rootSource = snapshot => JSON.stringify([
-    FORMAT, SCHEMA, snapshot.totalBytes, snapshot.packCount, snapshot.entryCount,
-    snapshot.pageCount, snapshot.pageRoot, snapshot.bloomChecksum
-]);
-
-function bloomIndexes(checksum) {
-    const bitCount = BLOOM_BYTES * 8;
-    return [0, 8, 16, 24].map(offset => parseInt(checksum.slice(offset, offset + 8), 16) % bitCount);
-}
-
-function bloomHas(bloom, checksum) {
-    return bloomIndexes(checksum).every(bit => (bloom[bit >>> 3] & (1 << (bit & 7))) !== 0);
-}
-
-function makeBloom(packs) {
-    const bloom = new Uint8Array(BLOOM_BYTES);
-    for (const pack of packs) {
-        for (const bit of bloomIndexes(pack.checksum)) bloom[bit >>> 3] |= 1 << (bit & 7);
-    }
-    return bloom;
-}
-
-async function buildSnapshot(count, { prefix = 'snapshot', mutatePacks, bloom } = {}) {
-    const packs = [];
-    for (let index = 0; index < count; index += 1) {
-        const bytes = encoder.encode(`${prefix}-${index}\n`);
-        packs.push({
-            bucketKey: `${prefix}-bucket`,
-            group: `${prefix}-group`,
-            part: index,
-            checksum: await sha256Bytes(bytes),
-            length: bytes.byteLength,
-            entryCount: 1,
-            bytes
-        });
-    }
-    if (mutatePacks) mutatePacks(packs);
-    let previousPageHash = CHAIN_SEED;
-    const pages = [];
-    const pageCount = Math.ceil(packs.length / PAGE_PACKS);
-    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-        const pagePacks = packs.slice(pageIndex * PAGE_PACKS, (pageIndex + 1) * PAGE_PACKS)
-            .map(({ bytes, ...pack }) => pack);
-        const pageHash = await sha256Text(pageSource(pageIndex, previousPageHash, pagePacks));
-        pages.push({ pageIndex, previousPageHash, pageHash, packs: pagePacks });
-        previousPageHash = pageHash;
-    }
-    const bloomBytes = bloom || makeBloom(packs);
-    const snapshot = {
-        snapshotFormat: FORMAT,
-        schemaVersion: SCHEMA,
-        totalBytes: packs.reduce((sum, pack) => sum + pack.length, 0),
-        packCount: packs.length,
-        entryCount: packs.reduce((sum, pack) => sum + pack.entryCount, 0),
-        pageCount,
-        pageRoot: previousPageHash,
-        bloomChecksum: await sha256Bytes(bloomBytes),
-        packs,
-        pages,
-        bloom: bloomBytes
-    };
-    snapshot.checksum = await sha256Text(rootSource(snapshot));
-    return snapshot;
-}
-
-function createBarrier(parties) {
-    let arrived = 0;
-    let release;
-    const promise = new Promise(resolve => { release = resolve; });
-    return async () => {
-        arrived += 1;
-        if (arrived >= parties) release();
-        await promise;
-    };
-}
-
-function createR2Mock() {
-    const objects = new Map();
-    const hooks = {};
-    // ETag 全局递增：isolate 级 manifest/迁移标记缓存按 etag 索引，真实 R2
-    // 的 etag 是内容摘要，不会因换 bucket 而重置；mock 若每个 bucket 从
-    // "etag-1" 重新计数，同一 isolate 内多个测试 bucket 会互相污染缓存。
-    let etagSequence = globalThis.__r2MockEtagCounter = (globalThis.__r2MockEtagCounter || 0);
-    const asBytes = async value => {
-        if (value instanceof Uint8Array) return new Uint8Array(value);
-        if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
-        return new Uint8Array(await new Response(value).arrayBuffer());
-    };
-    const metadata = object => object ? {
-        key: object.key,
-        etag: object.etag,
-        size: object.size,
-        uploaded: object.uploaded,
-        httpMetadata: object.httpMetadata,
-        customMetadata: object.customMetadata
-    } : null;
-    const bucket = {
-        objects,
-        hooks,
-        async head(key) {
-            await hooks.beforeHead?.(key);
-            return metadata(objects.get(key));
-        },
-        async get(key) {
-            await hooks.beforeGet?.(key);
-            const object = objects.get(key);
-            if (!object) return null;
-            return {
-                ...metadata(object),
-                body: new Uint8Array(object.bytes),
-                text: async () => Buffer.from(object.bytes).toString('utf8')
-            };
-        },
-        async put(key, value, options = {}) {
-            const bytes = await asBytes(value);
-            await hooks.beforePut?.({ key, bytes, options, bucket });
-            const current = objects.get(key);
-            const etag = current?.etag ?? null;
-            if (options.onlyIf?.etagMatches !== undefined && etag !== options.onlyIf.etagMatches) return null;
-            if (options.onlyIf?.etagDoesNotMatch === '*' && etag !== null) return null;
-            if (options.sha256) {
-                const expected = options.sha256 instanceof ArrayBuffer
-                    ? Buffer.from(options.sha256).toString('hex')
-                    : String(options.sha256).toLowerCase();
-                if (await sha256Bytes(bytes) !== expected) throw new Error('BadDigest: SHA-256 mismatch');
-            }
-            etagSequence = globalThis.__r2MockEtagCounter = globalThis.__r2MockEtagCounter + 1;
-            const nextEtag = `"etag-${etagSequence}"`;
-            objects.set(key, {
-                key,
-                bytes,
-                size: bytes.byteLength,
-                etag: nextEtag,
-                uploaded: hooks.uploadedAt ? new Date(hooks.uploadedAt) : new Date(),
-                httpMetadata: options.httpMetadata,
-                customMetadata: options.customMetadata
-            });
-            return { key, etag: nextEtag };
-        },
-        async delete(keys) {
-            await hooks.beforeDelete?.(keys);
-            const list = Array.isArray(keys) ? keys : [keys];
-            for (const key of list) objects.delete(key);
-        },
-        async list({ prefix = '', cursor, limit = 1000 } = {}) {
-            await hooks.beforeList?.({ prefix, cursor, limit });
-            const keys = [...objects.keys()].filter(key => key.startsWith(prefix)).sort();
-            const start = cursor ? keys.findIndex(key => key > cursor) : 0;
-            const normalizedStart = start < 0 ? keys.length : start;
-            const selected = keys.slice(normalizedStart, normalizedStart + limit);
-            const truncated = normalizedStart + limit < keys.length;
-            return {
-                objects: selected.map(key => metadata(objects.get(key))),
-                truncated,
-                cursor: truncated ? selected[selected.length - 1] : undefined
-            };
-        }
-    };
-    return bucket;
-}
-
-class FakeHTMLRewriter {
-    on() { return this; }
-    transform(response) { return response; }
-}
-
-async function loadWorker() {
-    const source = await fs.readFile(path.join(root, '_worker.js'), 'utf8');
-    return new Function('fetch', 'HTMLRewriter', source.replace('export default {', 'return {'))(
-        globalThis.fetch,
-        FakeHTMLRewriter
-    );
-}
-
-function makeApi(worker, bucket, password = '') {
-    const auth = password ? { 'x-rp-sync-password': password } : {};
-    return {
-        async post(payload) {
-            return worker.fetch(new Request('https://local.test/api/rp-sync', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json', ...auth },
-                body: JSON.stringify(payload)
-            }), { RP_SYNC_R2: bucket, ...(password ? { RP_SYNC_PASSWORD: password } : {}) }, {});
-        },
-        async json(payload) {
-            const response = await this.post(payload);
-            const body = await response.json().catch(() => ({}));
-            return { response, body };
-        },
-        async binary(action, params, bytes) {
-            const url = new URL('https://local.test/api/rp-sync');
-            url.searchParams.set('action', action);
-            for (const [name, value] of Object.entries(params)) url.searchParams.set(name, String(value));
-            return worker.fetch(new Request(url, {
-                method: 'POST',
-                headers: { 'content-type': 'application/octet-stream', ...auth },
-                body: bytes
-            }), { RP_SYNC_R2: bucket, ...(password ? { RP_SYNC_PASSWORD: password } : {}) }, {});
-        }
-    };
-}
-
-async function initialize(api) {
-    const { response } = await api.json({ action: 'initialize-storage', schemaVersion: SCHEMA });
-    assert.equal(response.status, 200);
-}
-
-async function begin(api, snapshot, baseVersion = 0, baseChecksum = '') {
-    return api.json({
-        action: 'begin-upload',
-        baseVersion,
-        baseChecksum,
-        checksum: snapshot.checksum,
-        bloomChecksum: snapshot.bloomChecksum,
-        snapshotFormat: FORMAT,
-        schemaVersion: SCHEMA,
-        totalBytes: snapshot.totalBytes,
-        packCount: snapshot.packCount,
-        entryCount: snapshot.entryCount,
-        pageCount: snapshot.pageCount,
-        pageRoot: snapshot.pageRoot
-    });
-}
-
-async function uploadBloom(api, snapshot) {
-    return api.binary('upload-bloom', { uploadId: snapshot.checksum }, snapshot.bloom);
-}
-
-async function uploadPack(api, uploadId, pack) {
-    return api.binary('upload-pack', {
-        uploadId,
-        checksum: pack.checksum,
-        length: pack.length,
-        entryCount: pack.entryCount
-    }, pack.bytes);
-}
-
-async function submitPage(api, snapshot, pageIndex) {
-    return api.json({
-        action: 'upload-manifest-page',
-        uploadId: snapshot.checksum,
-        pageIndex,
-        packs: snapshot.pages[pageIndex].packs
-    });
-}
-
-async function seedPack(bucket, pack, uploaded = new Date()) {
-    const result = await bucket.put(packKey(pack.checksum), pack.bytes, {
-        customMetadata: { entryCount: String(pack.entryCount) },
-        httpMetadata: { contentType: 'application/octet-stream' }
-    });
-    bucket.objects.get(packKey(pack.checksum)).uploaded = uploaded;
-    return result;
-}
-
-async function finishPages(api, snapshot) {
-    for (let pageIndex = 0; pageIndex < snapshot.pageCount; pageIndex += 1) {
-        let { response, body } = await submitPage(api, snapshot, pageIndex);
-        assert.equal(response.status, 200);
-        for (const checksum of body.missingPacks || []) {
-            const pack = snapshot.packs.find(item => item.checksum === checksum);
-            assert.ok(pack);
-            assert.equal((await uploadPack(api, snapshot.checksum, pack)).status, 204);
-        }
-        ({ response, body } = await submitPage(api, snapshot, pageIndex));
-        assert.equal(response.status, 200);
-        assert.deepEqual(body.missingPacks, []);
-    }
-}
-
-async function prepareSnapshot(api, snapshot, baseVersion = 0, baseChecksum = '') {
-    const started = await begin(api, snapshot, baseVersion, baseChecksum);
-    assert.equal(started.response.status, 200);
-    assert.equal(started.body.committed, false);
-    assert.equal((await uploadBloom(api, snapshot)).status, 204);
-    await finishPages(api, snapshot);
-    return started.body;
-}
 
 async function testLegacyInitializationAndEmptyCommit(worker) {
     const bucket = createR2Mock();
@@ -544,26 +248,72 @@ async function testConcurrentFinalizeAndRootCas(worker) {
     }
 }
 
-async function testGcInvalidatesPendingUpload(worker) {
-    const bucket = createR2Mock();
-    const api = makeApi(worker, bucket);
-    await initialize(api);
-    const committed = await buildSnapshot(0);
-    await prepareSnapshot(api, committed);
-    assert.equal((await api.post({ action: 'finalize-upload', uploadId: committed.checksum })).status, 200);
-    const pending = await buildSnapshot(1, { prefix: 'gc-reuse' });
-    await seedPack(bucket, pending.packs[0], new Date(Date.now() - 48 * 60 * 60 * 1000));
-    await prepareSnapshot(api, pending, 1, committed.checksum);
-    const collected = await api.json({ action: 'gc-step' });
-    assert.equal(collected.response.status, 200);
-    assert.equal(collected.body.deletedCount, 0, 'GC must retain packs referenced by a pending upload');
-    const final = await api.json({ action: 'finalize-upload', uploadId: pending.checksum });
-    assert.equal(final.response.status, 200, 'a pending upload remains finalizable after GC');
-    const pack = pending.packs[0];
-    const pulled = await api.post({ action: 'pull-pack', version: final.body.remote.version,
-        pageIndex: 0, packIndex: 0, checksum: pack.checksum, length: pack.length, entryCount: pack.entryCount });
-    assert.equal(pulled.status, 200, 'a successful commit must remain downloadable');
-    assert.deepEqual(new Uint8Array(await pulled.arrayBuffer()), pack.bytes);
+async function testConsistencyRecoveryAndImmutablePacks(worker) {
+    {
+        const bucket = createR2Mock();
+        const api = makeApi(worker, bucket);
+        await initialize(api);
+        const committed = await buildSnapshot(1, { prefix: 'committed' });
+        await prepareSnapshot(api, committed);
+        assert.equal((await api.post({ action: 'finalize-upload', uploadId: committed.checksum })).status, 200);
+
+        const other = await buildSnapshot(1, { prefix: 'other' });
+        await begin(api, other, 1, committed.checksum);
+        await uploadBloom(api, other);
+        const page = await submitPage(api, other, 0);
+        assert.equal(page.body.nextPage, 0);
+        assert.ok(bucket.objects.has(pageKey(other.checksum, 0)), 'page declaration is durable before binary upload');
+
+        const old = bucket.objects.get(packKey(committed.packs[0].checksum));
+        assert.equal((await uploadPack(api, other.checksum, { ...committed.packs[0], entryCount: 2 })).status, 409);
+        assert.equal(bucket.objects.get(old.key), old, 'cross-session write cannot replace an existing pack');
+        assert.equal((await api.post({ action: 'pull-pack', version: 1, pageIndex: 0, packIndex: 0, ...committed.pages[0].packs[0] })).status, 200);
+
+        const outcomes = await Promise.all([
+            uploadPack(api, other.checksum, other.packs[0]),
+            uploadPack(api, other.checksum, other.packs[0])
+        ]);
+        assert.deepEqual(outcomes.map(item => item.status), [204, 204]);
+        assert.equal((await uploadPack(api, other.checksum, { ...other.packs[0], entryCount: 2 })).status, 409);
+        await submitPage(api, other, 0);
+        assert.equal((await uploadPack(api, other.checksum, other.packs[0])).status, 204, 'completed-page retry is idempotent');
+    }
+
+    {
+        const bucket = createR2Mock();
+        const api = makeApi(worker, bucket);
+        await initialize(api);
+        const snapshot = await buildSnapshot(0, { prefix: 'lost-root-response' });
+        await prepareSnapshot(api, snapshot);
+        const put = bucket.put.bind(bucket);
+        bucket.put = async (key, bytes, options) => {
+            const result = await put(key, bytes, options);
+            if (key === MANIFEST_KEY) throw new Error('R2 response lost after root write');
+            return result;
+        };
+        const finalized = await api.json({ action: 'finalize-upload', uploadId: snapshot.checksum });
+        assert.equal(finalized.response.status, 200, 'finalize verifies a root after an unknown write response');
+        assert.equal(finalized.body.remote.checksum, snapshot.checksum);
+    }
+
+    {
+        const bucket = createR2Mock();
+        const api = makeApi(worker, bucket);
+        await initialize(api);
+        const snapshot = await buildSnapshot(1, { prefix: 'lost-session-response' });
+        const put = bucket.put.bind(bucket);
+        bucket.put = async (key, bytes, options) => {
+            const result = await put(key, bytes, options);
+            if (key === sessionKey(snapshot.checksum)) throw new Error('R2 response lost after session write');
+            return result;
+        };
+        assert.equal((await begin(api, snapshot)).response.status, 503);
+        bucket.put = put;
+        const resumed = await begin(api, snapshot);
+        assert.equal(resumed.response.status, 200, 'a session write with a lost response remains resumable');
+    }
+
+    console.log('PASS consistency recovery, immutable packs and page/session binding');
 }
 
 async function testGcCursor(worker, committed) {
@@ -623,7 +373,8 @@ async function testGcControlObjectLifecycle(worker) {
     // 新根提交后旧 page/Bloom 不再被引用，但仍在 24 小时控制对象宽限期内。
     const fresh = await buildSnapshot(1, { prefix: 'gc-new' });
     await prepareSnapshot(api, fresh);
-    assert.equal((await api.post({ action: 'finalize-upload', uploadId: fresh.checksum })).status, 200);
+    const freshFinal = await api.json({ action: 'finalize-upload', uploadId: fresh.checksum });
+    assert.equal(freshFinal.response.status, 200);
 
     const firstPass = await api.json({ action: 'gc-step' });
     assert.equal(firstPass.response.status, 200);
@@ -643,7 +394,7 @@ async function testGcControlObjectLifecycle(worker) {
     // 过期 upload session：根切换触发新一轮完整扫描（与真实上传后客户端
     // drain 的路径一致），过期会话被删除后 begin-upload 能建立新会话。
     const expired = await buildSnapshot(1, { prefix: 'gc-expired' });
-    await begin(api, expired, fresh.body?.version ?? 2, fresh.checksum);
+    await begin(api, expired, freshFinal.body.remote.version, fresh.checksum);
     const sessionObject = bucket.objects.get(sessionKey(expired.checksum));
     assert.ok(sessionObject);
     const staleTime = Date.now() - 8 * 24 * 60 * 60 * 1000;
@@ -796,15 +547,58 @@ async function testPasswordAndBinaryEndpoint(worker) {
     assert.equal(binaryDenied.status, 401);
 }
 
+async function testFinalizeChecksReusedPacks(worker) {
+    const bucket = createR2Mock();
+    const api = makeApi(worker, bucket);
+    await initialize(api);
+
+    const seed = await buildSnapshot(1, { prefix: 'finalize-seed' });
+    await prepareSnapshot(api, seed);
+    assert.equal((await api.json({ action: 'finalize-upload', uploadId: seed.checksum })).response.status, 200);
+
+    // The new snapshot reuses the old pack instead of uploading it again.
+    const snapshot = await buildSnapshot(2, {
+        prefix: 'finalize-reused',
+        mutatePacks(packs) {
+            packs[0] = seed.packs[0];
+            packs[1] = {
+                ...packs[1],
+                bucketKey: seed.packs[0].bucketKey,
+                group: seed.packs[0].group,
+                part: 1
+            };
+        }
+    });
+    await prepareSnapshot(api, snapshot);
+
+    // Advance the root to a snapshot that does not reference the reused pack,
+    // then simulate a GC race deleting it before this session finalizes.
+    const other = await buildSnapshot(1, { prefix: 'finalize-other' });
+    await prepareSnapshot(api, other);
+    assert.equal((await api.json({ action: 'finalize-upload', uploadId: other.checksum })).response.status, 200);
+    bucket.objects.delete(packKey(seed.packs[0].checksum));
+
+    const finalized = await api.json({
+        action: 'finalize-upload',
+        uploadId: snapshot.checksum,
+        reusedPacks: [seed.packs[0].checksum]
+    });
+    assert.equal(finalized.response.status, 409, 'missing reused packs must block finalize');
+    assert.deepEqual(finalized.body.missingPacks, [seed.packs[0].checksum]);
+    assert.equal(bucket.objects.has(sessionKey(snapshot.checksum)), false,
+        'failed reused-pack verification clears the session so a retry can re-upload');
+}
+
 const worker = await loadWorker();
 await testLegacyInitializationAndEmptyCommit(worker);
 const committed = await testResumablePagedUploadAndPull(worker);
 await testMetadataBloomAndOrderingRejections(worker);
 await testConcurrentFinalizeAndRootCas(worker);
-await testGcInvalidatesPendingUpload(worker);
+await testConsistencyRecoveryAndImmutablePacks(worker);
 await testGcCursor(worker, committed);
 await testGcControlObjectLifecycle(worker);
 await testGcProtectsFreshSession(worker);
 await testGcStageDrainCoversAllObjects(worker);
+await testFinalizeChecksReusedPacks(worker);
 await testPasswordAndBinaryEndpoint(worker);
 console.log('sync-v13-smoke: ok');
