@@ -34,6 +34,7 @@ function bucket() {
         },
         async list({ prefix }) { return { objects: key.startsWith(prefix) ? [{ key, size: 1 }] : [], truncated: false }; },
         async put(k, value, options) {
+            if (value instanceof ReadableStream) throw new TypeError('R2 put requires a fixed-length body');
             const bytes = value instanceof Uint8Array
                 ? value
                 : new Uint8Array(await new Response(value).arrayBuffer());
@@ -186,6 +187,7 @@ test('generated image key is returned and its GET replay reads the same R2 objec
             return bytes ? { key: objectKey, size: bytes.byteLength, httpMetadata: { contentType: 'image/png' } } : null;
         },
         async put(objectKey, value) {
+            if (value instanceof ReadableStream) throw new TypeError('R2 put requires a fixed-length body');
             objects.set(objectKey, value instanceof Uint8Array
                 ? value
                 : new Uint8Array(await new Response(value).arrayBuffer()));

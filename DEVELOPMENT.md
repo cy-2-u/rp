@@ -193,7 +193,7 @@ npm run lint
 
 `npm test` 依次运行：
 
-- `unit-regressions`：`audit-regressions`（崩溃安全、恢复字节批次、自动保存 scheduler、跨文件协议常量、Worker/bootstrap 字段序）、`cache-entry-buffer-regression`（独立 backing buffer、无字节别名、两遍解析和 64MiB 边界）、`worker-regressions`（适配脚本 ASSETS/last-good/有界读取、YNAI 端点与大小限制、图片 ETag/墓碑/24MiB 流式上限、同步 API）和 `image-task-regressions`（生图门控、固定记录、缩略图失败回退、重掷与角色清理）。
+- `unit-regressions`：`audit-regressions`（崩溃安全、恢复字节批次、自动保存 scheduler、跨文件协议常量、Worker/bootstrap 字段序）、`cache-entry-buffer-regression`（独立 backing buffer、无字节别名、两遍解析和 64MiB 边界）、`worker-regressions`（适配脚本 ASSETS/last-good/有界读取、YNAI 端点与大小限制、图片 ETag/墓碑/24MiB 有界读取上限、R2 拒绝流式写入的回归、同步 API）和 `image-task-regressions`（生图门控、固定记录、缩略图失败回退、重掷与角色清理）。
 - `runtime-regressions`：按顺序运行 `runtime-smoke`（作者脚本原样代理、注入顺序、图库与图片 API）、`sync-v13-smoke`（上传会话、不可变清单页、CAS 竞争、缺包重试、Bloom 损坏、分页 GC、密码门控）、`sync-v13-budget`（小堆隔离环境下的请求预算；p95 ≤10ms、max ≤20ms、R2 并发 ≤6；GC 因逐候选 head 复核单独放宽到 ≤80 子请求）和 `restore-sim`（fake-indexeddb 上传/恢复、缓存命中与损坏回源、严格增量、水位、冲突、访问门禁、每条记录恰好解析两遍、每个 staging pack 只读一次）。
 - `external-author-integration`：jsdom + 真 Vue + 未改写作者 app.js，覆盖 fixture SHA-256 校验、启动偏好、保存防抖与聊天/重掷落盘、图片接管与懒加载、实时开关、模型下拉重挂载、角色图片清理、事务失败与能力缺失诊断。使用最小 root template，不等同完整页面浏览器视觉验收。
 

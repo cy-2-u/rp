@@ -585,20 +585,6 @@ function buildImageUpstreamUrl(params, token) {
     return upstream.toString();
 }
 
-function createImageLimitStream(maxBytes, label) {
-    let total = 0;
-    return new TransformStream({
-        transform(chunk, controller) {
-            total += chunk.byteLength;
-            if (total > maxBytes) {
-                controller.error(Object.assign(new Error(`${label}：${total}/${maxBytes}`), { status: 413 }));
-                return;
-            }
-            controller.enqueue(chunk);
-        }
-    });
-}
-
 async function readBoundedImageBytes(message, maxBytes, label, signal) {
     const reader = message.body?.getReader();
     const cancel = () => { if (reader) void reader.cancel().catch(() => {}); };
@@ -1012,43 +998,28 @@ async function handleImageRender(request, env) {
                 return error('生图服务没有返回图片。', 502);
             }
             if (!upstreamResponse.body) return error('生图服务返回了空图片。', 502);
-            // 声明长度已超限时不必拉起正文；声明偏小/缺失仍由下面的
-            // TransformStream 逐块计数兜底。
-            const declaredLength = Number(upstreamResponse.headers.get('content-length') || 0);
-            if (Number.isFinite(declaredLength) && declaredLength > IMAGE_MAX_BYTES) {
-                return error('图片过大。', 413);
+            // R2 的 put 不接受这里 tee 出来的普通 ReadableStream，必须先把
+            // 上游正文有界读成字节；24MiB 上限仍由逐块计数在落盘前拦截。
+            let bytes;
+            try {
+                bytes = await readBoundedImageBytes(upstreamResponse, IMAGE_MAX_BYTES, '图片过大', signal);
+            } catch (err) {
+                if (err?.status === 413) return error(err.message, 413);
+                throw err;
             }
-            // 二进制上游直接计数并 tee：一份流写 R2，一份流直接作为本次
-            // 响应正文，客户端不必为了拿图再发一次 GET；超过上限时两个
-            // 分支一起失败，不会把半张图写进缓存。
-            const [forR2, forClient] = upstreamResponse.body
-                .pipeThrough(createImageLimitStream(IMAGE_MAX_BYTES, '图片过大'))
-                .tee();
-            return {
-                stream: forClient,
-                contentType,
-                put: bucket.put(primary.key, forR2, { httpMetadata: { contentType } })
-            };
+            if (!bytes.byteLength) return error('生图服务返回了空图片。', 502);
+            return { bytes, contentType };
         });
     }
     if (result instanceof Response) return result;
-    if (result.stream) {
-        try {
-            await result.put;
-        } catch (err) {
-            try { await result.stream.cancel(); } catch (_) { }
-            return error(err?.status === 413 ? err.message : '生图图片写入失败。', err?.status === 413 ? 413 : 503);
-        }
-        return imageResponse(result.stream, result.contentType, {
-            ...identityHeaders,
-            ...(etag ? { etag } : {}),
-            'cache-control': 'private, max-age=31536000, immutable'
-        });
-    }
     const { bytes, contentType } = result;
-    await bucket.put(primary.key, bytes, {
-        httpMetadata: { contentType }
-    });
+    try {
+        await bucket.put(primary.key, bytes, {
+            httpMetadata: { contentType }
+        });
+    } catch (_) {
+        return error('生图图片写入失败。', 503);
+    }
 
     return imageResponse(bytes, contentType, {
         ...identityHeaders,
