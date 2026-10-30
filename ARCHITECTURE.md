@@ -208,7 +208,7 @@ npm run sync-perf     # 同步性能：后台准备耗时基准 + journal 增量
 ## 6. 维护约定
 
 - Worker 保持单文件、无构建步骤、无 `import`/顶层 `await`。
-- `page/` 是唯一发布正本；`page.zip` 需要时用打包工具重建（禁止 `Compress-Archive`：反斜杠条目会让 Pages 站点打不开）。
+- `page/` 是唯一发布正本；本地手动部署直接上传该目录，部署器（`deployer/worker.js`）部署/更新时实时从仓库 `main` 的 `page/` 拉文件，无需打包 page.zip。
 - 改同步协议必须同时改 `page/_worker.js`、`page/DB/bootstrap.js`、`tests/`（三方 canonical 校验和源逐字一致，audit-regressions 有断言）。
 - `page/DB/dirty-tracker.js` 与 `page/DB/bootstrap.js` 的协议常量是**人肉双写副本**，任何一侧改名必须双侧同步（audit-regressions 静态断言逐字比较）。
 - 改适配层时：锚点变化只改 `ANCHORS` 表；契约变化必须升 `version` 并同步系统侧。
