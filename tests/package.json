@@ -1,0 +1,26 @@
+{
+  "name": "rp-magic-v2-tests",
+  "private": true,
+  "type": "module",
+  "description": "RP Hub 魔改版 v2 本地测试：协议冒烟、客户端端到端模拟、审计回归、适配层契约、图片业务行为。",
+  "scripts": {
+    "audit": "node audit-regressions.mjs",
+    "protocol": "node protocol-smoke.mjs",
+    "images": "node image-regressions.mjs",
+    "client": "node client-sim.mjs",
+    "adapter": "node adapter-contract.mjs",
+    "magic": "node magic-behavior.mjs",
+    "realistic": "node realistic-sim.mjs",
+    "day": "node day-sim.mjs",
+    "scale": "node --max-old-space-size=8192 --expose-gc client-sim.mjs --scale",
+    "sync-perf": "node background-prepare-bench.mjs && node journal-incremental-verify.mjs",
+    "unit": "node audit-regressions.mjs && node protocol-smoke.mjs && node image-regressions.mjs && node legacy-upgrade.mjs && node magic-behavior.mjs",
+    "runtime": "node client-sim.mjs && node realistic-sim.mjs && node adapter-contract.mjs",
+    "test": "npm run unit && npm run runtime"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "^26.1.0",
+    "vue": "^3.5.24"
+  }
+}

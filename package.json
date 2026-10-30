@@ -1,15 +1,11 @@
 {
-  "name": "rp-hub-magic",
+  "name": "rp-hub-magic-v2",
   "private": true,
   "type": "module",
-  "description": "RP Hub 魔改版根工作区：ESLint 死代码门禁（npm run lint）",
+  "description": "RP Hub 魔改版 v2 根工作区：ESLint 死代码门禁（npm run lint），测试在 tests/",
   "scripts": {
     "lint": "eslint .",
-    "test": "npm --prefix .sync-tests test && npm run test:deployer-flow && npm run test:deployer-blake3",
-    "test:scale": "node --max-old-space-size=8192 --expose-gc .sync-tests/scale-sim.mjs",
-    "build:page-zip": "node deployer/make-page-zip.mjs",
-    "test:deployer-flow": "node deployer/test-flow.mjs",
-    "test:deployer-blake3": "node deployer/test-blake3.mjs"
+    "test": "npm --prefix tests test"
   },
   "engines": {
     "node": ">=22.13"

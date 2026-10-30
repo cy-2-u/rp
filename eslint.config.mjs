@@ -18,8 +18,9 @@ const webGlobals = {
     TextEncoder: 'readonly', TextDecoder: 'readonly',
     fetch: 'readonly', Headers: 'readonly', Request: 'readonly', Response: 'readonly',
     ReadableStream: 'readonly', WritableStream: 'readonly', TransformStream: 'readonly',
-    FormData: 'readonly', File: 'readonly',
-    crypto: 'readonly', console: 'readonly',
+    CompressionStream: 'readonly', DecompressionStream: 'readonly',
+    FormData: 'readonly', File: 'readonly', Blob: 'readonly',
+    crypto: 'readonly', globalThis: 'readonly', console: 'readonly',
     setTimeout: 'readonly', clearTimeout: 'readonly',
     performance: 'readonly', structuredClone: 'readonly',
     Event: 'readonly', EventTarget: 'readonly', CustomEvent: 'readonly', DOMException: 'readonly'
@@ -27,7 +28,7 @@ const webGlobals = {
 
 const workerGlobals = {
     ...webGlobals,
-    HTMLRewriter: 'readonly', caches: 'readonly', matchMedia: 'readonly'
+    HTMLRewriter: 'readonly', caches: 'readonly'
 };
 
 const clientGlobals = {
@@ -54,8 +55,9 @@ const nodeTestGlobals = {
     TextEncoder: 'readonly', TextDecoder: 'readonly',
     Request: 'readonly', Response: 'readonly', Headers: 'readonly', FormData: 'readonly', File: 'readonly',
     ReadableStream: 'readonly', WritableStream: 'readonly', TransformStream: 'readonly',
+    CompressionStream: 'readonly', DecompressionStream: 'readonly',
     Uint8Array: 'readonly', ArrayBuffer: 'readonly',
-    crypto: 'readonly', atob: 'readonly', btoa: 'readonly',
+    crypto: 'readonly', globalThis: 'readonly', atob: 'readonly', btoa: 'readonly',
     DOMException: 'readonly', structuredClone: 'readonly',
     // fake-indexeddb 在测试环境里提供的 IndexedDB 全局
     IDBKeyRange: 'readonly'
@@ -63,10 +65,10 @@ const nodeTestGlobals = {
 
 export default [
     {
-        ignores: ['node_modules/**', '.zcode/**', 'docs/**', '.sync-tests/fixtures/**', '**/*.json']
+        ignores: ['node_modules/**', 'tests/node_modules/**', '**/*.json', '**/*.html']
     },
     {
-        files: ['page/_worker.js', 'deployer/worker.js'],
+        files: ['page/_worker.js'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: workerGlobals },
         rules: gate
     },
@@ -76,7 +78,7 @@ export default [
         rules: gate
     },
     {
-        files: ['eslint.config.mjs', 'deployer/*.mjs', '.sync-tests/**/*.mjs'],
+        files: ['eslint.config.mjs', 'tests/**/*.mjs'],
         languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: nodeTestGlobals },
         rules: gate
     }

@@ -1,12 +1,14 @@
+// RP Hub 魔改版 - IndexedDB/localStorage 事务级变更日志
+//
+// 职责：把作者业务的每次 IndexedDB 写入（put/add/delete/范围删除/clear/
+// cursor.update）与 localStorage 写入记录为同步候选；恢复期间暂停写入。
+// 与 bootstrap.js 是同一份协议的两份静态副本（无构建注入），头部常量
+// 任何一侧改名必须双侧同步；tests/audit-regressions.mjs 静态断言逐字比较。
 (function () {
     if (window.__RPH_SYNC_DIRTY_TRACKING__) return;
     window.__RPH_SYNC_DIRTY_TRACKING__ = true;
 
     // ---- 跨文件协议常量（人肉双写）----
-    // 本块与 DB/bootstrap.js 的同名常量是同一份协议的两份副本（纯静态
-    // 文件没有构建注入）。任何一侧改名必须双侧同步，否则脏追踪与同步面板
-    // 会静默失去共同语言（journal 对不上、恢复暂停标记失联）；
-    // audit-regressions.mjs 的静态断言会抓住两侧不一致。
     const JOURNAL = '__rp_sync_journal_v2';
     const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
     const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
@@ -83,6 +85,11 @@
     let journalFailure = null;
     const trackingEpoch = localStorage.getItem(TRACKING_EPOCH_KEY) || crypto.randomUUID();
     storageSetItem.call(localStorage, TRACKING_EPOCH_KEY, trackingEpoch);
+    // 业务写入通知：同步客户端据此在后台提前做快照准备（差分/重建/gzip），
+    // 让"上传"只剩网络阶段。事件本身零开销，节流由监听方负责。
+    const notifyDirty = () => {
+        try { window.dispatchEvent(new CustomEvent('rphub:dirty')); } catch (_) { }
+    };
 
     // Return request events only after the journal store exists. Old explicit
     // author versions remain usable after our internal-only schema upgrade.
@@ -182,7 +189,7 @@
                 tx.addEventListener('abort', resolve, { once: true });
             });
             pendingWrites.add(pending);
-            pending.then(() => pendingWrites.delete(pending));
+            pending.then(() => { pendingWrites.delete(pending); notifyDirty(); });
         }
         return tx;
     };
@@ -253,7 +260,9 @@
         // Each write owns its intent key; different tabs never overwrite a shared
         // read-modify-write index. An interrupted write is a harmless candidate.
         storageSetItem.call(storage, intent, key);
-        return operation();
+        const result = operation();
+        notifyDirty();
+        return result;
     };
     Storage.prototype.setItem = function (key, value) {
         key = String(key);
@@ -276,6 +285,7 @@
         for (const key of keys) {
             if (!key.startsWith('rp_sync_')) storageRemoveItem.call(this, key);
         }
+        notifyDirty();
     };
     const nativeDeleteDatabase = factoryPrototype.deleteDatabase;
     factoryPrototype.deleteDatabase = function (name) {

@@ -1,135 +1,45 @@
+// RP Hub 魔改版 - 同步客户端 v2
+//
+// 协议：rp-sync/v2（全量根清单 + gzip 内容寻址分片，无服务端会话、无分页清单、
+// 无 Bloom、无 GC 状态机）。上传 = 逐片 PUT（幂等）→ commit（CAS 切根，服务端
+// 顺带回收孤儿分片）；恢复 = 读根清单 → 逐片 GET（边缘缓存）→ 两遍 staging 恢复。
+// 设计前提：个人单用户、无并发写者；免费版网络（国内高延迟）优先优化请求数与字节。
 (function (global) {
     'use strict';
 
-    function toAsyncIterator(source) {
-        if (source && typeof source[Symbol.asyncIterator] === 'function') return source[Symbol.asyncIterator]();
-        if (source && typeof source[Symbol.iterator] === 'function') {
-            const iterator = source[Symbol.iterator]();
-            return {
-                next: async () => iterator.next(),
-                return: async () => typeof iterator.return === 'function' ? iterator.return() : { done: true }
-            };
-        }
-        throw new TypeError('上传数据源必须是可迭代对象。');
-    }
-
-    function createBatchReader(source, maxItems, maxBytes) {
-        const iterator = toAsyncIterator(source);
-        let pending = null;
-        let ended = false;
-
-        const readBatch = async function readBatch() {
-            if (ended) return null;
-            const items = [];
-            let totalBytes = 0;
-            while (items.length < maxItems) {
-                const result = pending || await iterator.next();
-                pending = null;
-                if (result.done) {
-                    ended = true;
-                    break;
-                }
-                const item = result.value;
-                const length = Number(item?.length);
-                if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
-                    throw new Error('上传分片大小无效。');
-                }
-                if (items.length > 0 && totalBytes + length > maxBytes) {
-                    pending = result;
-                    break;
-                }
-                items.push(item);
-                totalBytes += length;
-                if (totalBytes === maxBytes) break;
-            }
-            return items.length ? { items, totalBytes } : null;
-        };
-        readBatch.close = async () => {
-            if (ended) return;
-            ended = true;
-            pending = null;
-            if (typeof iterator.return === 'function') await iterator.return();
-        };
-        return readBatch;
-    }
-
-    async function runBoundedUpload(options = {}) {
-        const normalizeLimit = (value, fallback) => {
-            const number = Number(value);
-            return Number.isFinite(number) && number >= 1 ? Math.floor(number) : fallback;
-        };
-        const concurrency = normalizeLimit(options.concurrency, 1);
-        const maxItems = normalizeLimit(options.maxItems, 1);
-        const maxBytes = normalizeLimit(options.maxBytes, 1);
-        if (typeof options.read !== 'function' || typeof options.send !== 'function') {
-            throw new TypeError('上传引擎缺少 read/send 回调。');
-        }
-
-        const readBatch = createBatchReader(options.items, maxItems, maxBytes);
-        const active = new Set();
-        let stopped = false;
+    // 有界并发池：失败后停止派发新任务，已在途任务自然收尾。
+    async function mapPool(items, limit, worker) {
+        const results = new Array(items.length);
+        let cursor = 0;
         let failure = null;
-        let uploadedBytes = 0;
-        let uploadedItems = 0;
-
-        const launch = batch => {
-            const task = (async () => {
-                const records = [];
+        const runnerCount = Math.min(Math.max(1, limit), items.length);
+        await Promise.all(Array.from({ length: runnerCount }, async () => {
+            while (cursor < items.length && !failure) {
+                const index = cursor;
+                cursor += 1;
                 try {
-                    for (const item of batch.items) {
-                        if (failure) throw failure;
-                        const value = await options.read(item);
-                        if (!value || !value.bytes || !Number.isSafeInteger(value.bytes.byteLength)
-                            || value.bytes.byteLength !== item.length) {
-                            throw new Error('本地同步缓存不完整，请重新上传。');
-                        }
-                        records.push({ ...item, ...value });
-                    }
-                    await options.send(records);
-                    uploadedBytes += batch.totalBytes;
-                    uploadedItems += batch.items.length;
-                    await options.onBatchSuccess?.({ bytes: uploadedBytes });
-                } finally {
-                    records.forEach(record => { record.bytes = null; });
+                    results[index] = await worker(items[index], index);
+                } catch (err) {
+                    failure = failure || err;
                 }
-            })();
-            active.add(task);
-            task.then(() => active.delete(task), error => {
-                active.delete(task);
-                failure ||= error;
-            });
-        };
-
-        try {
-            while ((!stopped || active.size) && !failure) {
-                while (!stopped && !failure && active.size < concurrency) {
-                    const batch = await readBatch();
-                    if (!batch) {
-                        stopped = true;
-                        break;
-                    }
-                    launch(batch);
-                }
-                if (active.size) await Promise.race(active);
             }
-            if (failure) throw failure;
-            return { bytes: uploadedBytes, items: uploadedItems };
-        } finally {
-            await Promise.allSettled([...active]);
-            await readBatch.close?.();
-        }
+        }));
+        if (failure) throw failure;
+        return results;
     }
 
-    global.RPH_SYNC_UPLOAD_ENGINE = Object.freeze({
-        runBoundedUpload
-    });
+    global.RPH_SYNC_UPLOAD_ENGINE = Object.freeze({ mapPool });
 })(globalThis);
+
 (function () {
     window.RPH_SYNC_PERSISTENCE = {
         async manualSave() {
             const external = window.RPHubExternal;
-            if (external?.version !== 1 || typeof external.flush !== 'function') throw new Error('作者保存接口未就绪，请刷新后重试。');
-            await external.flush();
+            if (external?.version !== 2 || typeof external.flush !== 'function') {
+                throw new Error('作者保存接口未就绪，请刷新后重试。');
+            }
+            const result = await external.flush();
+            if (result && result.ok === false) throw new Error(result.reason || '作者数据保存失败。');
             if (window.RPH_MAGIC_FLUSH_IMAGES) await window.RPH_MAGIC_FLUSH_IMAGES();
             await window.RPH_SYNC_TRACKER.flush();
         }
@@ -267,12 +177,9 @@ function createAutoSaveScheduler(options = {}) {
 }
 
 (function () {
-    const SNAPSHOT_FORMAT = 'rp-sync-paged-jsonl-v4';
-    const SNAPSHOT_SCHEMA_VERSION = 13;
-    const MANIFEST_PAGE_FORMAT = 'rp-sync-manifest-page-v1';
-    const MANIFEST_PAGE_PACKS = 32;
-    const MANIFEST_CHAIN_SEED = '0'.repeat(64);
-    const GC_BLOOM_BYTES = 32 * 1024;
+    // ---- 协议常量（客户端侧）----
+    const SNAPSHOT_FORMAT = 'rp-sync-manifest-v2';
+    const SNAPSHOT_COMPRESSION = 'gzip';
     const DOWNLOAD_STAGING_DB = 'RPHubSyncStaging';
     const DOWNLOAD_STAGING_DB_VERSION = 3;
     const DOWNLOAD_STAGING_STORE = 'packs';
@@ -284,17 +191,97 @@ function createAutoSaveScheduler(options = {}) {
     // 恢复页判定与 dirty-tracker.js 头部的 RESTORE_PAGE 是同一判定的两份
     // 副本（bootstrap 多了非浏览器环境的 typeof 守卫），语义改动须双侧同步。
     const PAGE_SCOPE = ['/', '/index.html', '/sync-restore'];
-    if (!RESTORE_PAGE && !PAGE_SCOPE.includes(location.pathname)) {
+    if (typeof location !== 'undefined' && !RESTORE_PAGE && !PAGE_SCOPE.includes(location.pathname)) {
         return;
     }
-    if (RESTORE_PAGE && location.pathname === '/sync-restore'
+    if (RESTORE_PAGE && typeof location !== 'undefined' && location.pathname === '/sync-restore'
         && typeof history !== 'undefined' && typeof history.replaceState === 'function') {
         history.replaceState(null, '', '/');
     }
 
-    // 面板样式：原为独立注入的 /DB/styles.css（主页 <link> 第 4 个注入节点）。
-    // 为收敛作者页注入面，样式随 bootstrap 启动自注入，内容与原文件一致；
-    // 作者页注入因此只剩 dirty-tracker、magic-extension、bootstrap 三个节点。
+    const CONFIG = {
+        apiEndpoint: '/api/rp-sync',
+        packEndpoint: '/api/rp-sync/pack',
+        passwordStorageKey: 'rp_hub_sync_password_v1',
+        autoSaveEnabledKey: 'rp_hub_sync_auto_save_enabled_v1',
+        autoSaveMinutesKey: 'rp_hub_sync_auto_save_minutes_v1',
+        lastSyncKey: 'rp_hub_sync_last_result_v1',
+        autoSaveDefaultMinutes: 5,
+        autoSaveMinMinutes: 1,
+        autoSaveMaxMinutes: 1440,
+        autoSaveTickMs: 30 * 1000,
+        autoSaveLateToleranceMs: 5000,
+        knownDatabases: [
+            { name: 'RPHubDB', stores: ['store'] },
+            { name: 'AICharGen', stores: ['characters'] }
+        ],
+        localStoragePrefixes: ['rp_hub_', 'ai_chargen_'],
+        maxSnapshotBytes: 1024 * 1024 * 1024,
+        maxPackCount: 4096,
+        // 分片原始上限 4MiB、记录上限 512 条；gzip 后传输（JSONL 压缩比通常 3-6 倍）。
+        // 一请求仍只携带一片：Worker 把正文流式直通 R2，不在 isolate 内聚合。
+        targetPackBytes: 4 * 1024 * 1024,
+        maxPackEntries: 512,
+        uploadConcurrency: 6,
+        downloadPackConcurrency: 6,
+        requestTimeoutMs: 60_000,
+        packTransferTimeoutMs: 120_000,
+        commitTimeoutMs: 120_000,
+        retryCount: 3,
+        retryDelayMs: 600,
+        readBatchSize: 256,
+        // 无变化自动保存的快速通道：本地校验和与云端一致时跳过网络，只确认
+        // 水位。云端根此刻是否仍与本机记忆一致，由每满这个间隔的一次完整
+        // 验证兜底（免费版个人单用户下，云端只可能被本机自己改写）。
+        fastPathVerifyIntervalMs: 3600 * 1000,
+        // 首扫批次：单条作者记录可能是一整段对话，批次在记录数与估算字节双限。
+        scanBatchRecords: 64,
+        scanBatchBytes: 8 * 1024 * 1024,
+        restoreBatchSize: 64,
+        cacheWriteBytes: 1024 * 1024,
+        yieldIntervalMs: 12
+    };
+
+    // ---- 跨文件协议常量（人肉双写）----
+    // 下面 JOURNAL_STORE / STORAGE_INTENT_PREFIX / TRACKING_EPOCH_KEY /
+    // RESTORE_ACTIVE_KEY / RESTORE_EPOCH_KEY 与 DB/dirty-tracker.js 头部的
+    // 同名常量是同一份协议的两份副本（纯静态文件没有构建注入）。任何一侧
+    // 改名必须双侧同步；tests/audit-regressions.mjs 的静态断言逐字比较。
+    const LOCAL_CACHE_DB = 'RPHubSyncCache';
+    const LOCAL_CACHE_DB_VERSION = 5;
+    const LOCAL_CACHE_ENTRY_STORE = 'entries';
+    const LOCAL_CACHE_STATE_STORE = 'state';
+    const LOCAL_CACHE_PACK_STORE = 'packs';
+    const JOURNAL_STORE = '__rp_sync_journal_v2';
+    // journal 里的追踪 epoch 标记键（string 键，值是 dirty-tracker 建库时
+    // 写入的随机 UUID）：键名与 dirty-tracker.js L147 的字面量是同一份协议
+    // 的两份副本，改名必须双侧同步。
+    const JOURNAL_EPOCH_KEY = '__epoch__';
+    const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
+    const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
+    const CACHE_STATE_KEY = 'snapshot';
+    const CACHE_FORMAT_VERSION = 9;
+    const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
+    const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
+    const STABLE_BUCKET_COUNT = 256;
+    const ARRAY_BUCKET_ENTRIES = 32;
+
+    const MAX_SUPPORTED_OBJECT_BYTES = 64 * 1024 * 1024;
+
+    const state = {
+        syncing: false,
+        operationPending: false,
+        progress: 0,
+        statusText: '请选择同步方向。'
+    };
+
+    const AUTO_SAVE_CONFIG = Object.freeze({
+        defaultMinutes: CONFIG.autoSaveDefaultMinutes,
+        minMinutes: CONFIG.autoSaveMinMinutes,
+        maxMinutes: CONFIG.autoSaveMaxMinutes
+    });
+
+    // ---- 面板样式（自注入，不依赖外部样式表时序）----
     const SYNC_STYLE_TEXT = `
 .rp-sync-modal *, .rp-sync-modal *::before, .rp-sync-modal *::after {
     box-sizing: border-box;
@@ -489,14 +476,12 @@ function createAutoSaveScheduler(options = {}) {
     text-overflow: ellipsis;
 }
 
-/* 底行：左自动保存状态、右上次同步结果，形成对称 */
 .rp-sync-auto-save__footer {
     display: flex;
     align-items: baseline;
     gap: 12px;
 }
 
-/* 上次同步结果：与左侧自动保存状态同一行、靠右对称，一行短文案（HH:MM 同步成功/失败） */
 .rp-sync-last-sync {
     flex: 0 0 auto;
     margin: 8px 0 0;
@@ -688,7 +673,6 @@ function createAutoSaveScheduler(options = {}) {
         gap: 8px;
     }
 
-    /* 极窄屏允许换行，间隔输入仍靠右。 */
     .rp-sync-auto-save__row {
         flex-wrap: wrap;
         row-gap: 10px;
@@ -698,7 +682,6 @@ function createAutoSaveScheduler(options = {}) {
         margin-left: auto;
     }
 
-    /* 底行过窄时将结果徽标移到下一行。 */
     .rp-sync-auto-save__footer {
         flex-wrap: wrap;
         row-gap: 2px;
@@ -721,7 +704,6 @@ function createAutoSaveScheduler(options = {}) {
         border-radius: 8px;
         padding: 20px;
     }
-
 }
 
 `;
@@ -733,91 +715,9 @@ function createAutoSaveScheduler(options = {}) {
         style.textContent = SYNC_STYLE_TEXT;
         (document.head || document.documentElement).appendChild(style);
     }
-    ensureSyncStyle();
+    if (typeof document !== 'undefined') ensureSyncStyle();
 
-    // TextEncoder.encode 无内部状态，整个同步模块共享一个实例；
-    // 序列化/校验和是每条记录级别的热路径，不再逐次分配编码器。
     const textEncoder = new TextEncoder();
-
-    const CONFIG = {
-        apiEndpoint: '/api/rp-sync',
-        passwordStorageKey: 'rp_hub_sync_password_v1',
-        autoSaveEnabledKey: 'rp_hub_sync_auto_save_enabled_v1',
-        autoSaveMinutesKey: 'rp_hub_sync_auto_save_minutes_v1',
-        lastSyncKey: 'rp_hub_sync_last_result_v1',
-        autoSaveDefaultMinutes: 5,
-        autoSaveMinMinutes: 1,
-        autoSaveMaxMinutes: 1440,
-        autoSaveTickMs: 30 * 1000,
-        autoSaveLateToleranceMs: 5000,
-        knownDatabases: [
-            { name: 'RPHubDB', stores: ['store'] },
-            { name: 'AICharGen', stores: ['characters'] }
-        ],
-        localStoragePrefixes: ['rp_hub_', 'ai_chargen_'],
-        maxSnapshotBytes: 1024 * 1024 * 1024,
-        // One request still carries exactly one 1 MiB pack (the Worker forwards
-        // the request stream directly into R2 without copying or scanning it);
-        // six packs may be in flight at once to use the full outbound budget.
-        uploadBatchConcurrency: 6,
-        uploadBatchMaxPacks: 1,
-        uploadBatchMaxBytes: 1024 * 1024,
-        downloadPackConcurrency: 6,
-        requestTimeoutMs: 60_000,
-        packTransferTimeoutMs: 120_000,
-        commitTimeoutMs: 120_000,
-        retryCount: 3,
-        retryDelayMs: 600,
-        readBatchSize: 256,
-        // Full-scan batches: one author record can be an entire conversation,
-        // so batches stop before pulling in a record that would exceed either limit.
-        scanBatchRecords: 64,
-        scanBatchBytes: 8 * 1024 * 1024,
-        restoreBatchSize: 64,
-        targetPackBytes: 1024 * 1024,
-        maxPackCount: 8192,
-        maxManifestBytes: 2 * 1024 * 1024,
-        cacheWriteBytes: 1024 * 1024,
-        maxPackEntries: 512,
-        yieldIntervalMs: 12
-    };
-
-    // ---- 跨文件协议常量（人肉双写）----
-    // 下面 JOURNAL_STORE / STORAGE_INTENT_PREFIX / TRACKING_EPOCH_KEY /
-    // RESTORE_ACTIVE_KEY / RESTORE_EPOCH_KEY 与 DB/dirty-tracker.js 头部的
-    // 同名常量是同一份协议的两份副本（纯静态文件没有构建注入）。任何一侧
-    // 改名必须双侧同步，否则脏追踪与同步面板会静默失去共同语言（journal
-    // 对不上、跨 tab 互斥失效）；audit-regressions.mjs 的静态断言会抓住
-    // 两侧不一致。
-    const LOCAL_CACHE_DB = 'RPHubSyncCache';
-    const LOCAL_CACHE_DB_VERSION = 4;
-    const LOCAL_CACHE_ENTRY_STORE = 'entries';
-    const LOCAL_CACHE_STATE_STORE = 'state';
-    const LOCAL_CACHE_PACK_STORE = 'packs';
-    const JOURNAL_STORE = '__rp_sync_journal_v2';
-    const STORAGE_INTENT_PREFIX = 'rp_sync_intent_v2:';
-    const TRACKING_EPOCH_KEY = 'rp_sync_tracking_epoch_v2';
-    const CACHE_STATE_KEY = 'snapshot';
-    const CACHE_FORMAT_VERSION = 8;
-    const RESTORE_ACTIVE_KEY = 'rp_sync_restore_active';
-    const RESTORE_EPOCH_KEY = 'rp_sync_restore_epoch';
-    const STABLE_BUCKET_COUNT = 256;
-    const ARRAY_BUCKET_ENTRIES = 32;
-
-    const MAX_SUPPORTED_OBJECT_BYTES = 64 * 1024 * 1024;
-
-    const state = {
-        syncing: false,
-        operationPending: false,
-        progress: 0,
-        statusText: '请选择同步方向。'
-    };
-
-    const AUTO_SAVE_CONFIG = Object.freeze({
-        defaultMinutes: CONFIG.autoSaveDefaultMinutes,
-        minMinutes: CONFIG.autoSaveMinMinutes,
-        maxMinutes: CONFIG.autoSaveMaxMinutes
-    });
 
     let modalRoot = null;
     let modalStatus = null;
@@ -839,53 +739,19 @@ function createAutoSaveScheduler(options = {}) {
     let checkingPassword = false;
 
     function wait(ms) {
-        return new Promise((resolve) => setTimeout(resolve, ms));
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async function readDirtyState() {
-        const watermark = { databases: {}, intents: [] };
-        const dirty = { localStorage: new Set(), stores: new Map(), watermark, epochs: {} };
-        for (let index = 0; index < localStorage.length; index += 1) {
-            const intent = localStorage.key(index);
-            if (!intent?.startsWith(STORAGE_INTENT_PREFIX)) continue;
-            const key = localStorage.getItem(intent);
-            if (key !== null) { watermark.intents.push(intent); dirty.localStorage.add(key); }
-        }
-        for (const name of await listIndexedDbNames()) {
-            const db = await openDbByName(name);
-            try {
-                if (!db.objectStoreNames.contains(JOURNAL_STORE)) throw new Error('本地变更追踪未就绪，请刷新后重试。');
-                const tx = db.transaction(JOURNAL_STORE, 'readonly');
-                const request = tx.objectStore(JOURNAL_STORE).openCursor();
-                request.onsuccess = () => {
-                    const cursor = request.result;
-                    if (!cursor) return;
-                    if (cursor.key === '__epoch__') { dirty.epochs[name] = cursor.value; cursor.continue(); return; }
-                    const event = cursor.value;
-                    watermark.databases[name] = cursor.key;
-                    const identity = `${name}/${event.store}`;
-                    const item = dirty.stores.get(identity) || { clear: false, keys: new Map() };
-                    if (event.clear) { item.clear = true; item.keys.clear(); }
-                    else item.keys.set(stableKeyToken(event.key), event.key);
-                    dirty.stores.set(identity, item);
-                    cursor.continue();
-                };
-                await waitForTransaction(tx, '变更日志读取失败。');
-            } finally { db.close(); }
-        }
-        return dirty;
-    }
-
-    function requestExplicitRebuild() {
-        localStorage.setItem('rp_sync_rebuild_requested', '1');
-    }
-
-
+    // 让出控制器：连续工作超过间隔后让出主线程。后台准备期间启用低占空比
+    // 模式（工作 6ms → 睡 8ms，约 43%），手机上完整扫描不持续烧 CPU、不抢
+    // 作者前端的性能；上传路径保持全速（工作 12ms → 让出 0ms）。
+    let backgroundYield = false;
     function createYieldController() {
         let lastYieldAt = performance.now();
         return async function yieldIfNeeded() {
-            if (performance.now() - lastYieldAt < CONFIG.yieldIntervalMs) return;
-            await wait(0);
+            const interval = backgroundYield ? 6 : CONFIG.yieldIntervalMs;
+            if (performance.now() - lastYieldAt < interval) return;
+            await wait(backgroundYield ? 8 : 0);
             lastYieldAt = performance.now();
         };
     }
@@ -955,6 +821,78 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
+    // 读取变更日志：afterDatabases 给出各库已消费的水位（journal 自增主键）
+    // 时只扫描其后的事件——历史事件早已差分进缓存，重放只会靠字节比较幂等
+    // 地空转；watermark 记录本次扫到的末尾，供上传成功后整段确认。
+    async function readDirtyState(afterDatabases = null) {
+        const watermark = { databases: {}, intents: [] };
+        const dirty = { localStorage: new Set(), stores: new Map(), watermark, epochs: {} };
+        for (let index = 0; index < localStorage.length; index += 1) {
+            const intent = localStorage.key(index);
+            if (!intent?.startsWith(STORAGE_INTENT_PREFIX)) continue;
+            const key = localStorage.getItem(intent);
+            if (key !== null) { watermark.intents.push(intent); dirty.localStorage.add(key); }
+        }
+        for (const name of await listIndexedDbNames()) {
+            const after = afterDatabases?.[name];
+            const db = await openDbByName(name);
+            try {
+                if (!db.objectStoreNames.contains(JOURNAL_STORE)) throw new Error('本地变更追踪未就绪，请刷新后重试。');
+                const tx = db.transaction(JOURNAL_STORE, 'readonly');
+                // __epoch__ 是 string 键，恒排在全部数字键之后，增量范围同样会扫到。
+                const range = typeof after === 'number' ? IDBKeyRange.lowerBound(after, true) : null;
+                const request = tx.objectStore(JOURNAL_STORE).openCursor(range);
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return;
+                    if (cursor.key === '__epoch__') { dirty.epochs[name] = cursor.value; cursor.continue(); return; }
+                    const event = cursor.value;
+                    watermark.databases[name] = cursor.key;
+                    const identity = `${name}/${event.store}`;
+                    const item = dirty.stores.get(identity) || { clear: false, keys: new Map() };
+                    if (event.clear) { item.clear = true; item.keys.clear(); }
+                    else item.keys.set(stableKeyToken(event.key), event.key);
+                    dirty.stores.set(identity, item);
+                    cursor.continue();
+                };
+                await waitForTransaction(tx, '变更日志读取失败。');
+            } finally { db.close(); }
+        }
+        return dirty;
+    }
+
+    function requestExplicitRebuild() {
+        localStorage.setItem('rp_sync_rebuild_requested', '1');
+    }
+
+    // 无变化快速通道判定（纯本地读取，不发网络）。安全判据是"变更日志已
+    // 全部确认"：数字键为空 = acknowledge 追平了最后一次快照准备的水位 =
+    // 缓存快照与云端根一致（期间若有 prepare 消费过未上传的新写入，那些
+    // 事件会留在 journal 里，判据自然不成立）。__epoch__ 变化说明追踪被
+    // 重置，必须走完整流程；localStorage 意图存在说明有待同步的应用键写入。
+    async function journalIsFullyAcknowledged(expectedEpochs) {
+        for (let index = 0; index < localStorage.length; index += 1) {
+            if (String(localStorage.key(index) || '').startsWith(STORAGE_INTENT_PREFIX)) return false;
+        }
+        try {
+            for (const name of await listIndexedDbNames()) {
+                const db = await openDbByName(name);
+                try {
+                    if (!db.objectStoreNames.contains(JOURNAL_STORE)) return false;
+                    const tx = db.transaction(JOURNAL_STORE, 'readonly');
+                    const keysRequest = tx.objectStore(JOURNAL_STORE).getAllKeys();
+                    const epochRequest = tx.objectStore(JOURNAL_STORE).get(JOURNAL_EPOCH_KEY);
+                    const { keys, epoch } = await waitForTransaction(tx, '变更日志读取失败。', () => ({ keys: keysRequest.result, epoch: epochRequest.result }));
+                    if ((epoch || null) !== (expectedEpochs?.[name] || null)) return false;
+                    if (keys.some(key => typeof key === 'number')) return false;
+                } finally { db.close(); }
+            }
+        } catch (_) {
+            return false; // 判定失败按"需要完整流程"处理
+        }
+        return true;
+    }
+
     function assertRestoreStoreSchema(db, stores) {
         const existing = stores.filter(store => db.objectStoreNames.contains(store.name));
         if (!existing.length) return;
@@ -994,7 +932,6 @@ function createAutoSaveScheduler(options = {}) {
 
     function createObjectStoreFromSnapshot(db, storeDef) {
         if (db.objectStoreNames.contains(storeDef.name)) return;
-
         const options = {};
         if (storeDef.keyPath !== null && typeof storeDef.keyPath !== 'undefined') {
             options.keyPath = storeDef.keyPath;
@@ -1002,14 +939,12 @@ function createAutoSaveScheduler(options = {}) {
         if (storeDef.autoIncrement) {
             options.autoIncrement = true;
         }
-
         db.createObjectStore(storeDef.name, options);
     }
 
     function openDbForRestore(dbDef) {
         return new Promise((resolve, reject) => {
             const request = indexedDB.open(dbDef.name);
-
             request.onerror = () => reject(request.error || new Error('IndexedDB restore open failed.'));
             request.onupgradeneeded = () => {
                 const db = request.result;
@@ -1020,16 +955,13 @@ function createAutoSaveScheduler(options = {}) {
             request.onsuccess = () => {
                 const db = request.result;
                 const missingStores = (dbDef.stores || [])
-                    .filter((storeDef) => !db.objectStoreNames.contains(storeDef.name));
-
+                    .filter(storeDef => !db.objectStoreNames.contains(storeDef.name));
                 if (missingStores.length === 0) {
                     resolve(db);
                     return;
                 }
-
                 const nextVersion = db.version + 1;
                 db.close();
-
                 const upgradeRequest = indexedDB.open(dbDef.name, nextVersion);
                 upgradeRequest.onerror = () => reject(upgradeRequest.error || new Error('IndexedDB restore upgrade failed.'));
                 upgradeRequest.onupgradeneeded = () => {
@@ -1046,7 +978,7 @@ function createAutoSaveScheduler(options = {}) {
     function isAppLocalStorageKey(key) {
         return key !== CONFIG.passwordStorageKey
             && !key.startsWith('rp_hub_sync_')
-            && CONFIG.localStoragePrefixes.some((prefix) => key.startsWith(prefix));
+            && CONFIG.localStoragePrefixes.some(prefix => key.startsWith(prefix));
     }
 
     function isSyncExcludedRecord(database, store, key) {
@@ -1064,30 +996,25 @@ function createAutoSaveScheduler(options = {}) {
         for (let index = 0; index < localStorage.length; index += 1) {
             const key = localStorage.key(index);
             if (key === null || !isAppLocalStorageKey(key)) continue;
-            entries.push({
-                key,
-                value: localStorage.getItem(key)
-            });
+            entries.push({ key, value: localStorage.getItem(key) });
         }
         entries.sort((a, b) => compareCodeUnits(a.key, b.key));
         return entries;
     }
 
     async function listIndexedDbNames() {
-        const knownNames = CONFIG.knownDatabases.map((dbDef) => dbDef.name);
-
+        const knownNames = CONFIG.knownDatabases.map(dbDef => dbDef.name);
         if (typeof indexedDB.databases === 'function') {
             try {
                 const databases = await indexedDB.databases();
                 const existingNames = new Set((databases || [])
-                    .map((dbInfo) => dbInfo?.name)
-                    .filter((name) => typeof name === 'string' && name));
-                return knownNames.filter((name) => existingNames.has(name));
+                    .map(dbInfo => dbInfo?.name)
+                    .filter(name => typeof name === 'string' && name));
+                return knownNames.filter(name => existingNames.has(name));
             } catch (error) {
                 // Some browsers expose indexedDB.databases but may reject it.
             }
         }
-
         return knownNames;
     }
 
@@ -1144,7 +1071,6 @@ function createAutoSaveScheduler(options = {}) {
         let hasAfterKey = false;
         let afterKey;
         const yieldIfNeeded = createYieldController();
-
         while (true) {
             const batch = await readObjectStoreRecordBatch(db, storeName, afterKey, hasAfterKey);
             for (const record of batch.records) {
@@ -1188,7 +1114,7 @@ function createAutoSaveScheduler(options = {}) {
             const batch = keys.slice(start, start + CONFIG.restoreBatchSize);
             const tx = db.transaction([storeName], 'readwrite');
             const store = tx.objectStore(storeName);
-            batch.forEach((key) => store.delete(key));
+            batch.forEach(key => store.delete(key));
             await waitForTransaction(tx, 'IndexedDB cleanup failed.');
             await yieldIfNeeded();
         }
@@ -1197,7 +1123,6 @@ function createAutoSaveScheduler(options = {}) {
     async function clearKnownIndexedDbStores(dbDef, storeNames) {
         const dbNames = await listIndexedDbNames();
         if (!dbNames.includes(dbDef.name)) return;
-
         const db = await openDbByName(dbDef.name);
         try {
             for (const storeName of storeNames) {
@@ -1207,7 +1132,7 @@ function createAutoSaveScheduler(options = {}) {
                     await deleteObjectStoreKeys(
                         db,
                         storeName,
-                        keys.filter((key) => !isSyncExcludedRecord(dbDef.name, storeName, key))
+                        keys.filter(key => !isSyncExcludedRecord(dbDef.name, storeName, key))
                     );
                 } else {
                     await clearObjectStore(db, storeName);
@@ -1222,7 +1147,6 @@ function createAutoSaveScheduler(options = {}) {
         if (!Array.isArray(records) || records.length === 0) return Promise.resolve();
         const tx = db.transaction([storeDef.name], 'readwrite');
         const store = tx.objectStore(storeDef.name);
-
         for (const record of records) {
             if (storeDef.keyPath !== null && typeof storeDef.keyPath !== 'undefined') {
                 store.put(record.value);
@@ -1235,7 +1159,7 @@ function createAutoSaveScheduler(options = {}) {
 
     async function deleteMissingObjectStoreRecords(db, database, storeName, incomingKeyTokens) {
         const existingKeys = await readObjectStoreKeys(db, storeName);
-        const keysToDelete = existingKeys.filter((key) => {
+        const keysToDelete = existingKeys.filter(key => {
             if (isSyncExcludedRecord(database, storeName, key)) return false;
             const token = stableKeyToken(key);
             return !incomingKeyTokens.has(token);
@@ -1268,11 +1192,32 @@ function createAutoSaveScheduler(options = {}) {
 
     async function sha256Bytes(bytes) {
         const digest = await crypto.subtle.digest('SHA-256', bytes);
-        return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+
+    // gzip/解压：CompressionStream 在所有受支持浏览器可用；不可用时显式报错
+    // （协议双方都固定 gzip，不做无压缩回退，保持键稳定）。
+    async function gzipBytes(bytes) {
+        if (typeof CompressionStream !== 'function') throw new Error('当前浏览器不支持 CompressionStream，无法同步。');
+        const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    async function gunzipBytes(bytes) {
+        if (typeof DecompressionStream !== 'function') throw new Error('当前浏览器不支持 DecompressionStream，无法恢复。');
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
     }
 
     function serializeSnapshotObject(value) {
         const seen = new Set();
+        // 跨 realm 安全的"普通对象"判定：普通对象的原型链是 Object.prototype
+        // （或 null），再往上一层必然是 null；类实例/Map/Set 的原型链更长。
+        // 不直接比较 Object.prototype 是为了兼容多 realm 嵌入环境。
+        const isPlainObject = item => {
+            const proto = Object.getPrototypeOf(item);
+            return proto === null || Object.getPrototypeOf(proto) === null;
+        };
         const canonical = item => {
             // Date 是作者数据里合法且常见的类型；JSON 本身没有日期，统一转
             // ISO 字符串，保证同一时刻在不同浏览器得到相同 canonical 字节。
@@ -1289,14 +1234,14 @@ function createAutoSaveScheduler(options = {}) {
                 }
                 return item;
             }
-            if (seen.has(item) || (!Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null)) {
+            if (seen.has(item) || (!Array.isArray(item) && !isPlainObject(item))) {
                 throw new Error('数据包含循环引用或非 JSON 对象，已停止同步以避免丢失。');
             }
             seen.add(item);
-            const value = Array.isArray(item) ? item.map(canonical) : Object.create(null);
-            if (!Array.isArray(item)) for (const key of Object.keys(item).sort()) value[key] = canonical(item[key]);
+            const out = Array.isArray(item) ? item.map(canonical) : Object.create(null);
+            if (!Array.isArray(item)) for (const key of Object.keys(item).sort()) out[key] = canonical(item[key]);
             seen.delete(item);
-            return value;
+            return out;
         };
         const json = JSON.stringify(canonical(value));
         if (typeof json !== 'string') throw new Error('本地数据包含无法序列化的内容。');
@@ -1314,7 +1259,6 @@ function createAutoSaveScheduler(options = {}) {
                     store.createIndex('sourceKey', 'sourceKey', { unique: false });
                 } else {
                     const store = request.transaction.objectStore(LOCAL_CACHE_ENTRY_STORE);
-                    // v3 曾创建过无人查询的 bucketKey 索引，升级时清理。
                     if (store.indexNames.contains('bucketKey')) store.deleteIndex('bucketKey');
                     if (!store.indexNames.contains('sourceKey')) store.createIndex('sourceKey', 'sourceKey', { unique: false });
                 }
@@ -1330,23 +1274,12 @@ function createAutoSaveScheduler(options = {}) {
     function cacheReadState(db) {
         const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readonly');
         const request = tx.objectStore(LOCAL_CACHE_STATE_STORE).get(CACHE_STATE_KEY);
-        return waitForTransaction(tx, '本地同步索引读取失败。', () => {
-            const value = request.result || null;
-            // 写入时清单只保存一份（state.packs），读回时回填到
-            // state.snapshot.packManifest，避免大库存两份清单。
-            if (value && Array.isArray(value.packs) && value.snapshot && !value.snapshot.packManifest) {
-                value.snapshot.packManifest = value.packs;
-            }
-            return value;
-        });
+        return waitForTransaction(tx, '本地同步索引读取失败。', () => request.result || null);
     }
 
     function cacheWriteState(db, value) {
-        const persisted = value && Array.isArray(value.packs) && value.snapshot
-            ? { ...value, snapshot: { ...value.snapshot, packManifest: undefined } }
-            : value;
         const tx = db.transaction([LOCAL_CACHE_STATE_STORE], 'readwrite');
-        tx.objectStore(LOCAL_CACHE_STATE_STORE).put(persisted, CACHE_STATE_KEY);
+        tx.objectStore(LOCAL_CACHE_STATE_STORE).put(value, CACHE_STATE_KEY);
         return waitForTransaction(tx, '本地同步索引写入失败。');
     }
 
@@ -1356,8 +1289,6 @@ function createAutoSaveScheduler(options = {}) {
         return waitForTransaction(tx, '本地同步对象读取失败.', () => request.result);
     }
 
-    // 与 readRecordsByKeys 同样的批量思路：一次只读事务读回多条缓存条目，
-    // 避免批量删除或数组分页比较时逐键一个事务。
     async function readCacheEntries(db, ids) {
         const entries = [];
         for (let start = 0; start < ids.length; start += CONFIG.restoreBatchSize) {
@@ -1400,10 +1331,9 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    function cachePack(db, checksum, bytes) {
-        const tx = db.transaction(LOCAL_CACHE_PACK_STORE, bytes ? 'readwrite' : 'readonly');
-        const store = tx.objectStore(LOCAL_CACHE_PACK_STORE);
-        const request = bytes ? store.put(bytes, checksum) : store.get(checksum);
+    function cachePack(db, checksum) {
+        const tx = db.transaction(LOCAL_CACHE_PACK_STORE, 'readonly');
+        const request = tx.objectStore(LOCAL_CACHE_PACK_STORE).get(checksum);
         return waitForTransaction(tx, '本地分片缓存失败。', () => request.result);
     }
 
@@ -1415,8 +1345,8 @@ function createAutoSaveScheduler(options = {}) {
         return waitForTransaction(tx, '本地分片缓存失败。');
     }
 
-    async function pruneCachedPacks(db, manifest) {
-        const active = new Set(manifest.map(pack => pack.checksum));
+    async function pruneCachedPacks(db, packs) {
+        const active = new Set(packs.map(pack => pack.checksum));
         const keys = await readObjectStoreKeys(db, LOCAL_CACHE_PACK_STORE);
         await deleteObjectStoreKeys(db, LOCAL_CACHE_PACK_STORE, keys.filter(key => !active.has(key)));
     }
@@ -1490,9 +1420,6 @@ function createAutoSaveScheduler(options = {}) {
         return `${left}${right}-${sourceKey.length}`;
     }
 
-    // 旧版 32 桶/128 项布局（|r/%03d 与 |p/%010d）的恢复兼容已删除：
-    // 云端是整体替换存档，个人数据用 v8 布局重新上传一次后不再存在
-    // legacy 快照；恢复到这种包只可能来自早已废弃的旧存档。
     function snapshotEntryBucket(value, id, sourceKey) {
         const group = snapshotEntryGroup(value);
         if (group.endsWith(':header')) return `${group}|h`;
@@ -1519,17 +1446,15 @@ function createAutoSaveScheduler(options = {}) {
                 : value.type === 'recordArrayEnd'
                     ? '2'
                     : '1';
-        // 恢复路径直接透传服务器数据包里的行字节（本就是同一规范序列化器
-        // 产出、上传时经 sha256 验证的），省掉对全量数据再跑一遍序列化。
-        // 但行字节通常是 1MiB pack 的 subarray；在这里复制到精确长度的
-        // 自有缓冲区，避免 IndexedDB structured clone 把整包 backing buffer 一并持久化。
+        // 恢复路径直接透传数据包里的行字节（本就是同一规范序列化器产出、
+        // 上传时经 sha256 验证的），省掉对全量数据再跑一遍序列化。
+        // 但行字节通常是分片的 subarray；在这里复制到精确长度的自有缓冲区，
+        // 避免 structured clone 把整个分片的 backing buffer 一并持久化。
         const bytes = canonicalBytes ? new Uint8Array(canonicalBytes) : serializeSnapshotObject(value);
         if (bytes.byteLength > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('单条本地数据超过 64MiB 同步上限。');
         return { id, group, sourceKey, sortKey: `${sourceKey}|${sequence}`, bucketKey: snapshotEntryBucket(value, id, sourceKey), bytes };
     }
 
-    // 缓存条目的 bytes 本来就是这台序列化器产出的规范字节，判断“未变化”
-    // 直接与缓存字节逐位比较即可，省掉先 JSON.parse 再重新序列化一遍。
     function snapshotBytesEqual(value, cachedBytes) {
         const bytes = serializeSnapshotObject(value);
         return bytesEqual(bytes, cachedBytes);
@@ -1550,8 +1475,6 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    // Keep requests in one transaction; callers bound each batch by record count.
-    // IndexedDB must still clone a whole value for a single business key.
     function readRecordsByKeys(db, storeName, keys) {
         if (!keys.length || !db.objectStoreNames.contains(storeName)) return Promise.resolve(keys.map(() => undefined));
         const tx = db.transaction(storeName, 'readonly');
@@ -1560,22 +1483,24 @@ function createAutoSaveScheduler(options = {}) {
         return waitForTransaction(tx, '本地同步记录读取失败。', () => requests.map(request => request.result));
     }
 
+    // 分片组装：把一个桶的全部 canonical 行字节顺序填入 4MiB 缓冲，逐片
+    // gzip 后内容寻址。缓存 packs 保存【gzip 后字节】（键 = gzip 校验和），
+    // 上传直接复用、恢复直接落盘，raw 字节只存在于 entries 与组装缓冲中。
     async function buildCachedPacks(db, bucketKey, buffer) {
         const packs = [];
-        // 缓冲由调用方传入并跨桶复用（顺序重建语义允许；flush 时 slice 拷贝出
-        // 独立字节，覆写安全）：大库增量连续重建上百个桶，每桶各分配 1MiB 是
-        // 纯 GC 压力。
         buffer = buffer || new Uint8Array(CONFIG.targetPackBytes);
         let used = 0;
         let entryCount = 0;
         let group;
         const flush = async () => {
             if (used === 0) return;
-            const bytes = buffer.slice(0, used);
-            const checksum = await sha256Bytes(bytes);
-            await cachePack(db, checksum, bytes);
+            const raw = buffer.slice(0, used);
+            const compressed = await gzipBytes(raw);
+            const checksum = await sha256Bytes(compressed);
+            await cacheWritePacks(db, [{ checksum, bytes: compressed }]);
             packs.push({
-                bucketKey, group, part: packs.length, checksum, length: bytes.byteLength, entryCount
+                bucket: bucketKey, group, part: packs.length,
+                checksum, length: compressed.byteLength, entryCount
             });
             used = 0;
             entryCount = 0;
@@ -1588,10 +1513,6 @@ function createAutoSaveScheduler(options = {}) {
                 buffer.set(bytes.subarray(offset, offset + length), used);
                 used += length;
                 offset += length;
-                // 缓冲写满先落盘再续写余量。跨包条目只在"写到它的行分隔符
-                // 那一包"才计数（parsePackSnapshot 也只在该包 count+=1），
-                // 因此这里不能提前 entryCount —— 满包若暂不计，flush 记录的
-                // 就是本包真正完整包含的条目数。
                 if (used === buffer.byteLength) await flush();
             }
             // 行分隔符写入前先保证还有一个字节的空位：条目正文刚好填满缓冲时，
@@ -1609,17 +1530,18 @@ function createAutoSaveScheduler(options = {}) {
         const order = new Map((state.groups || []).map((group, index) => [group, index]));
         return packItems.slice().sort((a, b) => (
             (order.get(a.group) ?? 999999) - (order.get(b.group) ?? 999999)
-            || compareCodeUnits(String(a.bucketKey), String(b.bucketKey))
+            || compareCodeUnits(String(a.bucket), String(b.bucket))
             || Number(a.part) - Number(b.part)
         ));
     }
 
+    // 组装当前快照的完整分片清单：changedBuckets 为空时全部复用 state.packs。
     async function finalizeCachedSnapshot(db, state, changedBuckets = null) {
         const targets = changedBuckets
             ? [...changedBuckets]
-            : [...new Set((state.packs || []).map(pack => pack.bucketKey))];
+            : [...new Set((state.packs || []).map(pack => pack.bucket))];
         const targetSet = new Set(targets);
-        const items = (state.packs || []).filter(pack => !targetSet.has(pack.bucketKey));
+        const items = (state.packs || []).filter(pack => !targetSet.has(pack.bucket));
         let totalBytes = items.reduce((sum, pack) => sum + pack.length, 0);
         const packBuffer = new Uint8Array(CONFIG.targetPackBytes);
         for (const bucketKey of targets) {
@@ -1627,24 +1549,17 @@ function createAutoSaveScheduler(options = {}) {
             items.push(...packs);
             totalBytes += packs.reduce((sum, pack) => sum + pack.length, 0);
             if (totalBytes > CONFIG.maxSnapshotBytes) throw new Error('本地同步数据超过 1GiB 上限。');
-            if (items.length > CONFIG.maxPackCount) throw new Error('本地同步分片超过 8192 个上限。');
+            if (items.length > CONFIG.maxPackCount) throw new Error('本地同步分片超过 4096 个上限。');
         }
         const ordered = orderPackItems(state, items);
-        const snapshot = {
-            snapshotFormat: SNAPSHOT_FORMAT,
-            schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-            packCount: ordered.length,
-            entryCount: ordered.reduce((sum, pack) => sum + pack.entryCount, 0),
-            totalBytes: ordered.reduce((sum, pack) => sum + pack.length, 0),
-            packManifest: ordered.map(({ bucketKey, group, part, checksum, length, entryCount }) => ({ bucketKey, group, part, checksum, length, entryCount }))
-        };
-        if (serializeSnapshotObject(snapshot).byteLength > CONFIG.maxManifestBytes - 1024) {
-            throw new Error('本地同步清单超过 2MiB 上限。');
-        }
-        await addPagedManifestMetadata(snapshot);
         state.packs = ordered;
-        state.snapshot = snapshot;
-        return { state, snapshot };
+        state.snapshot = {
+            format: SNAPSHOT_FORMAT,
+            compression: SNAPSHOT_COMPRESSION,
+            totalBytes: ordered.reduce((sum, pack) => sum + pack.length, 0),
+            entryCount: ordered.reduce((sum, pack) => sum + pack.entryCount, 0)
+        };
+        return state;
     }
 
     async function buildFullCachedSnapshot(cacheDb, progressStart, progressEnd) {
@@ -1674,7 +1589,7 @@ function createAutoSaveScheduler(options = {}) {
         await cacheWriteEntries(cacheDb, pendingEntries);
         const state = { version: CACHE_FORMAT_VERSION, groups, packs: [] };
         for (const [bucketKey, group] of buckets) {
-            state.packs.push({ bucketKey, group, part: 0, checksum: '', length: 0, entryCount: 0 });
+            state.packs.push({ bucket: bucketKey, group, part: 0, checksum: '', length: 0, entryCount: 0 });
         }
         return finalizeCachedSnapshot(cacheDb, state, new Set(buckets.keys()));
     }
@@ -1683,8 +1598,7 @@ function createAutoSaveScheduler(options = {}) {
         const affectedBuckets = new Set(state.pendingBuckets || []);
         let bucketsDirty = false;
         // 触桶只做内存标记，条目落盘前由 flushPendingBuckets 统一持久化：保住
-        // “条目已写入 ⇒ 其所在桶必已在 pendingBuckets”的崩溃安全不变量，
-        // 同时把原来每触一个桶就全量写一次 state 合并成每次条目落盘前至多一次。
+        // "条目已写入 ⇒ 其所在桶必已在 pendingBuckets"的崩溃安全不变量。
         const touchBucket = bucket => {
             if (affectedBuckets.has(bucket)) return;
             affectedBuckets.add(bucket);
@@ -1700,8 +1614,6 @@ function createAutoSaveScheduler(options = {}) {
         const removeEntries = async (keys, knownBuckets = null) => {
             const list = [...keys];
             if (!list.length) return;
-            // clear 差分路径已在游标单遍里顺带收集桶，跳过按键重读；
-            // 其余路径仍需读回条目取 bucketKey。
             if (knownBuckets) {
                 for (const bucketKey of knownBuckets) touchBucket(bucketKey);
             } else {
@@ -1716,8 +1628,6 @@ function createAutoSaveScheduler(options = {}) {
             const remaining = new Set(await cacheSourceKeys(cacheDb, sourceKey));
             if (value) {
                 const id = snapshotEntryId(value);
-                // 调用方若已预读同一条目（如 header 的 stabilize 判断）则直接
-                // 复用，省一次事务；其余路径照旧自读。
                 if (!previous) previous = await cacheReadEntry(cacheDb, id);
                 remaining.delete(id);
                 const bytes = serializeSnapshotObject(value);
@@ -1831,14 +1741,9 @@ function createAutoSaveScheduler(options = {}) {
                         cursor.continue();
                     };
                     const staleKeys = await waitForTransaction(tx, '本地同步索引读取失败。', () => keys);
-                    // 单遍完成收集与桶标记：游标值上已带 bucketKey，
-                    // removeEntries 不再把同一批键按键重读一遍。
                     await removeEntries(staleKeys, staleBuckets);
                 }
                 const dirtyKeys = [...item.keys.values()].filter(key => !isSyncExcludedRecord(database, store, key));
-                // 单连接 + 批量只读事务读取变化键：原来每键重开一次数据库、
-                // 每键一个事务，收敛为每库一次打开、每 64 键一个只读事务，
-                // 只读连接不会阻塞业务写入。
                 for (let start = 0; start < dirtyKeys.length; start += CONFIG.restoreBatchSize) {
                     const batch = dirtyKeys.slice(start, start + CONFIG.restoreBatchSize);
                     const values = await readRecordsByKeys(db, store, batch);
@@ -1860,14 +1765,14 @@ function createAutoSaveScheduler(options = {}) {
             groupOrder.push(`db:${definition.name}:footer`);
         }
         state.groups.sort((left, right) => groupOrder.indexOf(left) - groupOrder.indexOf(right));
-        if (affectedBuckets.size === 0) return { state, snapshot: state.snapshot };
+        if (affectedBuckets.size === 0) return state;
         const result = await finalizeCachedSnapshot(cacheDb, state, affectedBuckets);
-        result.state.pendingBuckets = [];
+        result.pendingBuckets = [];
         return result;
     }
 
     function readStoreDefinitions(db, storeNames) {
-        return storeNames.map((storeName) => {
+        return storeNames.map(storeName => {
             const tx = db.transaction([storeName], 'readonly');
             const store = tx.objectStore(storeName);
             return {
@@ -1882,57 +1787,33 @@ function createAutoSaveScheduler(options = {}) {
         for (const entry of readLocalStorageSnapshot()) {
             yield { type: 'localStorage', key: entry.key, value: entry.value };
         }
-
         const dbNames = await listIndexedDbNames();
         for (const dbName of dbNames) {
-            const knownDb = CONFIG.knownDatabases.find((dbDef) => dbDef.name === dbName);
+            const knownDb = CONFIG.knownDatabases.find(dbDef => dbDef.name === dbName);
             if (!knownDb) continue;
-
             const db = await openDbByName(dbName);
             try {
-                const storeNames = knownDb.stores.filter((name) => db.objectStoreNames.contains(name));
+                const storeNames = knownDb.stores.filter(name => db.objectStoreNames.contains(name));
                 if (storeNames.length === 0) continue;
                 const stores = readStoreDefinitions(db, storeNames);
                 yield { type: 'database', name: dbName, version: db.version, stores };
-
                 for (const storeDef of stores) {
                     for await (const record of iterateObjectStoreRecords(db, storeDef.name)) {
                         if (isSyncExcludedRecord(dbName, storeDef.name, record.key)) continue;
                         if (Array.isArray(record.value)) {
-                            yield {
-                                type: 'recordArrayStart',
-                                database: dbName,
-                                store: storeDef.name,
-                                key: record.key
-                            };
+                            yield { type: 'recordArrayStart', database: dbName, store: storeDef.name, key: record.key };
                             for (let index = 0; index < record.value.length; index += 1) {
                                 const value = Object.prototype.hasOwnProperty.call(record.value, index)
                                     ? record.value[index]
                                     : null;
                                 yield {
-                                    type: 'recordArrayItem',
-                                    database: dbName,
-                                    store: storeDef.name,
-                                    key: record.key,
-                                    index,
-                                    value: value === undefined ? null : value
+                                    type: 'recordArrayItem', database: dbName, store: storeDef.name,
+                                    key: record.key, index, value: value === undefined ? null : value
                                 };
                             }
-                            yield {
-                                type: 'recordArrayEnd',
-                                database: dbName,
-                                store: storeDef.name,
-                                key: record.key,
-                                length: record.value.length
-                            };
+                            yield { type: 'recordArrayEnd', database: dbName, store: storeDef.name, key: record.key, length: record.value.length };
                         } else {
-                            yield {
-                                type: 'record',
-                                database: dbName,
-                                store: storeDef.name,
-                                key: record.key,
-                                value: record.value
-                            };
+                            yield { type: 'record', database: dbName, store: storeDef.name, key: record.key, value: record.value };
                         }
                     }
                     yield { type: 'storeEnd', database: dbName, store: storeDef.name };
@@ -1944,760 +1825,73 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    function openDownloadStagingDb() {
-        return new Promise((resolve, reject) => {
-            const request = indexedDB.open(DOWNLOAD_STAGING_DB, DOWNLOAD_STAGING_DB_VERSION);
-            request.onerror = () => reject(request.error || new Error('同步临时数据库打开失败。'));
-            request.onupgradeneeded = () => {
-                const stagingDb = request.result;
-                if (stagingDb.objectStoreNames.contains('chunks')) {
-                    stagingDb.deleteObjectStore('chunks');
-                }
-                if (stagingDb.objectStoreNames.contains('objects')) {
-                    stagingDb.deleteObjectStore('objects');
-                }
-                if (!stagingDb.objectStoreNames.contains(DOWNLOAD_STAGING_STORE)) {
-                    stagingDb.createObjectStore(DOWNLOAD_STAGING_STORE);
-                }
-            };
-            request.onsuccess = () => resolve(request.result);
-        });
+    // ---- 后台快照准备（消除"点上传才开始整理"的等待）----
+    // 业务写入（rphub:dirty 事件）与页面加载会触发后台准备：把 journal 差分、
+    // 缓存重建与 gzip 分片全部提前完成，上传时只剩网络阶段。单飞保证后台
+    // 准备与上传准备永不并发写缓存；后台期间打开同步面板可实时看到进度。
+    let prepareInFlight = null;
+    let prepareTimer = null;
+
+    function runPrepareOnce(progressStart, progressEnd) {
+        if (prepareInFlight) return prepareInFlight;
+        prepareInFlight = (async () => {
+            try {
+                return await prepareLocalSnapshot(progressStart, progressEnd);
+            } finally {
+                prepareInFlight = null;
+            }
+        })();
+        return prepareInFlight;
     }
 
-    function clearDownloadStagingStore(stagingDb) {
-        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
-        tx.objectStore(DOWNLOAD_STAGING_STORE).clear();
-        return waitForTransaction(tx, '同步临时数据清理失败。');
+    function isBackgroundPrepareAllowed() {
+        return !RESTORE_PAGE && !state.syncing && !state.operationPending
+            && document.visibilityState !== 'hidden';
     }
 
-    function writeDownloadStagingObjects(stagingDb, objects) {
-        if (!Array.isArray(objects) || objects.length === 0) return Promise.resolve();
-        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
-        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
-        objects.forEach(object => store.put(object.bytes, object.index));
-        return waitForTransaction(tx, '同步临时数据写入失败。');
-    }
-
-    function readDownloadStagingObjects(stagingDb, packManifest, start) {
-        const packs = packManifest.slice(start, start + CONFIG.downloadPackConcurrency);
-        if (packs.length === 0) return Promise.resolve([]);
-        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readonly');
-        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
-        const requests = packs.map((_, offset) => store.get(start + offset));
-        return waitForTransaction(tx, '同步临时数据读取失败。', () => requests.map((request, offset) => {
-            const value = request.result;
-            const bytes = value instanceof Uint8Array
-                ? value
-                : value instanceof ArrayBuffer
-                    ? new Uint8Array(value)
-                    : null;
-            if (!bytes || bytes.byteLength !== packs[offset].length) {
-                throw new Error(`同步临时对象 ${start + offset + 1} 校验失败。`);
-            }
-            return { ...packs[offset], index: start + offset, bytes };
-        }));
-    }
-
-    async function* downloadPacksToStaging(remote, packManifest, stagingDb) {
-        await clearDownloadStagingStore(stagingDb);
-        const cacheDb = await openLocalSyncCache().catch(() => null);
-        // 滑动窗口：始终维持 downloadPackConcurrency 个在途下载，按清单顺序
-        // 产出（恢复解析要求分片顺序）。旧版批间串行——批内全部完成才开始
-        // 下一批，网络往返无法重叠。
-        const concurrency = CONFIG.downloadPackConcurrency;
-        let nextToFetch = 0;
-        let completed = 0;
-        const inflight = new Map();
-        const startNext = () => {
-            if (nextToFetch >= packManifest.length) return;
-            const index = nextToFetch++;
-            const pack = packManifest[index];
-            const pending = (async () => {
-                const cached = cacheDb ? await cachePack(cacheDb, pack.checksum).catch(() => null) : null;
-                // 缓存命中只验长度：这份字节在写入本地缓存前已按 checksum
-                // 验过（upload 时经 sha256 校验的分片原样落盘），个人场景
-                // 不再每次恢复对全部缓存包重付一遍 SHA-256。长度不符视为
-                // 缓存损坏，回源下载走完整校验。
-                if (cached?.byteLength === pack.length) return { bytes: cached, verified: true };
-                const bytes = await postSyncBinary({
-                    action: 'pull-pack',
-                    version: remote.version,
-                    pageIndex: Math.floor(index / MANIFEST_PAGE_PACKS),
-                    packIndex: index % MANIFEST_PAGE_PACKS,
-                    checksum: pack.checksum,
-                    length: pack.length,
-                    entryCount: pack.entryCount
-                }, { timeoutMs: CONFIG.packTransferTimeoutMs });
-                if (bytes.byteLength !== pack.length) {
-                    throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
-                }
-                if (await sha256Bytes(bytes) !== pack.checksum) {
-                    throw new Error(`服务器数据包 ${index + 1} 校验失败。`);
-                }
-                return { bytes, verified: false };
-            })().then(result => ({ ...pack, index, bytes: result.bytes }));
-            // 未按序抵达的失败由到达时的 await 抛出；此处先行挂钩避免
-            // 未处理拒绝告警。
-            pending.catch(() => { });
-            inflight.set(index, pending);
-        };
-        // staging 写保持与旧版相同的分组（每 4 个连续 pack 一批），
-        // restore-sim/scale-sim 的写批断言依赖这一分组。
-        let staged = [];
-        for (let i = 0; i < concurrency && nextToFetch < packManifest.length; i += 1) startNext();
-        try {
-            while (inflight.size) {
-                const index = Math.min(...inflight.keys());
-                const downloaded = await inflight.get(index);
-                inflight.delete(index);
-                startNext();
-                completed += 1;
-                updateProgress(8 + Math.round((completed / packManifest.length) * 57), '正在恢复…');
-                yield downloaded;
-                staged.push(downloaded);
-                if (staged.length >= concurrency) {
-                    await writeDownloadStagingObjects(stagingDb, staged);
-                    staged = [];
-                }
-            }
-            await writeDownloadStagingObjects(stagingDb, staged);
-        } finally {
-            // 下游异常提前退出时，放弃在途下载并关闭可能打开的缓存连接。
-            for (const pending of inflight.values()) pending.catch(() => { });
-            cacheDb?.close();
-        }
-    }
-
-    async function* iterateStagedSnapshotPacks(stagingDb, packManifest) {
-        for (let start = 0; start < packManifest.length; start += CONFIG.downloadPackConcurrency) {
-            for (const pack of await readDownloadStagingObjects(stagingDb, packManifest, start)) {
-                yield pack;
-            }
-        }
-    }
-
-    class ObjectSnapshotRestorer {
-        constructor(expectedEntryCount, { validateOnly = false } = {}) {
-            this.expectedEntryCount = Number(expectedEntryCount || 0);
-            this.validateOnly = validateOnly;
-            this.entryCount = 0;
-            this.finished = false;
-            this.localStorageEnded = false;
-            this.localStorageKeys = new Set();
-            this.seenDatabases = new Set();
-            this.currentDatabase = null;
-            this.yieldIfNeeded = createYieldController();
-        }
-
-        async consume(value) {
-            const object = value;
-            if (!object || typeof object !== 'object' || Array.isArray(object)) {
-                throw new Error('服务器同步对象格式不正确。');
-            }
-
-            switch (object.type) {
-                case 'localStorage':
-                    this.restoreLocalStorageEntry(object);
-                    break;
-                case 'database':
-                    await this.startDatabase(object);
-                    break;
-                case 'record':
-                    await this.restoreRecord(object);
-                    break;
-                case 'recordArrayStart':
-                    this.startArrayRecord(object);
-                    break;
-                case 'recordArrayItem':
-                    this.restoreArrayRecordItem(object);
-                    break;
-                case 'recordArrayEnd':
-                    await this.finishArrayRecord(object);
-                    break;
-                case 'storeEnd':
-                    await this.finishStore(object);
-                    break;
-                case 'databaseEnd':
-                    await this.finishDatabase(object);
-                    break;
-                default:
-                    throw new Error('服务器同步包含未知对象。');
-            }
-            this.entryCount += 1;
-        }
-
-        restoreLocalStorageEntry(line) {
-            if (this.localStorageEnded || this.currentDatabase || typeof line.key !== 'string') {
-                throw new Error('服务器本地设置记录顺序不正确。');
-            }
-            if (!isAppLocalStorageKey(line.key)) throw new Error('服务器包含无效的本地设置。');
-            if (!this.validateOnly) localStorage.setItem(line.key, String(line.value ?? ''));
-            this.localStorageKeys.add(line.key);
-        }
-
-        finishLocalStorage() {
-            if (this.currentDatabase) {
-                throw new Error('服务器本地设置结束标记不正确。');
-            }
-            if (this.localStorageEnded) return;
-            if (!this.validateOnly) {
-                for (const entry of readLocalStorageSnapshot()) {
-                    if (!this.localStorageKeys.has(entry.key)) localStorage.removeItem(entry.key);
-                }
-            }
-            this.localStorageEnded = true;
-        }
-
-        async startDatabase(line) {
-            this.finishLocalStorage();
-            if (this.currentDatabase || this.seenDatabases.has(line.name) || typeof line.name !== 'string') {
-                throw new Error('服务器数据库记录顺序不正确。');
-            }
-
-            const knownDb = CONFIG.knownDatabases.find((dbDef) => dbDef.name === line.name);
-            if (!knownDb) {
-                this.currentDatabase = { name: line.name, ignored: true };
-                return;
-            }
-
-            const seenStoreNames = new Set();
-            const stores = (Array.isArray(line.stores) ? line.stores : []).filter((storeDef) => {
-                if (!storeDef || !knownDb.stores.includes(storeDef.name) || seenStoreNames.has(storeDef.name)) return false;
-                seenStoreNames.add(storeDef.name);
-                return true;
-            }).map((storeDef) => ({
-                name: storeDef.name,
-                keyPath: storeDef.keyPath,
-                autoIncrement: Boolean(storeDef.autoIncrement)
-            }));
-
-            if (this.validateOnly && stores.length) await preflightRestoreDatabase({ name: line.name, stores });
-            const db = !this.validateOnly && stores.length > 0
-                ? await openDbForRestore({ name: line.name, stores })
-                : null;
-            this.currentDatabase = {
-                name: line.name,
-                db,
-                knownDb,
-                stores: new Map(stores.map((storeDef) => [storeDef.name, {
-                    definition: storeDef,
-                    incomingKeys: new Set(),
-                    batch: [],
-                    batchBytes: 0,
-                    arrayRecord: null,
-                    finished: false
-                }]))
-            };
-            this.seenDatabases.add(line.name);
-        }
-
-        getStoreState(line) {
-            const current = this.currentDatabase;
-            if (!current || line.database !== current.name || typeof line.store !== 'string') {
-                throw new Error('服务器数据库记录归属不正确。');
-            }
-            if (current.ignored) return null;
-
-            const storeState = current.stores.get(line.store);
-            if (!storeState || storeState.finished) throw new Error('服务器对象存储记录顺序不正确。');
-            return storeState;
-        }
-
-        async queueStoreRecord(storeState, record) {
-            const token = stableKeyToken(record.key);
-            // 校验路径也要发现重复键：真实恢复写入时后一条会覆盖前一条，
-            // 静默接受会让“校验通过”和服务端快照语义不一致。
-            if (storeState.incomingKeys.has(token)) {
-                throw new Error('服务器同步包含重复的对象键。');
-            }
-            storeState.incomingKeys.add(token);
-            if (this.validateOnly) return;
-            storeState.batch.push(record);
-            storeState.batchBytes += estimateRecordBytes(record.value);
-            if (storeState.batch.length >= CONFIG.restoreBatchSize || storeState.batchBytes >= CONFIG.scanBatchBytes) {
-                await this.flushStore(storeState);
-            }
-        }
-
-        async restoreRecord(line) {
-            const storeState = this.getStoreState(line);
-            if (!storeState) return;
-            if (storeState.arrayRecord) throw new Error('服务器数组记录尚未结束。');
-            if (isSyncExcludedRecord(this.currentDatabase.name, line.store, line.key)) {
-                return;
-            }
-            const record = {
-                key: line.key,
-                value: Object.prototype.hasOwnProperty.call(line, 'value') ? line.value : undefined
-            };
-            await this.queueStoreRecord(storeState, record);
-        }
-
-        startArrayRecord(line) {
-            const storeState = this.getStoreState(line);
-            if (!storeState) return;
-            if (storeState.arrayRecord) {
-                throw new Error('服务器数组记录头信息不正确。');
-            }
-            storeState.arrayRecord = {
-                key: line.key,
-                value: [],
-                nextIndex: 0,
-                excluded: isSyncExcludedRecord(this.currentDatabase.name, line.store, line.key)
-            };
-        }
-
-        restoreArrayRecordItem(line) {
-            const storeState = this.getStoreState(line);
-            if (!storeState) return;
-            const arrayRecord = storeState.arrayRecord;
-            if (!arrayRecord || stableKeyToken(line.key) !== stableKeyToken(arrayRecord.key)
-                || Number(line.index) !== arrayRecord.nextIndex) {
-                throw new Error('服务器数组记录顺序不正确。');
-            }
-            if (!arrayRecord.excluded && !this.validateOnly) {
-                arrayRecord.value.push(Object.prototype.hasOwnProperty.call(line, 'value') ? line.value : null);
-            }
-            arrayRecord.nextIndex += 1;
-        }
-
-        async finishArrayRecord(line) {
-            const storeState = this.getStoreState(line);
-            if (!storeState) return;
-            const arrayRecord = storeState.arrayRecord;
-            if (!arrayRecord || stableKeyToken(line.key) !== stableKeyToken(arrayRecord.key)
-                || Number(line.length) !== arrayRecord.nextIndex) {
-                throw new Error('服务器数组记录数据不完整。');
-            }
-            storeState.arrayRecord = null;
-            if (arrayRecord.excluded) {
-                return;
-            }
-            await this.queueStoreRecord(storeState, { key: arrayRecord.key, value: arrayRecord.value });
-            await this.flushStore(storeState);
-        }
-
-        async flushStore(storeState) {
-            if (this.validateOnly || storeState.batch.length === 0) return;
-            const batch = storeState.batch;
-            storeState.batch = [];
-            storeState.batchBytes = 0;
-            await writeObjectStoreRecordBatch(this.currentDatabase.db, storeState.definition, batch);
-            await this.yieldIfNeeded();
-        }
-
-        async finishStore(line) {
-            const current = this.currentDatabase;
-            if (!current || line.database !== current.name || typeof line.store !== 'string') {
-                throw new Error('服务器对象存储结束标记不正确。');
-            }
-            if (current.ignored) return;
-
-            const storeState = current.stores.get(line.store);
-            if (!storeState || storeState.finished) throw new Error('服务器对象存储结束顺序不正确。');
-            if (storeState.arrayRecord) throw new Error('服务器数组记录尚未结束。');
-            await this.flushStore(storeState);
-            if (!this.validateOnly) {
-                await deleteMissingObjectStoreRecords(current.db, current.name, line.store, storeState.incomingKeys);
-            }
-            storeState.incomingKeys.clear();
-            storeState.finished = true;
-        }
-
-        async finishDatabase(line) {
-            const current = this.currentDatabase;
-            if (!current || line.name !== current.name) throw new Error('服务器数据库结束标记不正确。');
-            if (!current.ignored) {
-                if ([...current.stores.values()].some((storeState) => !storeState.finished)) {
-                    throw new Error('服务器对象存储数据不完整。');
-                }
-                if (current.db) current.db.close();
-                const missingStores = current.knownDb.stores.filter((storeName) => !current.stores.has(storeName));
-                if (!this.validateOnly && missingStores.length > 0) {
-                    await clearKnownIndexedDbStores(current.knownDb, missingStores);
-                }
-            }
-            this.currentDatabase = null;
-        }
-
-        async finish() {
-            if (this.finished) throw new Error('服务器同步恢复已结束。');
-            if (this.currentDatabase) throw new Error('服务器数据库数据不完整。');
-            this.finishLocalStorage();
-            if (this.entryCount !== this.expectedEntryCount) {
-                throw new Error('服务器同步对象数量校验失败。');
-            }
-            if (!this.validateOnly) {
-                for (const knownDb of CONFIG.knownDatabases) {
-                    if (!this.seenDatabases.has(knownDb.name)) {
-                        await clearKnownIndexedDbStores(knownDb, knownDb.stores);
+    function scheduleBackgroundPrepare(delayMs = 8000) {
+        if (RESTORE_PAGE) return;
+        if (prepareTimer) clearTimeout(prepareTimer);
+        prepareTimer = setTimeout(() => {
+            prepareTimer = null;
+            if (!isBackgroundPrepareAllowed()) return;
+            const run = async () => {
+                backgroundYield = true;
+                try {
+                    await runPrepareOnce(2, 96);
+                } catch (error) {
+                    if (error?.indexInvalid) {
+                        // 索引缺失/过期：后台静默完整重建（只读本地数据），
+                        // 上传路径从此不再遇到"需要人工重建"。
+                        requestExplicitRebuild();
+                        await runPrepareOnce(2, 96);
+                        return;
                     }
+                    throw error;
+                } finally {
+                    backgroundYield = false;
                 }
-            }
-            this.finished = true;
-        }
-
-        abort() {
-            if (this.currentDatabase?.db) this.currentDatabase.db.close();
-            this.currentDatabase = null;
-        }
-    }
-
-    async function parsePackSnapshot(packSource, packCount, consumer, options = {}) {
-        const decoder = new TextDecoder('utf-8', { fatal: true });
-        let completed = 0;
-        let fragments = [];
-        let fragmentBytes = 0;
-        let previousBucket = null;
-        for await (const pack of packSource) {
-            if (previousBucket !== pack.bucketKey && fragmentBytes) {
-                throw new Error('服务器同步分片记录不完整。');
-            }
-            previousBucket = pack.bucketKey;
-            let count = 0;
-            let offset = 0;
-            while (offset < pack.bytes.byteLength) {
-                const end = pack.bytes.indexOf(10, offset);
-                const piece = pack.bytes.subarray(offset, end === -1 ? pack.bytes.byteLength : end);
-                fragmentBytes += piece.byteLength;
-                if (fragmentBytes > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('服务器单条数据超过 64MiB 上限。');
-                fragments.push(piece);
-                if (end === -1) break;
-                let bytes = fragments[0];
-                if (fragments.length > 1) {
-                    bytes = new Uint8Array(fragmentBytes);
-                    let position = 0;
-                    for (const fragment of fragments) { bytes.set(fragment, position); position += fragment.byteLength; }
-                }
-                let value;
-                try { value = JSON.parse(decoder.decode(bytes)); }
-                catch (_) { throw new Error('服务器同步数据包 JSON 不正确。'); }
-                fragments = [];
-                fragmentBytes = 0;
-                await consumer.consume(value, pack, bytes);
-                count += 1;
-                offset = end + 1;
-            }
-            if (count !== pack.entryCount) throw new Error('服务器同步数据包记录数量不一致。');
-            if (typeof consumer.packComplete === 'function') await consumer.packComplete(pack);
-            completed += 1;
-            if (typeof options.onProgress === 'function') options.onProgress(completed, packCount);
-        }
-        if (completed !== packCount) throw new Error('服务器同步数据包数量不一致。');
-        if (fragmentBytes || fragments.length) throw new Error('服务器同步记录尚未结束。');
-        await consumer.finish();
-    }
-
-    // entry 传入时复用已算好的 id/group/sourceKey/bucketKey（恢复热路径
-    // buildCacheEntry 刚算过同一套值），缺省时从 value 现算。
-    function assertPackEntryPlacement(value, pack, entry = null) {
-        const group = entry?.group ?? snapshotEntryGroup(value);
-        const bucketKey = entry?.bucketKey ?? snapshotEntryBucket(
-            value, snapshotEntryId(value), snapshotEntrySource(value)
-        );
-        if (group !== pack.group || bucketKey !== pack.bucketKey) {
-            throw new Error('服务器同步分片索引不一致。');
-        }
-    }
-
-    function manifestPackTuple(pack) {
-        return [
-            String(pack.bucketKey),
-            String(pack.group),
-            Number(pack.part),
-            String(pack.checksum).toLowerCase(),
-            Number(pack.length),
-            Number(pack.entryCount)
-        ];
-    }
-
-    function buildManifestPageChecksumSource(pageIndex, previousPageHash, packs) {
-        return JSON.stringify([
-            MANIFEST_PAGE_FORMAT,
-            pageIndex,
-            previousPageHash,
-            packs.map(manifestPackTuple)
-        ]);
-    }
-
-    function buildPackSnapshotChecksumSource(snapshot) {
-        return JSON.stringify([
-            SNAPSHOT_FORMAT,
-            SNAPSHOT_SCHEMA_VERSION,
-            Number(snapshot.totalBytes || 0),
-            Number(snapshot.packCount || 0),
-            Number(snapshot.entryCount || 0),
-            Number(snapshot.pageCount || 0),
-            String(snapshot.pageRoot || MANIFEST_CHAIN_SEED),
-            String(snapshot.bloomChecksum || '')
-        ]);
-    }
-
-    function bloomIndexes(checksum) {
-        const bitCount = GC_BLOOM_BYTES * 8;
-        return [0, 8, 16, 24].map(offset => parseInt(checksum.slice(offset, offset + 8), 16) % bitCount);
-    }
-
-    function buildPackBloom(packManifest) {
-        const bloom = new Uint8Array(GC_BLOOM_BYTES);
-        for (const pack of packManifest) {
-            for (const bit of bloomIndexes(pack.checksum)) bloom[bit >>> 3] |= 1 << (bit & 7);
-        }
-        return bloom;
-    }
-
-    async function addPagedManifestMetadata(snapshot) {
-        let previousPageHash = MANIFEST_CHAIN_SEED;
-        const pageCount = Math.ceil(snapshot.packManifest.length / MANIFEST_PAGE_PACKS);
-        for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-            const packs = snapshot.packManifest.slice(
-                pageIndex * MANIFEST_PAGE_PACKS,
-                (pageIndex + 1) * MANIFEST_PAGE_PACKS
-            );
-            previousPageHash = await sha256(buildManifestPageChecksumSource(pageIndex, previousPageHash, packs));
-        }
-        const bloom = buildPackBloom(snapshot.packManifest);
-        snapshot.pageCount = pageCount;
-        snapshot.pageRoot = previousPageHash;
-        snapshot.bloomChecksum = await sha256Bytes(bloom);
-        snapshot.checksum = await sha256(buildPackSnapshotChecksumSource(snapshot));
-    }
-
-    async function validateRemotePackManifest(remote) {
-        if (remote?.snapshotFormat !== SNAPSHOT_FORMAT
-            || Number(remote?.schemaVersion) !== SNAPSHOT_SCHEMA_VERSION) {
-            throw new Error('服务器同步格式不受支持。');
-        }
-        const packCount = Number(remote.packCount);
-        const entryCount = Number(remote.entryCount);
-        const totalBytes = Number(remote.totalBytes);
-        const pageCount = Number(remote.pageCount);
-        const pageRoot = String(remote.pageRoot || '').toLowerCase();
-        const bloomChecksum = String(remote.bloomChecksum || '').toLowerCase();
-        const emptySnapshot = packCount === 0 && entryCount === 0 && totalBytes === 0 && pageCount === 0;
-        if (!Number.isInteger(packCount) || packCount < 0 || packCount > CONFIG.maxPackCount
-            || !Number.isInteger(entryCount) || entryCount < 0 || entryCount > 10_000_000
-            || !Number.isInteger(totalBytes) || totalBytes < 0 || totalBytes > CONFIG.maxSnapshotBytes
-            || !Number.isInteger(pageCount) || pageCount !== Math.ceil(packCount / MANIFEST_PAGE_PACKS)
-            || !/^[a-f0-9]{64}$/.test(pageRoot) || !/^[a-f0-9]{64}$/.test(bloomChecksum)) {
-            throw new Error('服务器同步根清单异常。');
-        }
-        if ((!emptySnapshot && (packCount === 0 || entryCount === 0 || totalBytes === 0))
-            || (emptySnapshot && pageRoot !== MANIFEST_CHAIN_SEED)) {
-            throw new Error('服务器空快照字段必须同时为空。');
-        }
-        const rootChecksum = await sha256(buildPackSnapshotChecksumSource({
-            totalBytes, packCount, entryCount, pageCount, pageRoot, bloomChecksum
-        }));
-        if (String(remote.checksum || '').toLowerCase() !== rootChecksum) {
-            throw new Error('服务器同步根清单校验失败。');
-        }
-
-        const packManifest = [];
-        let previousPageHash = MANIFEST_CHAIN_SEED;
-        // 滑动窗口：始终维持 downloadPackConcurrency 个在途页请求。哈希链
-        // 要求按页序校验，所以按序 await；旧版批间串行——批内全部完成才
-        // 发下一批，网络往返无法重叠。
-        const concurrency = CONFIG.downloadPackConcurrency;
-        let nextToFetch = 0;
-        const inflight = new Map();
-        const startNext = () => {
-            if (nextToFetch >= pageCount) return;
-            const pageIndex = nextToFetch++;
-            const pending = postSync({
-                action: 'pull-manifest-page',
-                schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-                version: remote.version,
-                pageIndex
-            });
-            pending.catch(() => { });
-            inflight.set(pageIndex, pending);
-        };
-        for (let i = 0; i < concurrency && nextToFetch < pageCount; i += 1) startNext();
-        try {
-            for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-                const page = await inflight.get(pageIndex);
-                inflight.delete(pageIndex);
-                startNext();
-                if (Number(page.pageIndex) !== pageIndex || page.previousPageHash !== previousPageHash
-                    || !Array.isArray(page.packs)) throw new Error('服务器同步清单页顺序异常。');
-                const normalized = page.packs.map(pack => ({
-                    bucketKey: String(pack?.bucketKey || ''),
-                    group: String(pack?.group || ''),
-                    part: Number(pack?.part),
-                    checksum: String(pack?.checksum || '').toLowerCase(),
-                    length: Number(pack?.length),
-                    entryCount: Number(pack?.entryCount)
-                }));
-                const expectedPageHash = await sha256(buildManifestPageChecksumSource(
-                    pageIndex, previousPageHash, normalized
-                ));
-                if (page.pageHash !== expectedPageHash) throw new Error('服务器同步清单页校验失败。');
-                previousPageHash = expectedPageHash;
-                packManifest.push(...normalized);
-            }
-        } finally {
-            // 校验异常提前退出时，放弃在途请求，不产生未处理拒绝。
-            for (const pending of inflight.values()) pending.catch(() => { });
-        }
-        if (previousPageHash !== pageRoot || packManifest.length !== packCount) {
-            throw new Error('服务器同步清单页根不一致。');
-        }
-
-        let manifestBytes = 0;
-        let manifestEntries = 0;
-        const bucketParts = new Map();
-        for (const pack of packManifest) {
-            if (!pack.bucketKey || pack.bucketKey.length > 4000 || !pack.group || pack.group.length > 1000
-                || !Number.isInteger(pack.part) || pack.part < 0
-                || !/^[a-f0-9]{64}$/.test(pack.checksum)
-                || !Number.isInteger(pack.length) || pack.length <= 0 || pack.length > CONFIG.targetPackBytes
-                || !Number.isInteger(pack.entryCount) || pack.entryCount < 0 || pack.entryCount > CONFIG.maxPackEntries) {
-                throw new Error('服务器同步数据包清单异常。');
-            }
-            const bucketState = bucketParts.get(pack.bucketKey) || { group: pack.group, nextPart: 0 };
-            if (bucketState.group !== pack.group || pack.part !== bucketState.nextPart) {
-                throw new Error('服务器同步数据包顺序异常。');
-            }
-            bucketState.nextPart += 1;
-            bucketParts.set(pack.bucketKey, bucketState);
-            manifestBytes += pack.length;
-            manifestEntries += pack.entryCount;
-        }
-        if (manifestBytes !== totalBytes || manifestEntries !== entryCount) {
-            throw new Error('服务器同步清单合计不一致。');
-        }
-        return packManifest;
-    }
-
-    async function restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState) {
-        const cacheDb = await openLocalSyncCache();
-        const restorer = new ObjectSnapshotRestorer(remote.entryCount);
-        let pendingEntries = [];
-        let pendingBytes = 0;
-        let pendingPacks = [];
-        let entryCount = 0;
-        const flushEntries = async () => {
-            if (pendingEntries.length === 0) return;
-            const entries = pendingEntries;
-            pendingEntries = [];
-            pendingBytes = 0;
-            await cacheWriteEntries(cacheDb, entries);
-        };
-        const flushPacks = async () => {
-            if (pendingPacks.length === 0) return;
-            const packs = pendingPacks;
-            pendingPacks = [];
-            await cacheWritePacks(cacheDb, packs);
-        };
-
-        try {
-            await cacheClear(cacheDb);
-            await parsePackSnapshot(
-                iterateStagedSnapshotPacks(stagingDb, packManifest),
-                packManifest.length,
-                {
-                    async consume(value, pack, lineBytes) {
-                        await restorer.consume(value);
-                        const entry = buildCacheEntry(value, lineBytes);
-                        // 恢复热路径：placement 断言直接复用 entry 的派生字段。
-                        assertPackEntryPlacement(value, pack, entry);
-                        entry.bucketKey = pack.bucketKey;
-                        pendingEntries.push(entry);
-                        pendingBytes += entry.bytes.byteLength;
-                        entryCount += 1;
-                        if (pendingBytes >= CONFIG.cacheWriteBytes || pendingEntries.length >= CONFIG.readBatchSize) {
-                            await flushEntries();
-                        }
-                    },
-                    async packComplete(pack) {
-                        pendingPacks.push({ checksum: pack.checksum, bytes: pack.bytes });
-                        if (pendingPacks.length >= CONFIG.downloadPackConcurrency) await flushPacks();
-                    },
-                    async finish() {
-                        await restorer.finish();
-                        await flushEntries();
-                        await flushPacks();
-                    }
-                },
-                {
-                    onProgress: (completed, total) => {
-                        updateProgress(72 + Math.round((completed / total) * 27), '正在恢复…');
-                    }
-                }
-            );
-            if (entryCount !== Number(remote.entryCount)) {
-                throw new Error('服务器同步缓存记录数量不一致。');
-            }
-            const snapshot = {
-                snapshotFormat: SNAPSHOT_FORMAT,
-                schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-                packCount: Number(remote.packCount),
-                entryCount: Number(remote.entryCount),
-                totalBytes: Number(remote.totalBytes),
-                pageCount: Number(remote.pageCount),
-                pageRoot: String(remote.pageRoot).toLowerCase(),
-                bloomChecksum: String(remote.bloomChecksum).toLowerCase(),
-                packManifest: packManifest.map(pack => ({ ...pack })),
-                checksum: String(remote.checksum).toLowerCase()
             };
-            await cacheWriteState(cacheDb, {
-                version: CACHE_FORMAT_VERSION,
-                groups: [...new Set(packManifest.map(pack => pack.group))],
-                packs: packManifest.map(pack => ({ ...pack })),
-                epoch: localStorage.getItem(TRACKING_EPOCH_KEY),
-                epochs: dirtyState.epochs,
-                snapshot
-            });
-            await window.RPH_SYNC_TRACKER.acknowledge(dirtyState.watermark);
-        } catch (error) {
-            restorer.abort();
-            await cacheClearDerived(cacheDb);
-            throw error;
-        } finally {
-            cacheDb.close();
-        }
+            run().catch(() => { /* 后台准备失败静默，上传路径兜底 */ });
+        }, delayMs);
     }
 
-    async function restorePackSnapshot(remote) {
-        const packManifest = await validateRemotePackManifest(remote);
-        const stagingDb = await openDownloadStagingDb();
-
-        try {
-            const validator = new ObjectSnapshotRestorer(remote.entryCount, { validateOnly: true });
-            await parsePackSnapshot(
-                downloadPacksToStaging(remote, packManifest, stagingDb),
-                packManifest.length,
-                {
-                    async consume(value, pack) {
-                        assertPackEntryPlacement(value, pack);
-                        await validator.consume(value);
-                    },
-                    async finish() { await validator.finish(); }
-                }
-            );
-            updateProgress(72, '正在恢复…');
-            const restoreEpoch = crypto.randomUUID();
-            // 写冻结信号先于任何业务库写入：其他标签页收到 storage 事件后
-            // 暂停写入并显示恢复遮罩；本标签页由 waitForIndexedDbWriteBarrier
-            // 等待在途写事务收尾。恢复中途失败时保留该标记（其他标签页
-            // 维持写冻结），由中断恢复流程接管或完整重试后清除。
-            localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
-            localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
-            await waitForIndexedDbWriteBarrier();
-            // 一次 readDirtyState 同时供恢复水印（acknowledge）与
-            // 缓存 epochs 使用，避免恢复路径重复全量扫描变更日志。
-            const dirtyState = await readDirtyState();
-            await restoreSnapshotAndCache(stagingDb, packManifest, remote, dirtyState);
-            if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
-                localStorage.removeItem(RESTORE_ACTIVE_KEY);
-            }
-        } finally {
-            try { await clearDownloadStagingStore(stagingDb); } catch (_) { }
-            stagingDb.close();
+    // 上传前的准备：先等在飞的后台准备收尾（避免并发写缓存），随后再跑一次
+    // 增量——后台刚完成时差分为空、瞬间完成，同时保证覆盖最新写入。等待期间
+    // 解除后台低占空比：用户已明确要上传，剩余增量全速完成。
+    async function prepareForUpload(progressStart, progressEnd) {
+        if (prepareInFlight) {
+            backgroundYield = false;
+            await prepareInFlight.catch(() => { });
         }
+        if (prepareTimer) {
+            clearTimeout(prepareTimer);
+            prepareTimer = null;
+        }
+        return runPrepareOnce(progressStart, progressEnd);
     }
 
+    // ---- 网络层 ----
     function buildSyncHeaders(options = {}, withContentType = true) {
         const headers = withContentType ? { 'content-type': 'application/json' } : {};
         const password = typeof options.password === 'string' ? options.password : getStoredSyncPassword();
@@ -2717,9 +1911,6 @@ function createAutoSaveScheduler(options = {}) {
         const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : CONFIG.requestTimeoutMs;
         const abortMessage = options.abortMessage || '同步请求超时，请检查网络后重试。';
         let lastError = null;
-
-        // 循环体每轮必 return/throw（重试次数耗尽时在 catch 内抛出），无需
-        // 兜底返回；retryCount 由调用方约束为非负整数。
         for (let attempt = 0; ; attempt += 1) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -2752,30 +1943,59 @@ function createAutoSaveScheduler(options = {}) {
         );
     }
 
-    // JSON 与二进制拉取共用的请求发出：同一 endpoint、同一 header 构造、
-    // 同一 body 序列化，响应体留给调用方按需消费。
-    function sendSyncRequest(payload, options, signal) {
-        return fetch(CONFIG.apiEndpoint, {
-            method: 'POST',
-            headers: buildSyncHeaders(options),
-            body: JSON.stringify(payload),
-            credentials: 'same-origin',
-            signal
-        });
-    }
-
     async function postSync(payload, options = {}) {
         return withSyncRetry(options, async signal => {
-            const response = await sendSyncRequest(payload, options, signal);
+            const response = await fetch(CONFIG.apiEndpoint, {
+                method: 'POST',
+                headers: buildSyncHeaders(options),
+                body: JSON.stringify(payload),
+                credentials: 'same-origin',
+                signal
+            });
             const data = await response.json().catch(() => ({}));
             if (!response.ok || !data.ok) throwSyncHttpError(response, data, options.keepPasswordOnAuthError);
             return data;
         });
     }
 
-    async function postSyncBinary(payload, options = {}) {
-        return withSyncRetry(options, async signal => {
-            const response = await sendSyncRequest(payload, options, signal);
+    // 分片上传：PUT gzip 字节，服务端流式直通 R2；204 = 新建或幂等命中。
+    async function putPack(pack, bytes) {
+        const params = new URLSearchParams({
+            checksum: pack.checksum,
+            length: String(pack.length),
+            entries: String(pack.entryCount)
+        });
+        return withSyncRetry({
+            timeoutMs: CONFIG.packTransferTimeoutMs,
+            abortMessage: '上传超时，请检查网络后重试。'
+        }, async signal => {
+            const response = await fetch(`${CONFIG.packEndpoint}?${params.toString()}`, {
+                method: 'PUT',
+                headers: {
+                    ...buildSyncHeaders({}, false),
+                    'content-type': 'application/gzip'
+                },
+                body: bytes,
+                credentials: 'same-origin',
+                signal
+            });
+            if (response.status === 204) return;
+            throwSyncHttpError(response, await response.json().catch(() => ({})));
+        });
+    }
+
+    // 分片下载：GET gzip 字节；内容寻址 + 边缘缓存，客户端按清单校验和验证。
+    async function getPack(checksum, options = {}) {
+        return withSyncRetry({
+            timeoutMs: CONFIG.packTransferTimeoutMs,
+            abortMessage: '下载超时，请检查网络后重试。'
+        }, async signal => {
+            const response = await fetch(`${CONFIG.packEndpoint}?c=${encodeURIComponent(checksum)}`, {
+                method: 'GET',
+                headers: buildSyncHeaders({}, false),
+                credentials: 'same-origin',
+                signal
+            });
             if (!response.ok) {
                 throwSyncHttpError(response, await response.json().catch(() => ({})), options.keepPasswordOnAuthError);
             }
@@ -2783,207 +2003,218 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
-    // 二进制上传（upload-pack/upload-bloom）共用的 octet-stream POST：
-    // 地址带 query、成功返回空体 204。
-    async function postBinaryToQuery(params, body, options = {}) {
-        return withSyncRetry(options, async signal => {
-            const response = await fetch(`${CONFIG.apiEndpoint}?${params.toString()}`, {
-                method: 'POST',
-                headers: {
-                    ...buildSyncHeaders({}, false),
-                    'content-type': 'application/octet-stream'
-                },
-                body,
-                credentials: 'same-origin',
-                signal
-            });
-            if (!response.ok) {
-                throwSyncHttpError(response, await response.json().catch(() => ({})));
-            }
-        });
-    }
-
-    async function postUploadPack(records, uploadId) {
-        if (!Array.isArray(records) || records.length !== 1) throw new Error('每次只能上传一个同步分片。');
-        const record = records[0];
-        const body = record.bytes;
-        record.bytes = null;
-        const params = new URLSearchParams({
-            action: 'upload-pack',
-            uploadId,
-            checksum: record.checksum,
-            length: String(record.length),
-            entryCount: String(record.entryCount)
-        });
-        return postBinaryToQuery(params, body, {
-            timeoutMs: CONFIG.packTransferTimeoutMs,
-            abortMessage: '上传超时，请检查网络后重试。'
-        });
-    }
-
-    async function postUploadBloom(uploadId, bloom) {
-        const params = new URLSearchParams({ action: 'upload-bloom', uploadId });
-        return postBinaryToQuery(params, bloom, {
-            timeoutMs: CONFIG.packTransferTimeoutMs,
-            abortMessage: '同步过滤器上传超时，请检查网络后重试。'
-        });
-    }
-
-
+    // ---- 快照准备（journal → 缓存差分 → 分片清单）----
     async function prepareLocalSnapshot(progressStart, progressEnd) {
         const cacheDb = await openLocalSyncCache();
         try {
-            const dirty = await readDirtyState();
-            let state = await cacheReadState(cacheDb);
+            const local = await cacheReadState(cacheDb);
             const rebuild = localStorage.getItem('rp_sync_rebuild_requested') === '1';
+            // 增量消费：有可用本地索引时只扫描上次消费水位之后的新事件——
+            // 历史事件早已差分进缓存，重放只会靠字节比较幂等地空转。重建/首建
+            // 走全量扫描（相对全量数据读取可忽略；换新日志后旧水位不可复用，
+            // 必须重新建立）。journalWatermark 失效于 version/epoch/reset 检查：
+            // 一旦索引被判过期整体作废，不会把旧索引下的消费进度写回。
+            const incremental = Boolean(local) && !rebuild;
+            const afterDatabases = incremental ? local?.journalWatermark?.databases || null : null;
+            const dirty = await readDirtyState(afterDatabases);
             const epoch = localStorage.getItem(TRACKING_EPOCH_KEY);
-            const journalReset = state?.epochs && Object.entries(state.epochs).some(([name, value]) => dirty.epochs[name] !== value);
-            if (!rebuild && state && (state?.version !== CACHE_FORMAT_VERSION || !state.snapshot || state.epoch !== epoch || journalReset)) {
+            const journalReset = local?.epochs && Object.entries(local.epochs).some(([name, value]) => dirty.epochs[name] !== value);
+            if (!rebuild && local && (local?.version !== CACHE_FORMAT_VERSION || !local.snapshot || local.epoch !== epoch || journalReset)) {
                 const error = new Error('本地同步索引缺失、过期或追踪已重置，需要完整重建索引后才能继续上传（只读本地数据，不会覆盖云端）。');
                 error.indexInvalid = true;
                 throw error;
             }
-            let result;
-            if (rebuild || !state) {
-                result = await buildFullCachedSnapshot(cacheDb, progressStart, progressEnd);
-            } else {
-                result = await updateCachedSnapshot(cacheDb, state, dirty);
-            }
-            state = result.state;
-            state.epoch = epoch;
-            state.epochs = dirty.epochs;
-            await cacheWriteState(cacheDb, state);
+            const result = rebuild || !local
+                ? await buildFullCachedSnapshot(cacheDb, progressStart, progressEnd)
+                : await updateCachedSnapshot(cacheDb, local, dirty);
+            // 消费水位推进到本次扫描末端：本次读取/差分已覆盖其全部效果；期间
+            // 新到的事件键值必然更大，下轮增量补上。合并 afterDatabases 同时让
+            // acknowledge 覆盖"以前消费过但上传未成功"的旧段——增量扫描没扫到
+            // 新事件时它不出现，漏合并会让那段日志永远无法确认删除。
+            const consumedDatabases = incremental
+                ? { ...afterDatabases, ...dirty.watermark.databases }
+                : { ...dirty.watermark.databases };
+            result.journalWatermark = { databases: consumedDatabases };
+            result.epoch = epoch;
+            result.epochs = dirty.epochs;
+            await cacheWriteState(cacheDb, result);
             localStorage.removeItem('rp_sync_rebuild_requested');
-            await pruneCachedPacks(cacheDb, state.snapshot.packManifest);
-            return { snapshot: state.snapshot, watermark: dirty.watermark };
+            await pruneCachedPacks(cacheDb, result.packs);
+            return { local: result, watermark: { databases: consumedDatabases, intents: dirty.watermark.intents } };
         } finally {
             cacheDb.close();
         }
     }
 
-    async function runGcMaintenance() {
-        const deadline = Date.now() + 3000;
-        for (let step = 0; step < 8 && Date.now() < deadline; step += 1) {
-            const result = await postSync({ action: 'gc-step' }, {
-                retryCount: 0,
-                timeoutMs: Math.max(1, deadline - Date.now())
-            });
-            if (result.done) return false;
+    // commit 请求体里的根清单：与服务端 normalizeManifest 的 canonical 源
+    // 完全一致（字段顺序、packs 元组顺序都固定；对外字段名为 entries）。
+    // 校验和只覆盖内容（不含 version/updatedAt），同一内容重建根校验和恒定。
+    function manifestChecksumSource(root) {
+        return JSON.stringify([
+            SNAPSHOT_FORMAT,
+            root.compression,
+            root.totalBytes,
+            root.entryCount,
+            root.packs.map(pack => [pack.bucket, pack.checksum, pack.length, pack.entries])
+        ]);
+    }
+
+    async function buildRootManifest(local, remoteVersion) {
+        const root = {
+            format: SNAPSHOT_FORMAT,
+            version: Number(remoteVersion || 0) + 1,
+            updatedAt: Date.now(),
+            compression: SNAPSHOT_COMPRESSION,
+            totalBytes: local.packs.reduce((sum, pack) => sum + pack.length, 0),
+            entryCount: local.packs.reduce((sum, pack) => sum + pack.entryCount, 0),
+            packs: local.packs.map(({ bucket, checksum, length, entryCount }) => ({ bucket, checksum, length, entries: entryCount }))
+        };
+        root.checksum = await sha256(manifestChecksumSource(root));
+        return root;
+    }
+
+    // 客户端校验云端根清单：与上传侧同一 canonical 源重算校验和。
+    async function validateRemoteManifest(remote) {
+        if (remote?.format !== SNAPSHOT_FORMAT || remote.compression !== SNAPSHOT_COMPRESSION) {
+            throw new Error('服务器同步格式不受支持。');
         }
-        return true;
-    }
-
-    let gcMaintenance = null;
-    function scheduleGcMaintenance(delay = 0) {
-        if (gcMaintenance) return;
-        gcMaintenance = wait(delay).then(runGcMaintenance)
-            .catch(() => false)
-            .then(continueGc => {
-                gcMaintenance = null;
-                if (continueGc) scheduleGcMaintenance(250);
-            });
-    }
-
-    async function uploadPagedSnapshotAttempt(snapshot, baseVersion, baseChecksum, progress) {
-        const bloom = buildPackBloom(snapshot.packManifest);
-        const begin = await postSync({
-            action: 'begin-upload',
-            baseVersion,
-            baseChecksum,
-            checksum: snapshot.checksum,
-            bloomChecksum: snapshot.bloomChecksum,
-            snapshotFormat: snapshot.snapshotFormat,
-            schemaVersion: snapshot.schemaVersion,
-            packCount: snapshot.packCount,
-            entryCount: snapshot.entryCount,
-            totalBytes: snapshot.totalBytes,
-            pageCount: snapshot.pageCount,
-            pageRoot: snapshot.pageRoot
-        }, { timeoutMs: CONFIG.commitTimeoutMs });
-        if (begin.committed) return begin.remote;
-        const uploadId = begin.uploadId;
-        await postUploadBloom(uploadId, bloom);
-        // 本地分片缓存连接按需懒开、整个上传会话复用：旧实现每缺片页各开
-        // 一次 IndexedDB，大库恢复续传时反复付开库开销；分片齐全的常见
-        // 续传路径则一次都不用开。
-        let cacheDb = null;
-        // 本次上传中服务端已存在、因而没有重新写入的包。finalize 只对
-        // 这些包做存在性复核，避免 GC 在会话保护建立前误删旧对象。
-        const reusedPacks = [];
-        try {
-            for (let pageIndex = Number(begin.nextPage || 0); pageIndex < snapshot.pageCount; pageIndex += 1) {
-                const packs = snapshot.packManifest.slice(
-                    pageIndex * MANIFEST_PAGE_PACKS,
-                    (pageIndex + 1) * MANIFEST_PAGE_PACKS
-                );
-                let pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
-                    timeoutMs: CONFIG.commitTimeoutMs
-                });
-                const missing = new Set(
-                    Array.isArray(pageResult.missingPacks) ? pageResult.missingPacks : []
-                );
-                if (missing.size) {
-                    const pageStart = progress.uploadStart + Math.round(
-                        (pageIndex / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
-                    );
-                    const pageEnd = progress.uploadStart + Math.round(
-                        ((pageIndex + 1) / Math.max(1, snapshot.pageCount)) * (progress.uploadEnd - progress.uploadStart)
-                    );
-                    const pageBytes = packs.reduce((sum, pack) => sum + pack.length, 0);
-                    if (!cacheDb) cacheDb = await openLocalSyncCache();
-                    await uploadCachedSnapshot(
-                        packs.filter(pack => missing.has(pack.checksum)),
-                        uploadId,
-                        pageBytes,
-                        pageStart,
-                        pageEnd,
-                        cacheDb
-                    );
-                    pageResult = await postSync({ action: 'upload-manifest-page', uploadId, pageIndex, packs }, {
-                        timeoutMs: CONFIG.commitTimeoutMs
-                    });
-                    if (pageResult.missingPacks?.length) throw new Error('服务器仍缺少刚上传的同步分片。');
-                }
-                for (const pack of packs) {
-                    if (!missing.has(pack.checksum)) reusedPacks.push(pack.checksum);
-                }
-                const ratio = snapshot.pageCount ? (pageIndex + 1) / snapshot.pageCount : 1;
-                updateProgress(progress.uploadStart + Math.round(ratio * (progress.commit - progress.uploadStart)), '正在分页校验…');
-            }
-        } finally {
-            cacheDb?.close();
+        if (!Array.isArray(remote.packs) || remote.packs.length > CONFIG.maxPackCount) {
+            throw new Error('服务器同步根清单异常。');
         }
-        const finalized = await postSync({ action: 'finalize-upload', uploadId, reusedPacks }, {
-            retryCount: 1,
-            timeoutMs: CONFIG.commitTimeoutMs
-        });
-        return finalized.remote;
+        let totalBytes = 0;
+        let entryCount = 0;
+        for (const pack of remote.packs) {
+            const entries = Number(pack.entries);
+            if (!pack.bucket || String(pack.bucket).length > 4000
+                || !/^[a-f0-9]{64}$/.test(String(pack.checksum || '').toLowerCase())
+                || !Number.isInteger(pack.length) || pack.length <= 0 || pack.length > 6 * 1024 * 1024
+                || !Number.isInteger(entries) || entries < 0 || entries > CONFIG.maxPackEntries) {
+                throw new Error('服务器同步数据包清单异常。');
+            }
+            totalBytes += pack.length;
+            entryCount += entries;
+        }
+        if (totalBytes !== Number(remote.totalBytes) || entryCount !== Number(remote.entryCount)) {
+            throw new Error('服务器同步清单合计不一致。');
+        }
+        if (Number(remote.totalBytes) > CONFIG.maxSnapshotBytes) {
+            throw new Error(`服务器数据太大：${remote.totalBytes}/${CONFIG.maxSnapshotBytes}。`);
+        }
+        const normalized = {
+            format: SNAPSHOT_FORMAT,
+            version: Number(remote.version),
+            updatedAt: Number(remote.updatedAt),
+            compression: SNAPSHOT_COMPRESSION,
+            totalBytes,
+            entryCount,
+            // 保留线上字段名 entries：与 manifestChecksumSource 一致；
+            // 消费处（下载/恢复）按需转成内部 entryCount 命名。
+            packs: remote.packs.map(pack => ({
+                bucket: String(pack.bucket),
+                checksum: String(pack.checksum).toLowerCase(),
+                length: pack.length,
+                entries: Number(pack.entries)
+            }))
+        };
+        const checksum = await sha256(manifestChecksumSource(normalized));
+        if (String(remote.checksum || '').toLowerCase() !== checksum) {
+            throw new Error('服务器同步根清单校验失败。');
+        }
+        // 校验通过的根校验和必须带回：后续"无变化"判等依赖它。
+        normalized.checksum = checksum;
+        return normalized;
     }
 
-    // cacheDb 由调用方（uploadPagedSnapshotAttempt）按需打开并统一关闭，
-    // 本函数只借用：一次会话可能因多页缺片进入多次。
-    async function uploadCachedSnapshot(packSource, uploadId, totalBytes, progressStart, progressEnd, cacheDb) {
-        const engine = window.RPH_SYNC_UPLOAD_ENGINE;
-        if (!engine?.runBoundedUpload) throw new Error('上传引擎未就绪，请刷新页面后重试。');
-        await engine.runBoundedUpload({
-            items: packSource,
-            concurrency: CONFIG.uploadBatchConcurrency,
-            maxItems: CONFIG.uploadBatchMaxPacks,
-            maxBytes: CONFIG.uploadBatchMaxBytes,
-            read: async pack => {
-                const bytes = await cachePack(cacheDb, pack.checksum);
-                if (!bytes || bytes.byteLength !== pack.length) {
-                    await cacheWriteState(cacheDb, null);
-                    throw new Error('本地同步缓存不完整，请重新上传。');
-                }
-                return { bytes };
-            },
-            send: records => postUploadPack(records, uploadId),
-            onBatchSuccess: ({ bytes }) => {
-                const ratio = totalBytes > 0 ? Math.min(1, bytes / totalBytes) : 1;
-                updateProgress(progressStart + Math.round(ratio * (progressEnd - progressStart)), '正在按分片上传…');
+    // ---- 上传 ----
+    // 分片元数据预检：任何非法 entryCount/length/checksum 在客户端立即失败
+    // 并携带完整诊断信息，而不是得到服务端一句泛化的 409。
+    function assertPackMetadata(pack) {
+        const bad = reason => {
+            throw new Error(`本地分片元数据异常（${reason}）：${JSON.stringify({
+                bucket: pack.bucket, checksum: pack.checksum, length: pack.length, entryCount: pack.entryCount
+            })}；请重建本地索引后重试。`);
+        };
+        if (!pack.bucket || String(pack.bucket).length > 4000) bad('bucket');
+        if (!/^[a-f0-9]{64}$/.test(String(pack.checksum || '').toLowerCase())) bad('checksum');
+        if (!Number.isInteger(pack.length) || pack.length <= 0 || pack.length > 6 * 1024 * 1024) bad('length');
+        // entryCount 允许 0：单条记录超过分片缓冲时 buildCachedPacks 先落
+        // 纯字节填充片，记录本体跨片拼接，恢复端按行重组。
+        if (!Number.isInteger(pack.entryCount) || pack.entryCount < 0 || pack.entryCount > CONFIG.maxPackEntries) bad('entryCount');
+    }
+
+    async function uploadPacks(cacheDb, local, progress, uploadedSet = null) {
+        const engine = globalThis.RPH_SYNC_UPLOAD_ENGINE;
+        if (!engine?.mapPool) throw new Error('上传引擎未就绪，请刷新页面后重试。');
+        let uploadedBytes = 0;
+        await engine.mapPool(local.packs, CONFIG.uploadConcurrency, async pack => {
+            assertPackMetadata(pack);
+            // 同一次上传会话内已确认的分片跳过（commit 缺包重传时复用）。
+            if (uploadedSet?.has(pack.checksum)) return;
+            const bytes = await cachePack(cacheDb, pack.checksum);
+            if (!bytes || bytes.byteLength !== pack.length) {
+                await cacheWriteState(cacheDb, null);
+                throw new Error('本地同步缓存不完整，请重新上传。');
             }
+            await putPack(pack, bytes);
+            uploadedSet?.add(pack.checksum);
+            uploadedBytes += pack.length;
+            const ratio = local.snapshot.totalBytes > 0
+                ? Math.min(1, uploadedBytes / local.snapshot.totalBytes)
+                : 1;
+            updateProgress(progress.uploadStart + Math.round(ratio * (progress.uploadEnd - progress.uploadStart)), '正在按分片上传…');
         });
+    }
+
+    // commit：全部包已在云端后 CAS 切根。409 missing 时按【整桶】重建分片
+    // 并重传（gzip 字节可能与上次不同，校验和随之更新），最多 3 轮。
+    // 返回 { checksum, reclaimed }：reclaimed 是服务端未确认删除的孤儿数，
+    // 0 表示本轮提交没有需要 sweep 兜底的残留。
+    async function commitSnapshot(cacheDb, local, remote, progress, uploadedSet) {
+        let root = await buildRootManifest(local, remote?.version || 0);
+        for (let round = 0; round < 3; round += 1) {
+            updateProgress(progress.commit, '正在提交…');
+            const result = await postSync({ action: 'commit', manifest: root }, {
+                timeoutMs: CONFIG.commitTimeoutMs,
+                retryCount: 1
+            });
+            if (result.ok) return { checksum: root.checksum, reclaimed: Number(result.reclaimed) || 0 };
+            const missing = Array.isArray(result.missing) ? result.missing : [];
+            if (!missing.length) throw new Error('服务器没有确认新快照。');
+            const missingSet = new Set(missing.map(item => String(item).toLowerCase()));
+            const missingBuckets = [...new Set(local.packs.filter(pack => missingSet.has(pack.checksum)).map(pack => pack.bucket))];
+            const missingBucketSet = new Set(missingBuckets);
+            const packBuffer = new Uint8Array(CONFIG.targetPackBytes);
+            const rebuiltByBucket = new Map();
+            for (const bucket of missingBuckets) {
+                rebuiltByBucket.set(bucket, await buildCachedPacks(cacheDb, bucket, packBuffer));
+            }
+            // 整桶替换：跳过该桶全部旧分片（含未缺失的），在首个出现位置
+            // 插入重建结果，保持组顺序不变；被替换的旧对象成为孤儿，
+            // 服务端 sweep 兜底回收。
+            const kept = [];
+            const inserted = new Set();
+            for (const pack of local.packs) {
+                if (missingBucketSet.has(pack.bucket)) {
+                    if (!inserted.has(pack.bucket)) {
+                        inserted.add(pack.bucket);
+                        kept.push(...(rebuiltByBucket.get(pack.bucket) || []));
+                    }
+                    continue;
+                }
+                kept.push(pack);
+            }
+            local.packs = orderPackItems(local, kept);
+            local.snapshot = {
+                format: SNAPSHOT_FORMAT,
+                compression: SNAPSHOT_COMPRESSION,
+                totalBytes: local.packs.reduce((sum, pack) => sum + pack.length, 0),
+                entryCount: local.packs.reduce((sum, pack) => sum + pack.entryCount, 0)
+            };
+            await cacheWriteState(cacheDb, local);
+            await uploadPacks(cacheDb, local, progress, uploadedSet);
+            root = await buildRootManifest(local, remote?.version || 0);
+        }
+        throw new Error('云端数据包反复缺失，请重新上传。');
     }
 
     function updateProgress(progress, text) {
@@ -3017,10 +2248,6 @@ function createAutoSaveScheduler(options = {}) {
     }
 
     // ---- 上次同步结果徽标 ----
-    // 放在自动保存区底行右侧（与左侧自动保存状态对称）。只存最近一次的
-    // 结果（时间戳 + 成功/失败），格式化成 "16:30 同步成功"。
-    // 今天之外的记录不写日期（用户预期就是"最近一次"，过久会显示旧时间，
-    // 可接受；避免为极简文案引入日期逻辑）。
     function readLastSync() {
         try {
             const raw = JSON.parse(localStorage.getItem(CONFIG.lastSyncKey) || 'null');
@@ -3153,8 +2380,6 @@ function createAutoSaveScheduler(options = {}) {
         return true;
     }
 
-    // 自动保存失败文案的唯一写入点：runAutomaticUpload 与调度器
-    // onError 都走这里，autoSaveLastError 与状态条保持同步。
     function reportAutoSaveFailure(error) {
         autoSaveLastError = error?.message || '自动保存失败。';
         if (isAutoSaveEnabled()) {
@@ -3234,16 +2459,11 @@ function createAutoSaveScheduler(options = {}) {
         else stopAutoSave();
     }
 
-    function getAppPersistenceProxy() {
+    async function flushAppState() {
         const proxy = window.RPH_SYNC_PERSISTENCE;
         if (!proxy || typeof proxy.manualSave !== 'function') {
             throw new Error('应用保存接口尚未就绪，请刷新页面后重试。');
         }
-        return proxy;
-    }
-
-    async function flushAppState() {
-        const proxy = getAppPersistenceProxy();
         await proxy.manualSave();
     }
 
@@ -3296,7 +2516,7 @@ function createAutoSaveScheduler(options = {}) {
         passwordModalRoot.querySelector('.rp-sync-modal__close').addEventListener('click', closePasswordModal);
         passwordModalRoot.querySelector('[data-action="cancel-password"]').addEventListener('click', closePasswordModal);
         passwordModalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', closePasswordModal);
-        passwordModalRoot.querySelector('form').addEventListener('submit', (event) => {
+        passwordModalRoot.querySelector('form').addEventListener('submit', event => {
             event.preventDefault();
             submitSyncPassword().catch(() => { });
         });
@@ -3311,15 +2531,10 @@ function createAutoSaveScheduler(options = {}) {
         setTimeout(() => passwordInput.focus(), 0);
     }
 
-    // ------------------------------------------------------------ 访问门禁 ----
-    // 站点打开时先做一次同步密码校验：已保存密码（rp_hub_sync_password_v1）
-    // 走完全静默的自动验证，通过则不出现任何登录 UI、照常进入站点；只有云端
-    // 要求密码且本地没有有效密码时（未保存过，或已失效被清空）才显示登录
-    // 锁页。验证通过的密码保留在 localStorage，同步与图片管理页照常复用，
-    // 正常使用中不再弹出密码框。云端不可达（断网/Worker 无响应，8 秒单次
-    // 预算）直接放行：门禁只是体验层，真正的数据防护始终由 Worker 端 401
-    // 承担，不能因网络故障把整站锁死。
-
+    // ---- 访问门禁 ----
+    // 站点打开时先静默校验一次同步密码：已保存密码验证通过则不出现任何
+    // 登录 UI；云端要求密码且本地无有效密码时才显示锁页。云端不可达直接
+    // 放行：门禁只是体验层，真正的数据防护由 Worker 端 401 承担。
     const LOCK_STYLE_TEXT = `
 .rp-sync-lock{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;overflow:hidden;background:linear-gradient(180deg,#f8fafc 0%,#eef2ff 52%,#faf5ff 100%);opacity:1;transition:opacity .24s ease}
 .rp-sync-lock::before,.rp-sync-lock::after{content:"";position:absolute;inset:-24%;pointer-events:none}
@@ -3376,7 +2591,7 @@ function createAutoSaveScheduler(options = {}) {
     let lockBodyOverflow = null;
     let lockVerifying = false;
     let resolveAccessGate = null;
-    const accessGateDone = new Promise((resolve) => { resolveAccessGate = resolve; });
+    const accessGateDone = new Promise(resolve => { resolveAccessGate = resolve; });
 
     function ensureLockStyle() {
         if (lockStyleInstalled) return;
@@ -3431,7 +2646,7 @@ function createAutoSaveScheduler(options = {}) {
             });
         }
         if (lockForm) {
-            lockForm.addEventListener('submit', (event) => {
+            lockForm.addEventListener('submit', event => {
                 event.preventDefault?.();
                 submitLockPassword().catch(() => { });
             });
@@ -3520,7 +2735,7 @@ function createAutoSaveScheduler(options = {}) {
             return accessGateDone;
         }
         const stored = getStoredSyncPassword();
-        getAuthStatus(stored, { retryCount: 0, timeoutMs: 8000 }).then((auth) => {
+        getAuthStatus(stored, { retryCount: 0, timeoutMs: 8000 }).then(auth => {
             if (!auth?.authRequired || auth.authenticated) {
                 resolveAccessGate();
                 return;
@@ -3543,18 +2758,15 @@ function createAutoSaveScheduler(options = {}) {
 
     async function submitSyncPassword() {
         if (checkingPassword) return;
-
         const password = passwordInput.value;
         if (!password) {
             passwordStatus.textContent = '请输入同步密码。';
             passwordInput.focus();
             return;
         }
-
         checkingPassword = true;
         passwordSubmitButton.disabled = true;
         passwordStatus.textContent = '验证中…';
-
         try {
             const result = await verifySyncPasswordCore(password, {});
             if (!result.ok) {
@@ -3701,105 +2913,106 @@ function createAutoSaveScheduler(options = {}) {
         modalRoot.classList.remove('is-open');
     }
 
+    // ---- 上传主流程 ----
     async function commitObjectSnapshot(progress, options = {}) {
         updateProgress(progress.check, '准备中…');
-        const statusResponse = await postSync({ action: 'prepare-upload', schemaVersion: SNAPSHOT_SCHEMA_VERSION }, {
+        // 无变化自动保存快速通道：journal 无新事件 + 有未过期的"上次提交校验
+        // 和"→ 数据与上次成功提交完全一致，整次跳过网络（省一次 status RTT），
+        // 只确认水位。定期（fastPathVerifyIntervalMs）放行一次完整验证，防止
+        // 云端根被外部改写后永不自愈；手动上传永远走完整流程（用户在等结果，
+        // 要确定性）。
+        if (options.automatic) {
+            const cacheDb = await openLocalSyncCache();
+            let fastPath = null;
+            try {
+                const localState = await cacheReadState(cacheDb);
+                const committed = localState?.committed;
+                if (committed?.checksum
+                    && Date.now() - Number(committed.at || 0) < CONFIG.fastPathVerifyIntervalMs
+                    && await journalIsFullyAcknowledged(localState.epochs)) {
+                    fastPath = committed;
+                }
+            } catch (_) { /* 判定失败走完整流程 */ } finally {
+                cacheDb.close();
+            }
+            if (fastPath) {
+                // 判据本身保证 journal 数字键为空、无意图键：没有待确认的
+                // 水位，直接返回（期间新落库的写入事件留在 journal，由下一
+                // 轮同步照常消费）。
+                return true;
+            }
+        }
+        // status 往返（网络）与本地快照准备（CPU/IndexedDB）互不依赖，并行跑
+        const statusPromise = postSync({ action: 'status' }, {
             timeoutMs: CONFIG.commitTimeoutMs
         });
-        let baseRemote = statusResponse.remote || null;
-        let baseVersion = Number(baseRemote?.version || 0);
-        let baseChecksum = baseRemote?.checksum || '';
-        let incremental;
+        statusPromise.catch(() => { }); // 并行期间先失败时不产生未处理拒绝
+        let prepared;
         try {
-            incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+            prepared = await prepareForUpload(progress.check, progress.uploadStart);
         } catch (err) {
             if (!err?.indexInvalid) throw err;
             // 索引过期不再要求用户离开当前流程：一次确认后自动重建并继续
-            // 上传。重建只读本地数据；云端以上传开始时的状态为基准整体替换。
+            // 上传。后台准备通常已提前完成重建，走到这里属于兜底。
             if (options.automatic) {
                 throw new Error('本地同步索引需要人工重建，请打开同步面板后重试。');
             }
-            if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据。大库可能需要几分钟。继续吗？')) {
+            if (!confirm('本地同步索引缺失、过期或追踪已重置，需要完整扫描本地数据重建索引后才能继续上传。\n\n重建只读取本地数据，不会覆盖云端。继续吗？')) {
                 if (rebuildButton) rebuildButton.style.display = '';
                 throw err;
             }
             updateProgress(progress.check, '正在完整重建本地索引…');
             requestExplicitRebuild();
-            incremental = await prepareLocalSnapshot(progress.check, progress.uploadStart);
+            prepared = await prepareForUpload(progress.check, progress.uploadStart);
         }
-        const snapshot = incremental.snapshot;
-        if (statusResponse.resetRequired) {
-            updateProgress(progress.check, '正在初始化新版同步协议…');
-            await postSync({ action: 'initialize-storage', schemaVersion: SNAPSHOT_SCHEMA_VERSION });
-            baseRemote = null;
-            baseVersion = 0;
-            baseChecksum = '';
-        }
-        if (baseRemote?.checksum === snapshot.checksum) {
-            await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
+        const { local, watermark } = prepared;
+        const statusResponse = await statusPromise;
+        const remote = statusResponse.manifest ? await validateRemoteManifest(statusResponse.manifest) : null;
+
+        // 本地快照与云端一致：只确认水位，不发起任何上传。
+        const localRoot = await buildRootManifest(local, remote?.version || 0);
+        if (remote?.checksum === localRoot.checksum) {
+            await rememberCommittedRoot(localRoot.checksum);
+            await window.RPH_SYNC_TRACKER.acknowledge(watermark);
             return true;
         }
 
-        updateProgress(progress.uploadStart, '正在上传并分页校验…');
-        const committedRemote = await uploadPagedSnapshotAttempt(
-            snapshot,
-            baseVersion,
-            baseChecksum,
-            progress
-        );
-        if (committedRemote?.checksum !== snapshot.checksum) {
-            throw new Error('服务器没有确认新快照。');
+        const cacheDb = await openLocalSyncCache();
+        let reclaimed = 0;
+        try {
+            updateProgress(progress.uploadStart, '正在上传并提交…');
+            // 云端已有的分片（内容寻址、put 时经 sha256 校验）无需重传：
+            // 预置进已确认集合，增量上传只传真正新增/变化的分片。
+            const uploaded = new Set((remote?.packs || []).map(pack => pack.checksum));
+            await uploadPacks(cacheDb, local, progress, uploaded);
+            // 服务端已校验全部包存在并 CAS 切根；返回值带孤儿残留数。
+            ({ reclaimed } = await commitSnapshot(cacheDb, local, remote, progress, uploaded));
+        } finally {
+            cacheDb.close();
         }
-        await window.RPH_SYNC_TRACKER.acknowledge(incremental.watermark);
-        // 与快照相同校验和的基线已在上面提前返回 true；
-        // 走到这里必然是一次全新提交。
+        await rememberCommittedRoot(localRoot.checksum);
+        await window.RPH_SYNC_TRACKER.acknowledge(watermark);
+        // sweep 只为服务端未确认删除的孤儿兜底（正常提交由服务端顺带回收，
+        // 缺包重传轮的整桶替换也会在响应里带回残留数）。零残留时省掉这趟
+        // 往返——高延迟线路上每次上传少花一个 RTT。
+        if (reclaimed > 0) {
+            postSync({ action: 'sweep' }, { retryCount: 1, timeoutMs: CONFIG.commitTimeoutMs }).catch(() => { });
+        }
         return false;
     }
 
-    async function pullFromServerUnlocked() {
-        if (state.syncing) return;
-        state.syncing = true;
-        pauseAutoSave('正在恢复，自动保存已暂停。');
-
+    // 上次成功提交的根校验和与时刻：无变化快速通道的判定材料（校验和只覆盖
+    // 内容，与 version 无关，本地可复算）。
+    async function rememberCommittedRoot(checksum) {
+        const cacheDb = await openLocalSyncCache();
         try {
-            openModal();
-            setActionButtonsDisabled(true);
-            updateProgress(4, '正在恢复…');
-            const manifestResponse = await postSync({ action: 'pull-manifest', schemaVersion: SNAPSHOT_SCHEMA_VERSION });
-            if (manifestResponse.resetRequired) {
-                throw new Error('云端数据尚未准备好，请先完成一次上传。');
+            const localState = await cacheReadState(cacheDb);
+            if (localState) {
+                localState.committed = { checksum, at: Date.now() };
+                await cacheWriteState(cacheDb, localState);
             }
-            const remote = manifestResponse.remote;
-
-            if (!remote) {
-                updateProgress(100, '没有可恢复的数据');
-                if (RESTORE_PAGE) location.replace('/');
-                return;
-            }
-            if (Number(remote.totalBytes || 0) > CONFIG.maxSnapshotBytes) {
-                throw new Error(`服务器数据太大：${remote.totalBytes}/${CONFIG.maxSnapshotBytes}。`);
-            }
-
-            if (remote.snapshotFormat !== SNAPSHOT_FORMAT) {
-                throw new Error('云端数据格式不受支持。');
-            }
-            updateProgress(8, '正在恢复…');
-            await restorePackSnapshot(remote);
-
-            recordLastSync(true);
-            updateProgress(100, '恢复完成');
-            if (RESTORE_PAGE) {
-                location.replace('/');
-            } else {
-                location.reload();
-            }
-        } catch (error) {
-            recordLastSync(false);
-            showSyncError(error);
-            if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');
         } finally {
-            state.syncing = false;
-            setActionButtonsDisabled(false);
+            cacheDb.close();
         }
     }
 
@@ -3827,7 +3040,6 @@ function createAutoSaveScheduler(options = {}) {
             if (alreadyUpToDate) {
                 updateProgress(100, automatic ? '数据相同，已是最新' : '已是最新');
                 recordLastSync(true);
-                scheduleGcMaintenance();
                 if (automatic) {
                     autoSaveLastError = '';
                     setAutoSaveStatus('数据相同，已是最新。');
@@ -3836,7 +3048,6 @@ function createAutoSaveScheduler(options = {}) {
             }
             updateProgress(100, automatic ? '自动保存完成' : '已完成');
             recordLastSync(true);
-            scheduleGcMaintenance();
             if (automatic) {
                 autoSaveLastError = '';
                 setAutoSaveStatus('自动保存完成。');
@@ -3851,8 +3062,6 @@ function createAutoSaveScheduler(options = {}) {
                     openPasswordModal('同步密码已失效，请重新输入。');
                 }
             }
-            // 自动保存失败文案统一由 runAutomaticUpload 的 catch 写入一次，
-            // 这里不再重复 setAutoSaveStatus（过去两层各写一遍、文案还不一致）。
             if (!automatic) return { error };
             throw error;
         } finally {
@@ -3860,6 +3069,632 @@ function createAutoSaveScheduler(options = {}) {
             setActionButtonsDisabled(false);
         }
     }
+
+    // ---- 恢复主流程 ----
+    function openDownloadStagingDb() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(DOWNLOAD_STAGING_DB, DOWNLOAD_STAGING_DB_VERSION);
+            request.onerror = () => reject(request.error || new Error('同步临时数据库打开失败。'));
+            request.onupgradeneeded = () => {
+                const stagingDb = request.result;
+                if (stagingDb.objectStoreNames.contains('chunks')) {
+                    stagingDb.deleteObjectStore('chunks');
+                }
+                if (stagingDb.objectStoreNames.contains('objects')) {
+                    stagingDb.deleteObjectStore('objects');
+                }
+                if (!stagingDb.objectStoreNames.contains(DOWNLOAD_STAGING_STORE)) {
+                    stagingDb.createObjectStore(DOWNLOAD_STAGING_STORE);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+        });
+    }
+
+    function clearDownloadStagingStore(stagingDb) {
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
+        tx.objectStore(DOWNLOAD_STAGING_STORE).clear();
+        return waitForTransaction(tx, '同步临时数据清理失败。');
+    }
+
+    function writeDownloadStagingObjects(stagingDb, objects) {
+        if (!Array.isArray(objects) || objects.length === 0) return Promise.resolve();
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readwrite');
+        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
+        objects.forEach(object => store.put(object.raw, object.index));
+        return waitForTransaction(tx, '同步临时数据写入失败。');
+    }
+
+    function readDownloadStagingObjects(stagingDb, packManifest, start) {
+        const packs = packManifest.slice(start, start + CONFIG.downloadPackConcurrency);
+        if (packs.length === 0) return Promise.resolve([]);
+        const tx = stagingDb.transaction([DOWNLOAD_STAGING_STORE], 'readonly');
+        const store = tx.objectStore(DOWNLOAD_STAGING_STORE);
+        const requests = packs.map((_, offset) => store.get(start + offset));
+        return waitForTransaction(tx, '同步临时数据读取失败。', () => requests.map((request, offset) => {
+            const value = request.result;
+            const bytes = value instanceof Uint8Array
+                ? value
+                : value instanceof ArrayBuffer
+                    ? new Uint8Array(value)
+                    : null;
+            if (!bytes) {
+                throw new Error(`同步临时对象 ${start + offset + 1} 校验失败。`);
+            }
+            // 线上字段名 entries → 内部 entryCount（与下载路径同一转换）。
+            return {
+                bucket: packs[offset].bucket,
+                checksum: packs[offset].checksum,
+                length: packs[offset].length,
+                entryCount: packs[offset].entries,
+                index: start + offset,
+                bytes
+            };
+        }));
+    }
+
+    // 下载批次：滑动窗口维持 6 路在途；下载字节先按清单校验（gzip 字节的
+    // SHA-256 与长度），再解压出 raw JSONL 写 staging；gzip 字节同时写入
+    // 本地缓存（命中缓存只验证长度，写入缓存前已按校验和完整验证过）。
+    async function* downloadPacksToStaging(remote, stagingDb) {
+        await clearDownloadStagingStore(stagingDb);
+        const cacheDb = await openLocalSyncCache().catch(() => null);
+        const packManifest = remote.packs;
+        const concurrency = CONFIG.downloadPackConcurrency;
+        let nextToFetch = 0;
+        let completed = 0;
+        const inflight = new Map();
+        const startNext = () => {
+            if (nextToFetch >= packManifest.length) return;
+            const index = nextToFetch++;
+            const pack = packManifest[index];
+            const pending = (async () => {
+                let compressed = cacheDb ? await cachePack(cacheDb, pack.checksum).catch(() => null) : null;
+                let cacheHit = false;
+                if (compressed?.byteLength === pack.length) {
+                    cacheHit = true;
+                } else {
+                    compressed = await getPack(pack.checksum);
+                    if (compressed.byteLength !== pack.length) {
+                        throw new Error(`服务器数据包 ${index + 1} 大小校验失败。`);
+                    }
+                    if (await sha256Bytes(compressed) !== pack.checksum) {
+                        throw new Error(`服务器数据包 ${index + 1} 校验失败。`);
+                    }
+                }
+                const raw = await gunzipBytes(compressed);
+                return { pack, index, raw, compressed, cacheHit };
+            })().then(result => result);
+            pending.catch(() => { });
+            inflight.set(index, pending);
+        };
+        let staged = [];
+        let pendingCachePacks = [];
+        try {
+            for (let i = 0; i < concurrency && nextToFetch < packManifest.length; i += 1) startNext();
+            while (inflight.size) {
+                const index = Math.min(...inflight.keys());
+                const downloaded = await inflight.get(index);
+                inflight.delete(index);
+                startNext();
+                completed += 1;
+                updateProgress(8 + Math.round((completed / packManifest.length) * 57), '正在恢复…');
+                // 线上字段名 entries 转内部 entryCount，parse/断言按内部命名消费。
+                yield {
+                    bucket: downloaded.pack.bucket,
+                    checksum: downloaded.pack.checksum,
+                    length: downloaded.pack.length,
+                    entryCount: downloaded.pack.entries,
+                    index,
+                    bytes: downloaded.raw
+                };
+                staged.push({ index: downloaded.index, raw: downloaded.raw });
+                if (!downloaded.cacheHit) pendingCachePacks.push({ checksum: downloaded.pack.checksum, bytes: downloaded.compressed });
+                if (staged.length >= concurrency) {
+                    await writeDownloadStagingObjects(stagingDb, staged);
+                    if (cacheDb && pendingCachePacks.length) await cacheWritePacks(cacheDb, pendingCachePacks);
+                    staged = [];
+                    pendingCachePacks = [];
+                }
+            }
+            await writeDownloadStagingObjects(stagingDb, staged);
+            if (cacheDb && pendingCachePacks.length) await cacheWritePacks(cacheDb, pendingCachePacks);
+        } finally {
+            for (const pending of inflight.values()) pending.catch(() => { });
+            cacheDb?.close();
+        }
+    }
+
+    async function* iterateStagedSnapshotPacks(stagingDb, packManifest) {
+        for (let start = 0; start < packManifest.length; start += CONFIG.downloadPackConcurrency) {
+            for (const pack of await readDownloadStagingObjects(stagingDb, packManifest, start)) {
+                yield pack;
+            }
+        }
+    }
+
+    class ObjectSnapshotRestorer {
+        constructor(expectedEntryCount, { validateOnly = false } = {}) {
+            this.expectedEntryCount = Number(expectedEntryCount || 0);
+            this.validateOnly = validateOnly;
+            this.entryCount = 0;
+            this.finished = false;
+            this.localStorageEnded = false;
+            this.localStorageKeys = new Set();
+            this.seenDatabases = new Set();
+            this.currentDatabase = null;
+            this.yieldIfNeeded = createYieldController();
+        }
+
+        async consume(value) {
+            const object = value;
+            if (!object || typeof object !== 'object' || Array.isArray(object)) {
+                throw new Error('服务器同步对象格式不正确。');
+            }
+            switch (object.type) {
+                case 'localStorage':
+                    this.restoreLocalStorageEntry(object);
+                    break;
+                case 'database':
+                    await this.startDatabase(object);
+                    break;
+                case 'record':
+                    await this.restoreRecord(object);
+                    break;
+                case 'recordArrayStart':
+                    this.startArrayRecord(object);
+                    break;
+                case 'recordArrayItem':
+                    this.restoreArrayRecordItem(object);
+                    break;
+                case 'recordArrayEnd':
+                    await this.finishArrayRecord(object);
+                    break;
+                case 'storeEnd':
+                    await this.finishStore(object);
+                    break;
+                case 'databaseEnd':
+                    await this.finishDatabase(object);
+                    break;
+                default:
+                    throw new Error('服务器同步包含未知对象。');
+            }
+            this.entryCount += 1;
+        }
+
+        restoreLocalStorageEntry(line) {
+            if (this.localStorageEnded || this.currentDatabase || typeof line.key !== 'string') {
+                throw new Error('服务器本地设置记录顺序不正确。');
+            }
+            if (!isAppLocalStorageKey(line.key)) throw new Error('服务器包含无效的本地设置。');
+            if (!this.validateOnly) localStorage.setItem(line.key, String(line.value ?? ''));
+            this.localStorageKeys.add(line.key);
+        }
+
+        finishLocalStorage() {
+            if (this.currentDatabase) {
+                throw new Error('服务器本地设置结束标记不正确。');
+            }
+            if (this.localStorageEnded) return;
+            if (!this.validateOnly) {
+                for (const entry of readLocalStorageSnapshot()) {
+                    if (!this.localStorageKeys.has(entry.key)) localStorage.removeItem(entry.key);
+                }
+            }
+            this.localStorageEnded = true;
+        }
+
+        async startDatabase(line) {
+            this.finishLocalStorage();
+            if (this.currentDatabase || this.seenDatabases.has(line.name) || typeof line.name !== 'string') {
+                throw new Error('服务器数据库记录顺序不正确。');
+            }
+            const knownDb = CONFIG.knownDatabases.find(dbDef => dbDef.name === line.name);
+            if (!knownDb) {
+                this.currentDatabase = { name: line.name, ignored: true };
+                return;
+            }
+            const seenStoreNames = new Set();
+            const stores = (Array.isArray(line.stores) ? line.stores : []).filter(storeDef => {
+                if (!storeDef || !knownDb.stores.includes(storeDef.name) || seenStoreNames.has(storeDef.name)) return false;
+                seenStoreNames.add(storeDef.name);
+                return true;
+            }).map(storeDef => ({
+                name: storeDef.name,
+                keyPath: storeDef.keyPath,
+                autoIncrement: Boolean(storeDef.autoIncrement)
+            }));
+            if (this.validateOnly && stores.length) await preflightRestoreDatabase({ name: line.name, stores });
+            const db = !this.validateOnly && stores.length > 0
+                ? await openDbForRestore({ name: line.name, stores })
+                : null;
+            this.currentDatabase = {
+                name: line.name,
+                db,
+                knownDb,
+                stores: new Map(stores.map(storeDef => [storeDef.name, {
+                    definition: storeDef,
+                    incomingKeys: new Set(),
+                    batch: [],
+                    batchBytes: 0,
+                    arrayRecord: null,
+                    finished: false
+                }]))
+            };
+            this.seenDatabases.add(line.name);
+        }
+
+        getStoreState(line) {
+            const current = this.currentDatabase;
+            if (!current || line.database !== current.name || typeof line.store !== 'string') {
+                throw new Error('服务器数据库记录归属不正确。');
+            }
+            if (current.ignored) return null;
+            const storeState = current.stores.get(line.store);
+            if (!storeState || storeState.finished) throw new Error('服务器对象存储记录顺序不正确。');
+            return storeState;
+        }
+
+        async queueStoreRecord(storeState, record) {
+            const token = stableKeyToken(record.key);
+            // 校验路径也要发现重复键：真实恢复写入时后一条会覆盖前一条，
+            // 静默接受会让"校验通过"和服务端快照语义不一致。
+            if (storeState.incomingKeys.has(token)) {
+                throw new Error('服务器同步包含重复的对象键。');
+            }
+            storeState.incomingKeys.add(token);
+            if (this.validateOnly) return;
+            storeState.batch.push(record);
+            storeState.batchBytes += estimateRecordBytes(record.value);
+            if (storeState.batch.length >= CONFIG.restoreBatchSize || storeState.batchBytes >= CONFIG.scanBatchBytes) {
+                await this.flushStore(storeState);
+            }
+        }
+
+        async restoreRecord(line) {
+            const storeState = this.getStoreState(line);
+            if (!storeState) return;
+            if (storeState.arrayRecord) throw new Error('服务器数组记录尚未结束。');
+            if (isSyncExcludedRecord(this.currentDatabase.name, line.store, line.key)) {
+                return;
+            }
+            const record = {
+                key: line.key,
+                value: Object.prototype.hasOwnProperty.call(line, 'value') ? line.value : undefined
+            };
+            await this.queueStoreRecord(storeState, record);
+        }
+
+        startArrayRecord(line) {
+            const storeState = this.getStoreState(line);
+            if (!storeState) return;
+            if (storeState.arrayRecord) {
+                throw new Error('服务器数组记录头信息不正确。');
+            }
+            storeState.arrayRecord = {
+                key: line.key,
+                value: [],
+                nextIndex: 0,
+                excluded: isSyncExcludedRecord(this.currentDatabase.name, line.store, line.key)
+            };
+        }
+
+        restoreArrayRecordItem(line) {
+            const storeState = this.getStoreState(line);
+            if (!storeState) return;
+            const arrayRecord = storeState.arrayRecord;
+            if (!arrayRecord || stableKeyToken(line.key) !== stableKeyToken(arrayRecord.key)
+                || Number(line.index) !== arrayRecord.nextIndex) {
+                throw new Error('服务器数组记录顺序不正确。');
+            }
+            if (!arrayRecord.excluded && !this.validateOnly) {
+                arrayRecord.value.push(Object.prototype.hasOwnProperty.call(line, 'value') ? line.value : null);
+            }
+            arrayRecord.nextIndex += 1;
+        }
+
+        async finishArrayRecord(line) {
+            const storeState = this.getStoreState(line);
+            if (!storeState) return;
+            const arrayRecord = storeState.arrayRecord;
+            if (!arrayRecord || stableKeyToken(line.key) !== stableKeyToken(arrayRecord.key)
+                || Number(line.length) !== arrayRecord.nextIndex) {
+                throw new Error('服务器数组记录数据不完整。');
+            }
+            storeState.arrayRecord = null;
+            if (arrayRecord.excluded) {
+                return;
+            }
+            await this.queueStoreRecord(storeState, { key: arrayRecord.key, value: arrayRecord.value });
+            await this.flushStore(storeState);
+        }
+
+        async flushStore(storeState) {
+            if (this.validateOnly || storeState.batch.length === 0) return;
+            const batch = storeState.batch;
+            storeState.batch = [];
+            storeState.batchBytes = 0;
+            await writeObjectStoreRecordBatch(this.currentDatabase.db, storeState.definition, batch);
+            await this.yieldIfNeeded();
+        }
+
+        async finishStore(line) {
+            const current = this.currentDatabase;
+            if (!current || line.database !== current.name || typeof line.store !== 'string') {
+                throw new Error('服务器对象存储结束顺序不正确。');
+            }
+            if (current.ignored) return;
+            const storeState = current.stores.get(line.store);
+            if (!storeState || storeState.finished) throw new Error('服务器对象存储结束顺序不正确。');
+            if (storeState.arrayRecord) throw new Error('服务器数组记录尚未结束。');
+            await this.flushStore(storeState);
+            if (!this.validateOnly) {
+                await deleteMissingObjectStoreRecords(current.db, current.name, line.store, storeState.incomingKeys);
+            }
+            storeState.incomingKeys.clear();
+            storeState.finished = true;
+        }
+
+        async finishDatabase(line) {
+            const current = this.currentDatabase;
+            if (!current || line.name !== current.name) throw new Error('服务器数据库结束标记不正确。');
+            if (!current.ignored) {
+                if ([...current.stores.values()].some(storeState => !storeState.finished)) {
+                    throw new Error('服务器对象存储数据不完整。');
+                }
+                if (current.db) current.db.close();
+                const missingStores = current.knownDb.stores.filter(storeName => !current.stores.has(storeName));
+                if (!this.validateOnly && missingStores.length > 0) {
+                    await clearKnownIndexedDbStores(current.knownDb, missingStores);
+                }
+            }
+            this.currentDatabase = null;
+        }
+
+        async finish() {
+            if (this.finished) throw new Error('服务器同步恢复已结束。');
+            if (this.currentDatabase) throw new Error('服务器数据库数据不完整。');
+            this.finishLocalStorage();
+            if (this.entryCount !== this.expectedEntryCount) {
+                throw new Error('服务器同步对象数量校验失败。');
+            }
+            if (!this.validateOnly) {
+                for (const knownDb of CONFIG.knownDatabases) {
+                    if (!this.seenDatabases.has(knownDb.name)) {
+                        await clearKnownIndexedDbStores(knownDb, knownDb.stores);
+                    }
+                }
+            }
+            this.finished = true;
+        }
+
+        abort() {
+            if (this.currentDatabase?.db) this.currentDatabase.db.close();
+            this.currentDatabase = null;
+        }
+    }
+
+    async function parsePackSnapshot(packSource, packCount, consumer, options = {}) {
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        let completed = 0;
+        let fragments = [];
+        let fragmentBytes = 0;
+        let previousBucket = null;
+        for await (const pack of packSource) {
+            if (previousBucket !== pack.bucket && fragmentBytes) {
+                throw new Error('服务器同步分片记录不完整。');
+            }
+            previousBucket = pack.bucket;
+            let count = 0;
+            let offset = 0;
+            while (offset < pack.bytes.byteLength) {
+                const end = pack.bytes.indexOf(10, offset);
+                const piece = pack.bytes.subarray(offset, end === -1 ? pack.bytes.byteLength : end);
+                fragmentBytes += piece.byteLength;
+                if (fragmentBytes > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('服务器单条数据超过 64MiB 上限。');
+                fragments.push(piece);
+                if (end === -1) break;
+                let bytes = fragments[0];
+                if (fragments.length > 1) {
+                    bytes = new Uint8Array(fragmentBytes);
+                    let position = 0;
+                    for (const fragment of fragments) { bytes.set(fragment, position); position += fragment.byteLength; }
+                }
+                let value;
+                try { value = JSON.parse(decoder.decode(bytes)); }
+                catch (_) { throw new Error('服务器同步数据包 JSON 不正确。'); }
+                fragments = [];
+                fragmentBytes = 0;
+                await consumer.consume(value, pack, bytes);
+                count += 1;
+                offset = end + 1;
+            }
+            if (count !== pack.entryCount) throw new Error('服务器同步数据包记录数量不一致。');
+            if (typeof consumer.packComplete === 'function') await consumer.packComplete(pack);
+            completed += 1;
+            if (typeof options.onProgress === 'function') options.onProgress(completed, packCount);
+        }
+        if (completed !== packCount) throw new Error('服务器同步数据包数量不一致。');
+        if (fragmentBytes || fragments.length) throw new Error('服务器同步记录尚未结束。');
+        await consumer.finish();
+    }
+
+    // entry 传入时复用已算好的 id/group/sourceKey/bucketKey（恢复热路径
+    // buildCacheEntry 刚算过同一套值），缺省时从 value 现算。
+    function assertPackEntryPlacement(value, pack, entry = null) {
+        const bucket = entry?.bucketKey ?? snapshotEntryBucket(
+            value, snapshotEntryId(value), snapshotEntrySource(value)
+        );
+        if (bucket !== pack.bucket) {
+            throw new Error('服务器同步分片索引不一致。');
+        }
+    }
+
+    async function restoreSnapshotAndCache(stagingDb, remote, dirtyState) {
+        const cacheDb = await openLocalSyncCache();
+        const restorer = new ObjectSnapshotRestorer(remote.entryCount);
+        let pendingEntries = [];
+        let pendingBytes = 0;
+        let entryCount = 0;
+        const flushEntries = async () => {
+            if (pendingEntries.length === 0) return;
+            const entries = pendingEntries;
+            pendingEntries = [];
+            pendingBytes = 0;
+            await cacheWriteEntries(cacheDb, entries);
+        };
+        try {
+            // 只清派生索引（entries/state），保留分片缓存：分片在下载阶段
+            // 已按校验和验证并写入缓存，清掉会让下次恢复重新下载整库。
+            await cacheClearDerived(cacheDb);
+            await parsePackSnapshot(
+                iterateStagedSnapshotPacks(stagingDb, remote.packs),
+                remote.packs.length,
+                {
+                    async consume(value, pack, lineBytes) {
+                        await restorer.consume(value);
+                        const entry = buildCacheEntry(value, lineBytes);
+                        // 恢复热路径：placement 断言直接复用 entry 的派生字段。
+                        assertPackEntryPlacement(value, pack, entry);
+                        entry.bucketKey = pack.bucket;
+                        pendingEntries.push(entry);
+                        pendingBytes += entry.bytes.byteLength;
+                        entryCount += 1;
+                        if (pendingBytes >= CONFIG.cacheWriteBytes || pendingEntries.length >= CONFIG.readBatchSize) {
+                            await flushEntries();
+                        }
+                    },
+                    async finish() {
+                        await restorer.finish();
+                        await flushEntries();
+                    }
+                },
+                {
+                    onProgress: (completed, total) => {
+                        updateProgress(72 + Math.round((completed / total) * 27), '正在恢复…');
+                    }
+                }
+            );
+            if (entryCount !== Number(remote.entryCount)) {
+                throw new Error('服务器同步缓存记录数量不一致。');
+            }
+            // 恢复侧重建内部分片状态：group 从 bucket 键反解（'|' 前缀），
+            // part 按同桶出现顺序编号，顺序沿用清单数组顺序。
+            const groups = [];
+            const partByBucket = new Map();
+            const packs = remote.packs.map(pack => {
+                const group = String(pack.bucket).split('|')[0];
+                if (!groups.includes(group)) groups.push(group);
+                const part = partByBucket.get(pack.bucket) || 0;
+                partByBucket.set(pack.bucket, part + 1);
+                return { bucket: pack.bucket, group, part, checksum: pack.checksum, length: pack.length, entryCount: pack.entries };
+            });
+            await cacheWriteState(cacheDb, {
+                version: CACHE_FORMAT_VERSION,
+                groups,
+                packs,
+                epoch: localStorage.getItem(TRACKING_EPOCH_KEY),
+                epochs: dirtyState.epochs,
+                // 恢复完成即本机与该根一致：带上"已提交"记忆，无变化自动保存
+                // 从恢复后第一次起可走快速通道（journalWatermark 由
+                // acknowledge 后的下一次快照准备补齐；缺失时快速通道自退回
+                // 完整流程）。
+                committed: { checksum: String(remote.checksum || ''), at: Date.now() },
+                journalWatermark: { databases: dirtyState.watermark.databases },
+                snapshot: {
+                    format: SNAPSHOT_FORMAT,
+                    compression: SNAPSHOT_COMPRESSION,
+                    totalBytes: Number(remote.totalBytes),
+                    entryCount: Number(remote.entryCount)
+                }
+            });
+            await window.RPH_SYNC_TRACKER.acknowledge(dirtyState.watermark);
+        } catch (error) {
+            restorer.abort();
+            await cacheClearDerived(cacheDb);
+            throw error;
+        } finally {
+            cacheDb.close();
+        }
+    }
+
+    async function restorePackSnapshot(remote) {
+        const stagingDb = await openDownloadStagingDb();
+        try {
+            const validator = new ObjectSnapshotRestorer(remote.entryCount, { validateOnly: true });
+            await parsePackSnapshot(
+                downloadPacksToStaging(remote, stagingDb),
+                remote.packs.length,
+                {
+                    async consume(value, pack) {
+                        assertPackEntryPlacement(value, pack);
+                        await validator.consume(value);
+                    },
+                    async finish() { await validator.finish(); }
+                }
+            );
+            updateProgress(72, '正在恢复…');
+            const restoreEpoch = crypto.randomUUID();
+            // 写冻结信号先于任何业务库写入：其他标签页收到 storage 事件后
+            // 暂停写入并显示恢复遮罩；本标签页由 waitForIndexedDbWriteBarrier
+            // 等待在途写事务收尾。恢复中途失败时保留该标记（其他标签页
+            // 维持写冻结），由中断恢复流程接管或完整重试后清除。
+            localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
+            localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
+            await waitForIndexedDbWriteBarrier();
+            // 一次 readDirtyState 同时供恢复水印（acknowledge）与
+            // 缓存 epochs 使用，避免恢复路径重复全量扫描变更日志。
+            const dirtyState = await readDirtyState();
+            await restoreSnapshotAndCache(stagingDb, remote, dirtyState);
+            if (localStorage.getItem(RESTORE_ACTIVE_KEY) === restoreEpoch) {
+                localStorage.removeItem(RESTORE_ACTIVE_KEY);
+            }
+        } finally {
+            try { await clearDownloadStagingStore(stagingDb); } catch (_) { }
+            stagingDb.close();
+        }
+    }
+
+    async function pullFromServerUnlocked() {
+        if (state.syncing) return;
+        state.syncing = true;
+        pauseAutoSave('正在恢复，自动保存已暂停。');
+
+        try {
+            openModal();
+            setActionButtonsDisabled(true);
+            updateProgress(4, '正在恢复…');
+            const manifestResponse = await postSync({ action: 'status' });
+            const remote = manifestResponse.manifest ? await validateRemoteManifest(manifestResponse.manifest) : null;
+
+            if (!remote) {
+                updateProgress(100, '没有可恢复的数据');
+                if (RESTORE_PAGE) location.replace('/');
+                return;
+            }
+            updateProgress(8, '正在恢复…');
+            await restorePackSnapshot(remote);
+            // committed/journalWatermark 已由 restoreSnapshotAndCache 一并写
+            // 入缓存状态：恢复完成后本机即与云端根一致，无变化自动保存可直接
+            // 走快速通道（每满验证间隔重新完整验证一次）。
+
+            recordLastSync(true);
+            updateProgress(100, '恢复完成');
+            if (RESTORE_PAGE) {
+                location.replace('/');
+            } else {
+                location.reload();
+            }
+        } catch (error) {
+            recordLastSync(false);
+            showSyncError(error);
+            if (error.status === 401) openPasswordModal('请输入同步密码后恢复。');
+        } finally {
+            state.syncing = false;
+            setActionButtonsDisabled(false);
+        }
+    }
+
     const pullFromServer = () => runSyncOperation(() => pullFromServerUnlocked());
     const pushToServer = () => runSyncOperation(() => pushToServerUnlocked());
 
@@ -3869,6 +3704,17 @@ function createAutoSaveScheduler(options = {}) {
 
     const accessGateReady = startAccessGate();
 
+    if (!RESTORE_PAGE) {
+        // 后台快照准备触发器：业务写入后防抖 8 秒；回到前台尽快补一次；
+        // 页面加载预热 3 秒——首次使用（无本地索引）时提前完整扫描，
+        // 让"首次上传"不再从零等待。
+        window.addEventListener('rphub:dirty', () => scheduleBackgroundPrepare());
+        document.addEventListener('visibilitychange', () => {
+            if (isAutoSavePageActive()) scheduleBackgroundPrepare(1000);
+        });
+        scheduleBackgroundPrepare(3000);
+    }
+
     if (RESTORE_PAGE) {
         const beginRestore = () => {
             ensureModal();
@@ -3876,7 +3722,7 @@ function createAutoSaveScheduler(options = {}) {
             pullFromServer().catch(() => { });
         };
         const domReady = document.readyState === 'loading'
-            ? new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }))
+            ? new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, { once: true }))
             : Promise.resolve();
         Promise.all([domReady, accessGateReady]).then(beginRestore);
     } else if (document.readyState === 'loading') {

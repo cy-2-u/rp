@@ -1,3 +1,8 @@
+// RP Hub 魔改版 - 图片业务
+//
+// 通过 window.RPHubExternal v2 契约取得作者上下文：注册 image-request /
+// character-deleted 回调，管理生图任务、固定记录、缩略图与生图门控。
+// 只在主页加载；图片记录保存在 RPHubDB/store 的 rp_hub_image_renders_<角色UUID>。
 (function () {
     if (location.pathname !== '/' && location.pathname !== '/index.html') return;
 
@@ -9,7 +14,7 @@
     const DEFAULT_STORY_SCOPE_ID = 'main';
     const IMAGE_PARAM_KEYS = ['tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
     const external = window.RPHubExternal;
-    if (!external || external.version !== 1) return;
+    if (!external || external.version !== 2) return;
 
     const hashText = value => {
         let hash = 2166136261;
@@ -38,7 +43,7 @@
     ].join(':');
 
     // 生图提供商由密钥决定（worker 以 token 为准）；ynai 请求用用户在劫持下拉里
-    // 选的模型覆盖作者页面的模型参数，provider 不再写进 URL/快照（缓存不区分来源）。
+    // 选的模型覆盖作者页面的模型参数，provider 不写进 URL/快照（缓存不区分来源）。
     const normalizeRequestUrl = (value, characterName) => {
         const source = new URL(value, location.href);
         const target = new URL('/api/rp-image', location.origin);
@@ -109,7 +114,7 @@
         request.onsuccess = () => resolve(request.result);
     });
 
-    // 注意：normalizeRecordList 对重复 key 是“删除后重设”（后写者排到末尾），
+    // 注意：normalizeRecordList 对重复 key 是"删除后重设"（后写者排到末尾），
     // 与 mergeRecordLists 的 base 处理（Map 去重保首位置）顺序语义不同，不可合并。
     const normalizeRecordList = (value, characterName = '') => {
         if (!Array.isArray(value)) return [];
@@ -187,8 +192,7 @@
 
     const saveImageStore = (state, retry = false) => {
         if (!state || state.retired) return Promise.resolve();
-        // 无待写内容且无未结算修订时完全短路：不开库、不排队、不递增
-        // revision（过去 flush 重试路径会对空 pendings 白跑一次读改写）。
+        // 无待写内容且无未结算修订时完全短路：不开库、不排队、不递增 revision。
         if (state.savedRevision === state.saveRevision
             && state.pendingUpserts.size === 0 && state.pendingDeleteKeys.size === 0) {
             return Promise.resolve();
@@ -317,9 +321,8 @@
             notice.innerHTML = '<span>加载失败</span><button type="button">重新加载</button>';
             notice.querySelector('button').addEventListener('click', event => {
                 event.stopPropagation();
-                // 与上面 error 回调的自动重试同一道校验：只重发本站代理地址。
-                // currentSrc 可能已被作者页面换成带 token 的站外绝对 URL，
-                // 无条件改写并重发会把 token 带到第三方 origin。
+                // 只重发本站代理地址：currentSrc 可能已被作者页面换成带 token
+                // 的站外绝对 URL，无条件改写并重发会把 token 带到第三方 origin。
                 let retryUrl;
                 try {
                     retryUrl = new URL(image.currentSrc || image.src || '', location.origin);
@@ -414,7 +417,7 @@
         return task;
     };
 
-    // 隐藏任务：作者的“自动生图”开关关闭时卡片整体隐藏，不渲染任何占位。
+    // 隐藏任务：作者的"自动生图"开关关闭时卡片整体隐藏，不渲染任何占位。
     // promise 必须正常完成，作者端的 reroll 处理器会等待它。
     const createSuppressedImageTask = (requestUrl, render) => {
         const task = {
@@ -519,11 +522,12 @@
     };
 
     const uploadImageThumbnail = async (imageKey, token, blob) => {
-        if (!token) throw new Error('missing image token');
+        // token 仅为旧版兼容字段：Worker 端授权依据是同源 + 原图存在性，
+        // 旧记录恢复场景没有 token 也必须能回填缩略图。
         const url = new URL('/api/rp-image', location.origin);
         url.searchParams.set('key', imageKey);
         url.searchParams.set('thumb', '1');
-        url.searchParams.set('token', token);
+        if (token) url.searchParams.set('token', token);
         const response = await fetch(url, {
             method: 'PUT',
             headers: { 'content-type': 'image/webp' },
@@ -625,8 +629,8 @@
         const token = currentUrl.searchParams.get('token') || '';
         const descriptor = buildDescriptor(card, message, currentUrl, storyScopeId);
         if (!descriptor) {
-            // 无卡片上下文时无法定位槽位：作者的“自动生图”开关关闭时只隐藏。
-            // 适配层未提供“自动生图”状态时，按作者原生行为放行。
+            // 无卡片上下文时无法定位槽位：作者的"自动生图"开关关闭时只隐藏。
+            // 适配层未提供"自动生图"状态时，按作者原生行为放行。
             if (autoImageGen === false) return createSuppressedImageTask(currentUrl.href, render);
             const record = normalizeRecord({
                 storyScopeId,
@@ -670,14 +674,14 @@
         }
 
         if (!previous && !generationAllowed) {
-            // 作者“自动生图”开关关闭：卡片隐藏且不生成，不做任何持久化；
+            // 作者"自动生图"开关关闭：卡片隐藏且不生成，不做任何持久化；
             // 重新打开开关后按作者原生行为重新生成。
             return createSuppressedImageTask(currentUrl.href, render);
         }
 
         if (fresh === true) {
             if (previous && !generationAllowed) {
-                // 作者“自动生图”开关关闭时的重掷：保留已显示的旧图，不再生成。
+                // 作者"自动生图"开关关闭时的重掷：保留已显示的旧图，不再生成。
                 return resumeRecordedImageTask(previous, descriptor, slotKey, token, render, state);
             }
             const record = normalizeRecord({
@@ -810,6 +814,23 @@
             }
         }
         await state?.writeQueue.catch(() => undefined);
+        // 记录键本身也要清掉：retired 只拦住后续写入，RPHubDB 里的
+        // rp_hub_image_renders_<id> 若不删会被快照永久携带，还会在
+        // 同 UUID 角色重新导入时重放旧图。此时写队列已排空、retired
+        // 已置位，删除是最终态（删除经变更日志同步到云端与其他设备）。
+        try {
+            const db = await openImageDatabase();
+            try {
+                await new Promise((resolve, reject) => {
+                    const tx = db.transaction(['store'], 'readwrite');
+                    tx.objectStore('store').delete(IMAGE_STORAGE_PREFIX + id);
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error || new Error('图片记录删除失败'));
+                });
+            } finally { db.close(); }
+        } catch (_) {
+            // 清理失败不阻断删除流程：记录会残留，但不再被任何写入引用。
+        }
     });
     external.installUi();
 })();

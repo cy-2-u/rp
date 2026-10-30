@@ -1,0 +1,13 @@
+{
+  "adapter": {
+    "externalUrl": ""
+  },
+  "image": {
+    "ynai": {
+      "base": "https://nai.rinko.ai",
+      "modelsPath": "/v1/models",
+      "generatePath": "/v1/images/generations",
+      "defaultModel": "nai-diffusion-4-5-full"
+    }
+  }
+}
