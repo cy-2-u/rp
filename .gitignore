@@ -1,10 +1,5 @@
-.sync-tests/node_modules/
 *.log
 *.tmp
-*.tmp.mjs
 .zcode/
-audit-out.txt
 page.zip
 node_modules/
-RP-Hub-upstream/
-.sync-tests/fixtures/author-backup-*/
