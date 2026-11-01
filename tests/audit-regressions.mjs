@@ -21,6 +21,12 @@ function literal(source, declaration) {
     return match[1];
 }
 
+function stringArrayLiteral(source, declaration) {
+    const match = source.match(new RegExp(`const\\s+${declaration}\\s*=\\s*\\[([^\\]]+)\\]`));
+    assert(match, `常量声明缺失：${declaration}`);
+    return match[1].split(',').map(item => item.trim().replace(/^'|'$/g, '')).join(',');
+}
+
 function testDoubleWriteConstants() {
     // dirty-tracker 与 bootstrap 的协议常量是人肉双写副本，任何一侧改名
     // 必须双侧同步；此处逐字比较值。
@@ -37,6 +43,19 @@ function testDoubleWriteConstants() {
     // RESTORE_PAGE 判定两侧共享同一语义（恢复页 data 属性 + /sync-restore 路径）。
     assert(dirty.includes("location.pathname === '/sync-restore'") && bootstrap.includes("location.pathname === '/sync-restore'"), 'RESTORE_PAGE 判定一致（路径）');
     assert(dirty.includes("'data-rp-sync-restore'") && bootstrap.includes("'data-rp-sync-restore'"), 'RESTORE_PAGE 判定一致（data 属性）');
+    // ---- 跨文件 UI 常量双写（同为人肉副本，漂移即行为分叉）----
+    // magic 与适配层共享的设置键（设置开关与模型下拉读写同一存储）。
+    assertEqual(literal(magic, 'FIXED_IMAGE_KEY'), literal(adapter, 'FIXED_IMAGE_KEY'), '双写常量一致：FIXED_IMAGE_KEY');
+    assertEqual(literal(magic, 'YNAI_MODEL_KEY'), literal(adapter, 'YNAI_MODEL_KEY'), '双写常量一致：YNAI_MODEL_KEY');
+    // 生图参数键列表：worker 用它构造签名寻址，magic 用它复制请求参数，
+    // 两侧集合不一致会让缓存键与实际请求参数脱钩。
+    assertEqual(stringArrayLiteral(worker, 'IMAGE_PARAM_KEYS'), stringArrayLiteral(magic, 'IMAGE_PARAM_KEYS'), '双写常量一致：IMAGE_PARAM_KEYS');
+    // 图库单批删除上限：gallery 分片大小必须不大于 worker 校验上限，
+    // 否则正常分批删除会被服务端 400 拒绝。
+    const workerDeleteLimit = worker.match(/const IMAGE_DELETE_MAX_KEYS_PER_REQUEST = (\d+)/);
+    const galleryDeleteLimit = read('gallery.html').match(/deleteChunkSize=(\d+)/);
+    assert(workerDeleteLimit && galleryDeleteLimit, '删除批量常量声明存在');
+    assertEqual(workerDeleteLimit[1], galleryDeleteLimit[1], '双写常量一致：IMAGE_DELETE_MAX_KEYS_PER_REQUEST/deleteChunkSize');
     console.log('ok  双写协议常量一致');
 }
 

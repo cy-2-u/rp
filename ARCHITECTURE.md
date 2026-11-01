@@ -185,11 +185,12 @@ npm test              # audit + protocol + images + legacy + magic（unit）；c
 npm run scale         # 真实客户端代码路径的规模模拟（SCALE_MB 默认 300，可用 5 预检）
 npm run realistic     # 真实形态模拟（SIM_CHARS/SIM_CHATS/SIM_MSGS/SIM_B64_* 可调角色卡/长对话/内嵌图规模）
 npm run sync-perf     # 同步性能：后台准备耗时基准 + journal 增量消费正确性验证
+npm run code-audit    # 死代码静态审计：零引用顶层函数候选 + 单调用点自审清单
 ```
 
 | 文件 | 覆盖 |
 |---|---|
-| `audit-regressions.mjs` | 双写协议常量逐字一致、三方 canonical 源一致、无旧协议残留、Worker 结构约束（单文件/无 import/脚本链顺序）、page/ 文件集完整 |
+| `audit-regressions.mjs` | 双写协议常量逐字一致（含 UI 常量：参数键表/删除批量/设置键）、三方 canonical 源一致、无旧协议残留、Worker 结构约束（单文件/无 import/脚本链顺序）、page/ 文件集完整 |
 | `protocol-smoke.mjs` | 适配脚本链（注入顺序/外部优先/失败回退/last-good 持久化）、同步协议（上传/幂等/缺包 409/版本单调/CAS 收敛/孤儿回收/sweep/下载/密码门禁） |
 | `image-regressions.mjs` | 生图签名与键稳定、缓存与 ETag、GET 不生图、角色名净化、缩略图、墓碑两阶段删除、24MiB 上限、ynai/sta1n 路由、模型列表、图库页 |
 | `legacy-upgrade.mjs` | v1 遗留本地状态升级回归（旧缓存索引/旧日志/旧分片残留）+ 中断续传：分片元数据始终合法 |
@@ -200,6 +201,7 @@ npm run sync-perf     # 同步性能：后台准备耗时基准 + journal 增量
 | `background-prepare-bench.mjs` | 后台索引维护基准：持续聊天（每轮追加消息）+ 周期后台准备，断言准备耗时恒定（增量消费生效，不随累积增长） |
 | `journal-incremental-verify.mjs` | journal 增量消费正确性：水位推进、三轮后台准备增量进快照、上传捕获未准备写入、恢复后字节级对比、A 页 journal 清空 |
 | `day-sim.mjs` | **"用户的一天"全行为随机交错模拟**（虚拟时钟 24h 压缩到约 2 分钟）：聊天/swipe/生图/重掷/删图/导入与删除角色卡/删除会话/分支新聊天/手动上传/真实自动保存调度器（虚拟时钟驱动，含页签隐藏暂停）/双设备拉取。固定种子可复现；产出请求账单、无变化同步占比、快速通道命中数、sweep 触发数、孤儿记录拓扑、全量恢复字节级抽查 |
+| `dead-code-audit.mjs` | 死代码静态审计（`npm run code-audit`）：提取 page/ 五个运行时文件的顶层函数名，在全项目源码统计引用，零引用即死代码候选；另列"仅 1 处调用"清单供人工自审 |
 
 测试基建：`lib/r2.mjs`（内存 R2 兼容桶：条件写/sha256 校验/list 游标）、`lib/worker.mjs`（Worker 装载器 + HTMLRewriter 桩 + 作者上游拦截）。全部外网在测试内拦截，不访问远端。
 

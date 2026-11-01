@@ -14,6 +14,7 @@
     "day": "node day-sim.mjs",
     "scale": "node --max-old-space-size=8192 --expose-gc client-sim.mjs --scale",
     "sync-perf": "node background-prepare-bench.mjs && node journal-incremental-verify.mjs",
+    "code-audit": "node dead-code-audit.mjs",
     "unit": "node audit-regressions.mjs && node protocol-smoke.mjs && node image-regressions.mjs && node legacy-upgrade.mjs && node magic-behavior.mjs",
     "runtime": "node client-sim.mjs && node realistic-sim.mjs && node adapter-contract.mjs",
     "test": "npm run unit && npm run runtime"

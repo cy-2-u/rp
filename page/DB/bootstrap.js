@@ -4,48 +4,6 @@
 // 无 Bloom、无 GC 状态机）。上传 = 逐片 PUT（幂等）→ commit（CAS 切根，服务端
 // 顺带回收孤儿分片）；恢复 = 读根清单 → 逐片 GET（边缘缓存）→ 两遍 staging 恢复。
 // 设计前提：个人单用户、无并发写者；免费版网络（国内高延迟）优先优化请求数与字节。
-(function (global) {
-    'use strict';
-
-    // 有界并发池：失败后停止派发新任务，已在途任务自然收尾。
-    async function mapPool(items, limit, worker) {
-        const results = new Array(items.length);
-        let cursor = 0;
-        let failure = null;
-        const runnerCount = Math.min(Math.max(1, limit), items.length);
-        await Promise.all(Array.from({ length: runnerCount }, async () => {
-            while (cursor < items.length && !failure) {
-                const index = cursor;
-                cursor += 1;
-                try {
-                    results[index] = await worker(items[index], index);
-                } catch (err) {
-                    failure = failure || err;
-                }
-            }
-        }));
-        if (failure) throw failure;
-        return results;
-    }
-
-    global.RPH_SYNC_UPLOAD_ENGINE = Object.freeze({ mapPool });
-})(globalThis);
-
-(function () {
-    window.RPH_SYNC_PERSISTENCE = {
-        async manualSave() {
-            const external = window.RPHubExternal;
-            if (external?.version !== 2 || typeof external.flush !== 'function') {
-                throw new Error('作者保存接口未就绪，请刷新后重试。');
-            }
-            const result = await external.flush();
-            if (result && result.ok === false) throw new Error(result.reason || '作者数据保存失败。');
-            if (window.RPH_MAGIC_FLUSH_IMAGES) await window.RPH_MAGIC_FLUSH_IMAGES();
-            await window.RPH_SYNC_TRACKER.flush();
-        }
-    };
-})();
-
 function createAutoSaveScheduler(options = {}) {
     const setTimer = options.setTimeout || setTimeout;
     const clearTimer = options.clearTimeout || clearTimeout;
@@ -2142,11 +2100,30 @@ function createAutoSaveScheduler(options = {}) {
         if (!Number.isInteger(pack.entryCount) || pack.entryCount < 0 || pack.entryCount > CONFIG.maxPackEntries) bad('entryCount');
     }
 
+    // 有界并发池：失败后停止派发新任务，已在途任务自然收尾。
+    async function mapPool(items, limit, worker) {
+        const results = new Array(items.length);
+        let cursor = 0;
+        let failure = null;
+        const runnerCount = Math.min(Math.max(1, limit), items.length);
+        await Promise.all(Array.from({ length: runnerCount }, async () => {
+            while (cursor < items.length && !failure) {
+                const index = cursor;
+                cursor += 1;
+                try {
+                    results[index] = await worker(items[index], index);
+                } catch (err) {
+                    failure = failure || err;
+                }
+            }
+        }));
+        if (failure) throw failure;
+        return results;
+    }
+
     async function uploadPacks(cacheDb, local, progress, uploadedSet = null) {
-        const engine = globalThis.RPH_SYNC_UPLOAD_ENGINE;
-        if (!engine?.mapPool) throw new Error('上传引擎未就绪，请刷新页面后重试。');
         let uploadedBytes = 0;
-        await engine.mapPool(local.packs, CONFIG.uploadConcurrency, async pack => {
+        await mapPool(local.packs, CONFIG.uploadConcurrency, async pack => {
             assertPackMetadata(pack);
             // 同一次上传会话内已确认的分片跳过（commit 缺包重传时复用）。
             if (uploadedSet?.has(pack.checksum)) return;
@@ -2460,11 +2437,14 @@ function createAutoSaveScheduler(options = {}) {
     }
 
     async function flushAppState() {
-        const proxy = window.RPH_SYNC_PERSISTENCE;
-        if (!proxy || typeof proxy.manualSave !== 'function') {
-            throw new Error('应用保存接口尚未就绪，请刷新页面后重试。');
+        const external = window.RPHubExternal;
+        if (external?.version !== 2 || typeof external.flush !== 'function') {
+            throw new Error('作者保存接口未就绪，请刷新后重试。');
         }
-        await proxy.manualSave();
+        const result = await external.flush();
+        if (result && result.ok === false) throw new Error(result.reason || '作者数据保存失败。');
+        if (window.RPH_MAGIC_FLUSH_IMAGES) await window.RPH_MAGIC_FLUSH_IMAGES();
+        await window.RPH_SYNC_TRACKER.flush();
     }
 
     async function getAuthStatus(password = getStoredSyncPassword(), options = {}) {
@@ -3164,7 +3144,7 @@ function createAutoSaveScheduler(options = {}) {
                 }
                 const raw = await gunzipBytes(compressed);
                 return { pack, index, raw, compressed, cacheHit };
-            })().then(result => result);
+            })();
             pending.catch(() => { });
             inflight.set(index, pending);
         };

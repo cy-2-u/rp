@@ -289,6 +289,9 @@ function getBucket(env) {
 // config.json 是 Worker 侧自己的云端配置（外部适配脚本 URL、ynai 中转端点），
 // 随部署发布、经 ASSETS 读取；读取失败回退 R2 last-good，两者都不可用才失败。
 const deployConfigCache = new WeakMap();
+// 上次写入 last-good 的序列化值：内容未变不重复写 R2（免费版 Class A 写额
+// 有限），与适配脚本链的 adapterLastGoodPersisted 同一守卫模式。
+let configLastGoodPersisted = null;
 
 function defaultDeployConfig() {
     return { format: DEPLOY_CONFIG_FORMAT, adapter: { externalUrl: '' }, image: { ynai: null } };
@@ -317,10 +320,13 @@ async function loadDeployConfig(env) {
             }
         }
         const config = { ...defaultDeployConfig(), ...value, format: DEPLOY_CONFIG_FORMAT };
-        // 成功读取部署正本时顺手刷新 last-good（写入失败不影响服务）。
-        if (value && env?.[R2_BINDING]) {
+        // 成功读取部署正本时顺手刷新 last-good（写入失败不影响服务）；
+        // 内容未变时跳过写入，避免每个 isolate 每 30 秒都消耗一次 R2 写额。
+        const lastGoodValue = value ? JSON.stringify(value) : null;
+        if (lastGoodValue !== null && env?.[R2_BINDING] && lastGoodValue !== configLastGoodPersisted) {
+            configLastGoodPersisted = lastGoodValue;
             try {
-                await env[R2_BINDING].put(CONFIG_LASTGOOD_KEY, JSON.stringify(value), {
+                await env[R2_BINDING].put(CONFIG_LASTGOOD_KEY, lastGoodValue, {
                     httpMetadata: { contentType: 'application/json; charset=utf-8' }
                 });
             } catch (_) { }

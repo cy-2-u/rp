@@ -971,15 +971,21 @@ async function main() {
     const deviceBadges = badgeLog.filter(entry => entry.device === 'main');
     const firstPushBaseline = deviceBadges.length ? deviceBadges[0].packPut : worker.counters.packPut;
     let noChangeSyncs = 0;
+    let fastPathSyncs = 0;
     const perSync = deviceBadges.map((badge, index) => {
-        const packDelta = badge.packPut - (index > 0 ? deviceBadges[index - 1].packPut : firstPushBaseline);
-        if (packDelta === 0) noChangeSyncs += 1;
+        const previous = index > 0 ? deviceBadges[index - 1] : { syncPost: 0, packPut: firstPushBaseline };
+        const packDelta = badge.packPut - previous.packPut;
+        if (packDelta === 0) {
+            noChangeSyncs += 1;
+            // 无变化同步零网络请求 = 无变化快速通道命中；1 次 status = 定期完整验证兜底。
+            if (badge.syncPost - previous.syncPost === 0) fastPathSyncs += 1;
+        }
         return packDelta;
     });
     console.log('\n========== 一天模拟指标 ==========');
     console.log(`虚拟时长：${dayMinutes} 分钟（目标 ${Math.round(DAY_MS / 60000)}）；行为轮数：${round}；页签隐藏空档：${report.hiddenRounds}`);
     console.log(`行为分布：`, JSON.stringify(report.actionCounts));
-    console.log(`同步成功 ${autoSaveFires} 次（含手动），其中无变化同步 ${noChangeSyncs} 次（仍各花 1 次 status 往返）`);
+    console.log(`同步成功 ${autoSaveFires} 次（含手动），其中无变化同步 ${noChangeSyncs} 次（快速通道 ${fastPathSyncs} 次零请求 + 完整验证 ${noChangeSyncs - fastPathSyncs} 次 1 RTT）`);
     console.log(`请求账单：`, JSON.stringify(Object.fromEntries(Object.entries(requestSummary).map(([key, value]) => [key, `${value.count}次/${(value.bytes / 1024).toFixed(0)}KiB`]))));
     console.log(`同步动作分解：`, JSON.stringify(worker.counters.actions));
     console.log(`分片 PUT：${worker.counters.packPut} 次 / ${(worker.counters.packPutBytes / 1024).toFixed(0)}KiB gzip；分片 GET：${worker.counters.packGet} 次（B1 全量 ${b1PackGets} + B2 缓存 0）`);

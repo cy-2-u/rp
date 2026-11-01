@@ -401,7 +401,6 @@
         const task = {
             requestUrl,
             baseUrl: location.origin,
-            token: '',
             cards: new Set(),
             render,
             job: {
@@ -423,7 +422,6 @@
         const task = {
             requestUrl,
             baseUrl: location.origin,
-            token: '',
             cards: new Set(),
             render,
             suppressed: true,
@@ -584,7 +582,6 @@
             characterId: String(state?.id || ''),
             requestUrl: generateUrl,
             baseUrl: location.origin,
-            token: '',
             cards: new Set(),
             render,
             job: { status: 'running', generationProgress: { percent: 0 } },
