@@ -67,7 +67,6 @@ const IMAGE_PREFIX = 'rp-images';
 const IMAGE_OBJECT_PREFIX = `${IMAGE_PREFIX}/characters`;
 const IMAGE_THUMB_PREFIX = `${IMAGE_PREFIX}/thumbs`;
 const IMAGE_DELETED_PREFIX = `${IMAGE_PREFIX}/_deleted`;
-const IMAGE_ADMIN_AUTH_COOKIE = 'rp_image_admin_auth';
 // 墓碑与图库列表的 isolate 内短缓存：图库页整库加载是热点路径。
 const IMAGE_TOMBSTONE_CACHE_TTL_MS = 7 * 1000;
 const IMAGE_LIBRARY_CACHE_TTL_MS = 7 * 1000;
@@ -816,7 +815,7 @@ async function deletePackKeys(bucket, keys) {
     return failed;
 }
 
-async function handleSyncCommit(bucket, body, ctx) {
+async function handleSyncCommit(bucket, body) {
     const normalized = normalizeManifest(body.manifest);
     await verifyManifestChecksum(normalized);
     const root = normalized.root;
@@ -1082,9 +1081,6 @@ async function handleSyncApi(request, env, ctx) {
         }
         return error('Method not allowed.', 405);
     }
-    if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: { allow: 'POST, GET, PUT, OPTIONS' } });
-    }
     if (request.method !== 'POST') return error('Method not allowed.', 405);
 
     const body = await readSyncJsonBody(request);
@@ -1094,7 +1090,7 @@ async function handleSyncApi(request, env, ctx) {
     if (!await isRequestAuthorized(request, env)) return error('Sync password required.', 401, { authRequired: true });
     const bucket = getBucket(env);
     if (body.action === 'status') return handleSyncStatus(bucket);
-    if (body.action === 'commit') return handleSyncCommit(bucket, body, ctx);
+    if (body.action === 'commit') return handleSyncCommit(bucket, body);
     if (body.action === 'sweep') return handleSyncSweep(bucket);
     return error('Unsupported action.', 404);
 }
@@ -1622,30 +1618,12 @@ async function serveGalleryPage(request, env) {
     return error('图库页面缺失，请检查部署是否包含 gallery.html。', 500);
 }
 
-function imageAdminSessionToken(password) {
-    return sha256Text(`rp-image-admin:${password}`);
-}
-
-function readCookie(request, name) {
-    const header = request.headers.get('cookie') || '';
-    const prefix = `${name}=`;
-    return header
-        .split(';')
-        .map(part => part.trim())
-        .find(part => part.startsWith(prefix))
-        ?.slice(prefix.length) || '';
-}
-
-function imageAdminSessionCookie(value) {
-    return `${IMAGE_ADMIN_AUTH_COOKIE}=${value}; Path=/image; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax`;
-}
-
+// 图库鉴权只认密码头（gallery.html 每个请求都从 localStorage 带上
+// x-rp-sync-password）；个人项目不需要第二通道。
 async function isImageAdminAuthorized(request, env) {
     const expectedPassword = getSyncPassword(env);
     if (!expectedPassword) return true;
-    if ((request.headers.get(SYNC_PASSWORD_HEADER) || '') === expectedPassword) return true;
-    const sessionToken = readCookie(request, IMAGE_ADMIN_AUTH_COOKIE);
-    return Boolean(sessionToken) && sessionToken === await imageAdminSessionToken(expectedPassword);
+    return (request.headers.get(SYNC_PASSWORD_HEADER) || '') === expectedPassword;
 }
 
 function normalizeImageObject(object) {
@@ -1749,11 +1727,7 @@ async function handleImageAdmin(request, env, url, ctx) {
         return serveGalleryPage(request, env);
     }
     if (url.pathname === `${IMAGE_ADMIN_PATH}/api/auth-status`) {
-        const status = await authStatusPayload(request, env, isImageAdminAuthorized);
-        const headers = status.authRequired && status.authenticated
-            ? { 'set-cookie': imageAdminSessionCookie(await imageAdminSessionToken(getSyncPassword(env))) }
-            : {};
-        return json(status, 200, headers);
+        return json(await authStatusPayload(request, env, isImageAdminAuthorized));
     }
     if (!await isImageAdminAuthorized(request, env)) {
         return error('Sync password required.', 401, { authRequired: true });

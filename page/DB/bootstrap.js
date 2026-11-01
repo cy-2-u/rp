@@ -2245,7 +2245,12 @@ function createAutoSaveScheduler(options = {}) {
             return;
         }
         const time = new Date(record.at);
-        const text = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')} ${record.ok ? '同步成功' : '同步失败'}`;
+        // 跨天的记录带日期前缀，避免旧时刻看起来像今天同步过。
+        const clock = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+        const now = new Date();
+        const sameDay = time.getFullYear() === now.getFullYear()
+            && time.getMonth() === now.getMonth() && time.getDate() === now.getDate();
+        const text = `${sameDay ? clock : `${time.getMonth() + 1}/${time.getDate()} ${clock}`} ${record.ok ? '同步成功' : '同步失败'}`;
         badge.textContent = text;
         badge.className = `rp-sync-last-sync ${record.ok ? 'is-ok' : 'is-fail'}`;
     }

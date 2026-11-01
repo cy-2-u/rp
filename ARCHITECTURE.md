@@ -211,6 +211,7 @@ npm run code-audit    # 死代码静态审计：零引用顶层函数候选 + �
 
 - Worker 保持单文件、无构建步骤、无 `import`/顶层 `await`。
 - `page/` 是唯一发布正本；本地手动部署直接上传该目录，部署器（`deployer/worker.js`）部署/更新时实时从仓库 `main` 的 `page/` 拉文件，无需打包 page.zip。
+- 部署器后端源码在 `deployer/worker.js`（线上跑在独立 Worker，需手动同步部署）；其 `ASSETS` 资产清单必须与 `page/` 发布文件集逐一致，改动 page/ 文件集时同步更新。改动部署器后跑离线全流程测试：`node deployer/test-blake3.mjs && node deployer/test-flow.mjs`（mock fetch 与 CF API，37 + 101 项断言）。
 - 改同步协议必须同时改 `page/_worker.js`、`page/DB/bootstrap.js`、`tests/`（三方 canonical 校验和源逐字一致，audit-regressions 有断言）。
 - `page/DB/dirty-tracker.js` 与 `page/DB/bootstrap.js` 的协议常量是**人肉双写副本**，任何一侧改名必须双侧同步（audit-regressions 静态断言逐字比较）。
 - 改适配层时：锚点变化只改 `ANCHORS` 表；契约变化必须升 `version` 并同步系统侧。

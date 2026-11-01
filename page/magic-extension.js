@@ -1,7 +1,7 @@
 // RP Hub 魔改版 - 图片业务
 //
 // 通过 window.RPHubExternal v2 契约取得作者上下文：注册 image-request /
-// character-deleted 回调，管理生图任务、固定记录、缩略图与生图门控。
+// character-deleted 回调，管理生图任务、固定记录与生图门控。
 // 只在主页加载；图片记录保存在 RPHubDB/store 的 rp_hub_image_renders_<角色UUID>。
 (function () {
     if (location.pathname !== '/' && location.pathname !== '/index.html') return;
