@@ -174,7 +174,7 @@ JSON.stringify([
 - **与旧版部署逐字节兼容（重写期间经交叉测试验证后退役）**：图片键推导（参数集、默认值、签名 JSON、键路径、缩略图/墓碑派生键）与旧 Worker 逐字节一致，验证套件（原 `image-compat.mjs`）曾让新旧 Worker 共用同一 R2 桶交叉确认：同参数键一致、旧图直接命中缓存复用、缩略图跨版本读写、墓碑跨版本生效。兼容性成立后该套件连同旧 Worker 参考一并移除；同一 R2 桶先旧版后新版部署，已有图片库无缝沿用（生产已验证）。
 - 生图只接受 POST（GET/HEAD 只读缓存或 404）；24MiB/16MiB（ynai JSON）/2MiB（缩略图）有界读取；墓碑优先读取（删除后的生图读取立即返回占位图，不泄漏旧图）。
 - 两阶段删除：先写墓碑并返回，后台清理原图/缩略图；每请求 ≤20 目标，清空角色按游标续传。**图片墓碑不参与分片回收**——它们有自己的生命周期，删除墓碑会让旧链接重新生图。
-- `/image` 图库页是静态资产 `page/gallery.html`（Worker 经 ASSETS 提供）；管理端点与聊天端点共用缩略图读写实现。
+- `/image` 图库页是静态资产 `page/gallery.html`（Worker 经 ASSETS 提供）；缩略图读写归图库管理端点（图库自带按需回填），**聊天卡片恒显原图**，聊天端不生成也不展示缩略图。
 - ynai 中转端点只认 `page/config.json`（无代码兜底，配置缺失时 ynai 生图显式 503）。
 
 ## 5. 测试
@@ -194,7 +194,7 @@ npm run code-audit    # 死代码静态审计：零引用顶层函数候选 + �
 | `protocol-smoke.mjs` | 适配脚本链（注入顺序/外部优先/失败回退/last-good 持久化）、同步协议（上传/幂等/缺包 409/版本单调/CAS 收敛/孤儿回收/sweep/下载/密码门禁） |
 | `image-regressions.mjs` | 生图签名与键稳定、缓存与 ETag、GET 不生图、角色名净化、缩略图、墓碑两阶段删除、24MiB 上限、ynai/sta1n 路由、模型列表、图库页 |
 | `legacy-upgrade.mjs` | v1 遗留本地状态升级回归（旧缓存索引/旧日志/旧分片残留）+ 中断续传：分片元数据始终合法 |
-| `magic-behavior.mjs` | **真实适配脚本 + 真实 Vue 桥接 + 真实 magic-extension**：生图全链路（hydrate→imageTask→上游一次→固定记录落库）、重渲染复用记录不重新生成、无记录 key 直读不打上游、缩略图回填通路、图片 flush |
+| `magic-behavior.mjs` | **真实适配脚本 + 真实 Vue 桥接 + 真实 magic-extension**：生图全链路（hydrate→imageTask→上游一次→固定记录落库）、重渲染复用记录不重新生成、无记录 key 直读不打上游、卡片原图展示、图片 flush |
 | `realistic-sim.mjs` | 真实形态假数据（角色卡/长对话/内嵌 base64 图/设置键）端到端：首次上传、无变化 1 请求、会话续写增量、图片库全流程、全量恢复字节级抽查、恢复缓存命中 |
 | `client-sim.mjs` | jsdom + fake-indexeddb + **真实** bootstrap/dirty-tracker/worker 端到端：首次上传、无变化 1 请求、严格增量、恢复、二次恢复缓存命中、单条超 4MiB 大记录（entries=0 填充片跨片拼接）、规模模式（分片数、压缩率、请求数） |
 | `adapter-contract.mjs` | 真实 Vue + 真实适配脚本 + 模拟作者 app：契约 v2、能力报告、保存标记捕获、flush 稳定判定、忙碌拒绝、上下文/槽位、注册钩子 |

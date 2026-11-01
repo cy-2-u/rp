@@ -1442,7 +1442,7 @@ async function putImageThumbnail(bucket, imageKey, bytes) {
     return thumbKey;
 }
 
-// 缩略图读取/写入（聊天端点与图库管理端点共用）：写入要求原图存在。
+// 缩略图读取/写入（图库管理端点使用；聊天卡片恒显原图，聊天端不写缩略图）：写入要求原图存在。
 async function handleThumbRequest(request, bucket, key) {
     const thumbKey = createImageThumbKeyFromImageKey(key);
     if (!thumbKey) return error('图片路径无效。', 400);
@@ -1487,7 +1487,8 @@ async function handleThumbRequest(request, bucket, key) {
 
 async function handleImageRender(request, env) {
     const url = new URL(request.url);
-    // 缩略图端点先分发：客户端用 PUT 上传缩略图，不受生图端点的方法守卫约束。
+    // 缩略图端点先分发：图库页经 /image/api/thumb 使用同一处理器，此处是
+    // 历史聊天端 PUT 入口，不受生图端点的方法守卫约束。
     if (url.searchParams.get('thumb') === '1') {
         const key = url.searchParams.get('key') || '';
         if (!isValidImageObjectKey(key)) return error('图片路径无效。', 400);

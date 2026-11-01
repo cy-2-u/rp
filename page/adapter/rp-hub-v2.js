@@ -253,50 +253,6 @@
             image.src = src;
         }
     };
-    const thumbBackfill = (card, image, task) => {
-        const imageKey = image.dataset.rphImageKey || '';
-        let token = '';
-        try {
-            token = new URL(task?.requestUrl || '', location.href).searchParams.get('token') || '';
-        } catch (_) { }
-        if (!imageKey) return;
-        const backfill = window.RPH_MAGIC_BACKFILL_THUMB;
-        if (typeof backfill !== 'function') return;
-        card.classList.add('is-image-thumb-pending');
-        backfill(imageKey, token).then(thumbUrl => {
-            image.dataset.rphThumbFailed = '';
-            image.dataset.rphThumbSrc = thumbUrl;
-            card.classList.remove('is-image-thumb-failed', 'is-image-thumb-pending');
-            setCardImageSource(image, `${thumbUrl}${thumbUrl.includes('?') ? '&' : '?'}_rph_retry=${Date.now()}`);
-        }).catch(() => {
-            card.classList.remove('is-image-thumb-pending');
-            card.classList.add('is-image-thumb-failed');
-        });
-    };
-    const bindThumbEvents = (card, image, task) => {
-        if (!image || image.dataset.rphThumbBound === '1') return;
-        image.dataset.rphThumbBound = '1';
-        image.addEventListener('error', () => {
-            const thumbSrc = image.dataset.rphThumbSrc || '';
-            if (!thumbSrc || image.dataset.rphThumbFailed === '1') return;
-            if (!String(image.currentSrc || image.src || '').includes(thumbSrc.split('?')[0])) return;
-            // 缩略图还没生成：先显示占位，后台回填 480px WebP；绝不自动
-            // 回退到原图，避免聊天列表一次拉取几十张大图。
-            image.dataset.rphThumbFailed = '1';
-            image.removeAttribute('src');
-            card.classList.add('is-image-thumb-failed');
-            thumbBackfill(card, image, task);
-        });
-        // 显式"查看大图"才加载原图。
-        image.addEventListener('click', () => {
-            if (image.dataset.rphThumbFailed !== '1') return;
-            const fullSrc = image.dataset.rphFullSrc || '';
-            if (!fullSrc) return;
-            image.dataset.rphThumbFailed = '';
-            card.classList.remove('is-image-thumb-failed');
-            setCardImageSource(image, fullSrc);
-        }, true);
-    };
     const renderImage = (card, task, job) => {
         if (!card?.isConnected) return task.cards?.delete(card);
         card.dataset.imageJobState = job.status;
@@ -305,23 +261,10 @@
         if (job.imageUrl) {
             const image = card.querySelector('img');
             if (image) {
-                const fullSrc = new URL(job.imageUrl, task.baseUrl || location.href).href;
-                const thumbSrc = job.thumbUrl
-                    ? new URL(job.thumbUrl, task.baseUrl || location.href).href
-                    : '';
                 image.style.height = '100%';
-                image.dataset.rphFullSrc = fullSrc;
-                image.dataset.rphImageKey = (() => {
-                    try { return new URL(fullSrc).searchParams.get('key') || ''; } catch (_) { return ''; }
-                })();
-                if (thumbSrc) {
-                    image.dataset.rphThumbSrc = thumbSrc;
-                    bindThumbEvents(card, image, task);
-                    if (image.dataset.rphThumbFailed !== '1') setCardImageSource(image, thumbSrc);
-                } else {
-                    delete image.dataset.rphThumbSrc;
-                    setCardImageSource(image, fullSrc);
-                }
+                // 聊天卡片恒显原图（用户决策）：懒加载 + 300px 预取距离控制
+                // 滚动集中加载；缩略图体系归图库页自管（自带按需回填）。
+                setCardImageSource(image, new URL(job.imageUrl, task.baseUrl || location.href).href);
             }
         }
         const label = card.querySelector(imageUi.progressLabel);
@@ -621,9 +564,7 @@
             '.magic-image-load-error{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;background:#f8fafc;color:#64748b;font-size:14px}',
             '.magic-image-load-error button{padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:white;color:#2563eb;cursor:pointer}',
             '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}',
-            '.generated-image-card.is-generating ' + (pickSelector(imageUi.reroll) || '.generated-image-reroll') + '{opacity:.45;pointer-events:none}',
-            '.generated-image-card.is-image-thumb-failed img{opacity:.18;filter:grayscale(1)}',
-            '.generated-image-card.is-image-thumb-failed::after{content:"缩略图生成中…";position:absolute;inset:auto 0 12px 0;text-align:center;font-size:12px;color:#64748b}'
+            '.generated-image-card.is-generating ' + (pickSelector(imageUi.reroll) || '.generated-image-reroll') + '{opacity:.45;pointer-events:none}'
         ].join('');
         document.head.appendChild(style);
     };

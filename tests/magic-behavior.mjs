@@ -1,8 +1,8 @@
 // magic-extension.js 行为测试：真实适配脚本（兜底版）+ 真实 Vue 桥接 +
 // 真实图片业务脚本跑在 jsdom + fake-indexeddb，图片 API 直连真实 _worker.js
 // 与假 R2。驱动路径与作者端一致：chatContainer watcher → hydrate →
-// loadCard → magic imageTask。覆盖：生图全链路（生成→缩略图→固定记录
-// 持久化）、无上下文降级、自动生图门控抑制、缩略图回填、图片 flush。
+// loadCard → magic imageTask。覆盖：生图全链路（生成→固定记录持久化）、
+// 无上下文降级、自动生图门控抑制、图片 flush。
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -246,7 +246,7 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 300));
     const jobState = card.dataset.imageJobState;
     assert(['done', 'loading', 'failed'].includes(jobState || ''), `卡片任务状态合法（${jobState}）`);
-    // 等任务结算（生成 + 缩略图 + 记录落库）。
+    // 等任务结算（生成 + 记录落库）。
     for (let waited = 0; waited < 10000; waited += 50) {
         if (card.dataset.imageJobState === 'done') break;
         await new Promise(resolve => setTimeout(resolve, 50));
@@ -254,13 +254,9 @@ async function main() {
     assertEqual(card.dataset.imageJobState, 'done', '生图任务完成');
     assert((img.getAttribute('src') || '').includes('/api/rp-image'), '卡片图片指向本站代理地址');
     assertEqual(worker.upstreamCount(), 1, '生图上游只调用一次');
-    // 原图落 R2；缩略图取决于环境：真实浏览器走 canvas WebP 成功上传，
-    // jsdom 无位图解码 → createImageThumbnailBlob 失败 → thumbFailed 降级
-    // 路径（原图 URL 展示 + 回填队列），两者都是设计行为。
+    // 原图落 R2（聊天卡片恒显原图；缩略图体系归图库页自管，聊天端不再上传）。
     const objects = await worker.bucket.list({ prefix: 'rp-images/' });
     assert(objects.objects.some(object => object.key.startsWith('rp-images/characters/')), '原图入 R2');
-    const thumbUploaded = objects.objects.some(object => object.key.startsWith('rp-images/thumbs/'));
-    console.log(`  [环境] 缩略图上传：${thumbUploaded ? '成功（canvas 可用）' : '按设计降级（jsdom 无位图解码）'}`);
     // 固定记录持久化进 RPHubDB。
     const records = await readImageRecords(a.idb, 'char-1');
     assertEqual(records.length, 1, '固定记录写入');
@@ -300,19 +296,7 @@ async function main() {
     assert(['done', 'failed'].includes(card3.dataset.imageJobState), '缺图卡片状态结算');
     assertEqual(worker.upstreamCount(), 1, '缺图直读不触发上游生图');
 
-    // ---- 场景 4：缩略图回填（RPH_MAGIC_BACKFILL_THUMB）----
-    // 真实浏览器：拉原图→canvas WebP→PUT 成功。jsdom 无位图解码也缺
-    // URL.createObjectURL，回填会按环境失败——验证的是通路可达与失败原因合理。
-    const imageKey = records[0].imageKey;
-    const thumbKey = imageKey.replace('rp-images/characters/', 'rp-images/thumbs/') + '.webp';
-    await worker.bucket.delete(thumbKey);
-    assert(!(await worker.bucket.get(thumbKey)), '缩略图已清除');
-    const backfill = window.RPH_MAGIC_BACKFILL_THUMB(imageKey, 'TOK');
-    const outcome = await backfill.then(() => 'ok', error => `failed: ${error?.message || error}`);
-    console.log(`  缩略图回填结果：${outcome}`);
-    assert(outcome === 'ok' || outcome.startsWith('failed: '), '回填通路可达（成功或按环境限制失败）');
-
-    // ---- 场景 5：RPH_MAGIC_FLUSH_IMAGES 结算未落盘写 ----
+    // ---- 场景 4：RPH_MAGIC_FLUSH_IMAGES 结算未落盘写 ----
     await window.RPH_MAGIC_FLUSH_IMAGES();
     const recordsAfterFlush = await readImageRecords(a.idb, 'char-1');
     assertEqual(recordsAfterFlush.length, 1, 'flush 后记录稳定');
