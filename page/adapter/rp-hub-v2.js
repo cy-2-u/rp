@@ -199,7 +199,13 @@
     });
     if (storageExport) storageExport = wrapStorage(storageExport);
 
-    // ---- 图片渲染与缩略图 ----
+    // ---- 图片渲染 ----
+    // 【产品决策，勿回退】聊天卡片恒显原图，聊天端不做缩略图（2026-11 应
+    // 用户要求移除了曾经实现的"缩略图优先 + 失败回填 + 绝不回退原图"完整
+    // 体系——聊天页就是要看原图）。长会话集中加载靠懒加载缓解（Intersection
+    // Observer + loading=lazy + 300px 预取距离），不要重新引入缩略图展示。
+    // 缩略图只属于图库页（/image）：gallery.html 自带按需回填，Worker 的
+    // /api/rp-image?thumb=1 与 /image/api/thumb 端点均为图库服务。
     const imageUi = ANCHORS.images;
     const context = card => {
         if (!state) return null;
