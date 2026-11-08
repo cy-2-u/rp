@@ -1,9 +1,6 @@
-// RP Hub 魔改版 - 同步客户端 v2
-//
-// 协议：rp-sync/v2（全量根清单 + gzip 内容寻址分片，无服务端会话、无分页清单、
-// 无 Bloom、无 GC 状态机）。上传 = 逐片 PUT（幂等）→ commit（CAS 切根，服务端
-// 顺带回收孤儿分片）；恢复 = 读根清单 → 逐片 GET（边缘缓存）→ 两遍 staging 恢复。
-// 设计前提：个人单用户、无并发写者；免费版网络（国内高延迟）优先优化请求数与字节。
+// RP Hub 魔改版 - 同步客户端 v2：上传 = 逐片 PUT（幂等）→ commit（CAS 切根 +
+// 服务端顺带回收孤儿）；恢复 = 读根清单 → 逐片 GET → 两遍 staging 恢复。
+// 设计前提：个人单用户；国内高延迟下优先优化请求数与字节。
 function createAutoSaveScheduler(options = {}) {
     const setTimer = options.setTimeout || setTimeout;
     const clearTimer = options.clearTimeout || clearTimeout;
@@ -700,9 +697,7 @@ function createAutoSaveScheduler(options = {}) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    // 让出控制器：连续工作超过间隔后让出主线程。后台准备期间启用低占空比
-    // 模式（工作 6ms → 睡 8ms，约 43%），手机上完整扫描不持续烧 CPU、不抢
-    // 作者前端的性能；上传路径保持全速（工作 12ms → 让出 0ms）。
+    // 让出控制器：后台准备用低占空比（6ms 工作/8ms 让出）避免烧 CPU，上传全速。
     let backgroundYield = false;
     function createYieldController() {
         let lastYieldAt = performance.now();
@@ -779,9 +774,7 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
-    // 读取变更日志：afterDatabases 给出各库已消费的水位（journal 自增主键）
-    // 时只扫描其后的事件——历史事件早已差分进缓存，重放只会靠字节比较幂等
-    // 地空转；watermark 记录本次扫到的末尾，供上传成功后整段确认。
+    // 读变更日志：afterDatabases 水位之后只扫新事件；watermark 记录扫到的末尾供确认。
     async function readDirtyState(afterDatabases = null) {
         const watermark = { databases: {}, intents: [] };
         const dirty = { localStorage: new Set(), stores: new Map(), watermark, epochs: {} };
@@ -823,11 +816,9 @@ function createAutoSaveScheduler(options = {}) {
         localStorage.setItem('rp_sync_rebuild_requested', '1');
     }
 
-    // 无变化快速通道判定（纯本地读取，不发网络）。安全判据是"变更日志已
-    // 全部确认"：数字键为空 = acknowledge 追平了最后一次快照准备的水位 =
-    // 缓存快照与云端根一致（期间若有 prepare 消费过未上传的新写入，那些
-    // 事件会留在 journal 里，判据自然不成立）。__epoch__ 变化说明追踪被
-    // 重置，必须走完整流程；localStorage 意图存在说明有待同步的应用键写入。
+    // 无变化快速通道判据：journal 数字键空（acknowledge 追平）+ epoch 未变 +
+    // 无意图键 ⇒ 缓存快照与云端一致。prepare 消费过未上传的写入时事件留在
+    // journal，判据自然不成立；判定失败一律回退完整流程。
     async function journalIsFullyAcknowledged(expectedEpochs) {
         for (let index = 0; index < localStorage.length; index += 1) {
             if (String(localStorage.key(index) || '').startsWith(STORAGE_INTENT_PREFIX)) return false;
@@ -1153,8 +1144,7 @@ function createAutoSaveScheduler(options = {}) {
         return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
     }
 
-    // gzip/解压：CompressionStream 在所有受支持浏览器可用；不可用时显式报错
-    // （协议双方都固定 gzip，不做无压缩回退，保持键稳定）。
+    // 协议双方固定 gzip，不做无压缩回退（键稳定）。
     async function gzipBytes(bytes) {
         if (typeof CompressionStream !== 'function') throw new Error('当前浏览器不支持 CompressionStream，无法同步。');
         const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
@@ -1169,16 +1159,13 @@ function createAutoSaveScheduler(options = {}) {
 
     function serializeSnapshotObject(value) {
         const seen = new Set();
-        // 跨 realm 安全的"普通对象"判定：普通对象的原型链是 Object.prototype
-        // （或 null），再往上一层必然是 null；类实例/Map/Set 的原型链更长。
-        // 不直接比较 Object.prototype 是为了兼容多 realm 嵌入环境。
+        // 跨 realm 安全的普通对象判定（原型链两层内到顶），兼容多 realm 嵌入环境。
         const isPlainObject = item => {
             const proto = Object.getPrototypeOf(item);
             return proto === null || Object.getPrototypeOf(proto) === null;
         };
         const canonical = item => {
-            // Date 是作者数据里合法且常见的类型；JSON 本身没有日期，统一转
-            // ISO 字符串，保证同一时刻在不同浏览器得到相同 canonical 字节。
+            // Date → ISO：保证不同浏览器得到相同 canonical 字节。
             if (item instanceof Date) {
                 if (!Number.isFinite(item.getTime())) {
                     throw new Error('数据包含无效日期，已停止同步以避免丢失。');
@@ -1404,10 +1391,8 @@ function createAutoSaveScheduler(options = {}) {
                 : value.type === 'recordArrayEnd'
                     ? '2'
                     : '1';
-        // 恢复路径直接透传数据包里的行字节（本就是同一规范序列化器产出、
-        // 上传时经 sha256 验证的），省掉对全量数据再跑一遍序列化。
-        // 但行字节通常是分片的 subarray；在这里复制到精确长度的自有缓冲区，
-        // 避免 structured clone 把整个分片的 backing buffer 一并持久化。
+        // 恢复路径透传包内行字节（省二次序列化）；复制到精确长度缓冲，
+        // 避免 structured clone 连分片 backing buffer 一起持久化。
         const bytes = canonicalBytes ? new Uint8Array(canonicalBytes) : serializeSnapshotObject(value);
         if (bytes.byteLength > MAX_SUPPORTED_OBJECT_BYTES) throw new Error('单条本地数据超过 64MiB 同步上限。');
         return { id, group, sourceKey, sortKey: `${sourceKey}|${sequence}`, bucketKey: snapshotEntryBucket(value, id, sourceKey), bytes };
@@ -1441,9 +1426,7 @@ function createAutoSaveScheduler(options = {}) {
         return waitForTransaction(tx, '本地同步记录读取失败。', () => requests.map(request => request.result));
     }
 
-    // 分片组装：把一个桶的全部 canonical 行字节顺序填入 4MiB 缓冲，逐片
-    // gzip 后内容寻址。缓存 packs 保存【gzip 后字节】（键 = gzip 校验和），
-    // 上传直接复用、恢复直接落盘，raw 字节只存在于 entries 与组装缓冲中。
+    // 分片组装：桶内行字节顺序填 4MiB 缓冲 → gzip → 内容寻址；缓存存 gzip 字节。
     async function buildCachedPacks(db, bucketKey, buffer) {
         const packs = [];
         buffer = buffer || new Uint8Array(CONFIG.targetPackBytes);
@@ -1555,8 +1538,7 @@ function createAutoSaveScheduler(options = {}) {
     async function updateCachedSnapshot(cacheDb, state, dirty) {
         const affectedBuckets = new Set(state.pendingBuckets || []);
         let bucketsDirty = false;
-        // 触桶只做内存标记，条目落盘前由 flushPendingBuckets 统一持久化：保住
-        // "条目已写入 ⇒ 其所在桶必已在 pendingBuckets"的崩溃安全不变量。
+        // 先持久化触桶记录再落条目：保住"条目已写入 ⇒ 桶已标记"的崩溃安全不变量。
         const touchBucket = bucket => {
             if (affectedBuckets.has(bucket)) return;
             affectedBuckets.add(bucket);
@@ -1675,8 +1657,7 @@ function createAutoSaveScheduler(options = {}) {
                 const localGroup = otherGroups.includes('localStorage') ? ['localStorage'] : [];
                 state.groups = [...localGroup, ...otherGroups.filter(group => group !== 'localStorage'), `db:${database}:header`, ...dbGroups, `db:${database}:footer`];
                 if (item.clear) {
-                    // clear 按最终键集合做差分：只删除真正消失的键；clear 后原样
-                    // 回填的数据继续交给键循环字节比较去重，不再整店重写缓存。
+                    // clear 按最终键集合差分，只删真正消失的键；回填数据交给字节比较去重。
                     const finalSources = new Set();
                     for (const key of item.keys.values()) {
                         if (!isSyncExcludedRecord(database, store, key)) {
@@ -1783,10 +1764,8 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
-    // ---- 后台快照准备（消除"点上传才开始整理"的等待）----
-    // 业务写入（rphub:dirty 事件）与页面加载会触发后台准备：把 journal 差分、
-    // 缓存重建与 gzip 分片全部提前完成，上传时只剩网络阶段。单飞保证后台
-    // 准备与上传准备永不并发写缓存；后台期间打开同步面板可实时看到进度。
+    // ---- 后台快照准备：写入/页面加载触发，差分与分片提前完成，上传只剩网络；
+    // 单飞保证与上传准备永不并发写缓存。----
     let prepareInFlight = null;
     let prepareTimer = null;
 
@@ -1834,9 +1813,7 @@ function createAutoSaveScheduler(options = {}) {
         }, delayMs);
     }
 
-    // 上传前的准备：先等在飞的后台准备收尾（避免并发写缓存），随后再跑一次
-    // 增量——后台刚完成时差分为空、瞬间完成，同时保证覆盖最新写入。等待期间
-    // 解除后台低占空比：用户已明确要上传，剩余增量全速完成。
+    // 上传前：等在飞后台准备收尾再补一次增量，覆盖最新写入；解除低占空比全速跑。
     async function prepareForUpload(progressStart, progressEnd) {
         if (prepareInFlight) {
             backgroundYield = false;
@@ -1967,11 +1944,8 @@ function createAutoSaveScheduler(options = {}) {
         try {
             const local = await cacheReadState(cacheDb);
             const rebuild = localStorage.getItem('rp_sync_rebuild_requested') === '1';
-            // 增量消费：有可用本地索引时只扫描上次消费水位之后的新事件——
-            // 历史事件早已差分进缓存，重放只会靠字节比较幂等地空转。重建/首建
-            // 走全量扫描（相对全量数据读取可忽略；换新日志后旧水位不可复用，
-            // 必须重新建立）。journalWatermark 失效于 version/epoch/reset 检查：
-            // 一旦索引被判过期整体作废，不会把旧索引下的消费进度写回。
+            // 增量消费：只扫上次水位之后的新事件（重建/首建走全量）；
+            // 索引过期整体作废，不把旧索引的消费进度写回。
             const incremental = Boolean(local) && !rebuild;
             const afterDatabases = incremental ? local?.journalWatermark?.databases || null : null;
             const dirty = await readDirtyState(afterDatabases);
@@ -1985,10 +1959,8 @@ function createAutoSaveScheduler(options = {}) {
             const result = rebuild || !local
                 ? await buildFullCachedSnapshot(cacheDb, progressStart, progressEnd)
                 : await updateCachedSnapshot(cacheDb, local, dirty);
-            // 消费水位推进到本次扫描末端：本次读取/差分已覆盖其全部效果；期间
-            // 新到的事件键值必然更大，下轮增量补上。合并 afterDatabases 同时让
-            // acknowledge 覆盖"以前消费过但上传未成功"的旧段——增量扫描没扫到
-            // 新事件时它不出现，漏合并会让那段日志永远无法确认删除。
+            // 水位推到本次扫描末端；合并旧水位，让 acknowledge 也能覆盖
+            // "以前消费过但上传未成功"的旧段。
             const consumedDatabases = incremental
                 ? { ...afterDatabases, ...dirty.watermark.databases }
                 : { ...dirty.watermark.databases };
@@ -2142,10 +2114,8 @@ function createAutoSaveScheduler(options = {}) {
         });
     }
 
-    // commit：全部包已在云端后 CAS 切根。409 missing 时按【整桶】重建分片
-    // 并重传（gzip 字节可能与上次不同，校验和随之更新），最多 3 轮。
-    // 返回 { checksum, reclaimed }：reclaimed 是服务端未确认删除的孤儿数，
-    // 0 表示本轮提交没有需要 sweep 兜底的残留。
+    // commit：CAS 切根；409 missing 按整桶重建重传（最多 3 轮）。
+    // reclaimed = 服务端未确认删除的孤儿数，0 则客户端不用补发 sweep。
     async function commitSnapshot(cacheDb, local, remote, progress, uploadedSet) {
         let root = await buildRootManifest(local, remote?.version || 0);
         for (let round = 0; round < 3; round += 1) {
@@ -2854,8 +2824,7 @@ function createAutoSaveScheduler(options = {}) {
         pushButton = modalRoot.querySelector('[data-action="push"]');
         rebuildButton = modalRoot.querySelector('[data-action="rebuild"]');
         renderLastSync();
-        // 重建是恢复手段不是常规操作：默认隐藏。推送遇索引错误时经确认
-        // 自动重建并继续；拒绝时才显示按钮走手动路径。
+        // 重建默认隐藏：推送遇索引错误经确认自动重建；拒绝才显示按钮。
         rebuildButton.style.display = 'none';
         initializeAutoSave();
 
@@ -2901,11 +2870,9 @@ function createAutoSaveScheduler(options = {}) {
     // ---- 上传主流程 ----
     async function commitObjectSnapshot(progress, options = {}) {
         updateProgress(progress.check, '准备中…');
-        // 无变化自动保存快速通道：journal 无新事件 + 有未过期的"上次提交校验
-        // 和"→ 数据与上次成功提交完全一致，整次跳过网络（省一次 status RTT），
-        // 只确认水位。定期（fastPathVerifyIntervalMs）放行一次完整验证，防止
-        // 云端根被外部改写后永不自愈；手动上传永远走完整流程（用户在等结果，
-        // 要确定性）。
+        // 无变化快速通道（仅自动保存）：journal 已确认 + committed 记忆未过期
+        // ⇒ 跳过网络直接返回；每 fastPathVerifyIntervalMs 放行一次完整验证，
+        // 手动上传永远走完整流程。
         if (options.automatic) {
             const cacheDb = await openLocalSyncCache();
             let fastPath = null;
@@ -2966,8 +2933,7 @@ function createAutoSaveScheduler(options = {}) {
         let reclaimed = 0;
         try {
             updateProgress(progress.uploadStart, '正在上传并提交…');
-            // 云端已有的分片（内容寻址、put 时经 sha256 校验）无需重传：
-            // 预置进已确认集合，增量上传只传真正新增/变化的分片。
+            // 云端已有分片预置进已确认集合：增量只传新增/变化的分片。
             const uploaded = new Set((remote?.packs || []).map(pack => pack.checksum));
             await uploadPacks(cacheDb, local, progress, uploaded);
             // 服务端已校验全部包存在并 CAS 切根；返回值带孤儿残留数。
@@ -2977,9 +2943,7 @@ function createAutoSaveScheduler(options = {}) {
         }
         await rememberCommittedRoot(localRoot.checksum);
         await window.RPH_SYNC_TRACKER.acknowledge(watermark);
-        // sweep 只为服务端未确认删除的孤儿兜底（正常提交由服务端顺带回收，
-        // 缺包重传轮的整桶替换也会在响应里带回残留数）。零残留时省掉这趟
-        // 往返——高延迟线路上每次上传少花一个 RTT。
+        // sweep 只兜底服务端未确认删除的孤儿；零残留省一趟 RTT。
         if (reclaimed > 0) {
             postSync({ action: 'sweep' }, { retryCount: 1, timeoutMs: CONFIG.commitTimeoutMs }).catch(() => { });
         }
@@ -3118,9 +3082,8 @@ function createAutoSaveScheduler(options = {}) {
         }));
     }
 
-    // 下载批次：滑动窗口维持 6 路在途；下载字节先按清单校验（gzip 字节的
-    // SHA-256 与长度），再解压出 raw JSONL 写 staging；gzip 字节同时写入
-    // 本地缓存（命中缓存只验证长度，写入缓存前已按校验和完整验证过）。
+    // 下载：6 路滑动窗口；字节按校验和验证后解压写 staging，同时进本地缓存
+    // （缓存命中只验长度——入缓存时已完整验证）。
     async function* downloadPacksToStaging(remote, stagingDb) {
         await clearDownloadStagingStore(stagingDb);
         const cacheDb = await openLocalSyncCache().catch(() => null);
@@ -3620,10 +3583,8 @@ function createAutoSaveScheduler(options = {}) {
             );
             updateProgress(72, '正在恢复…');
             const restoreEpoch = crypto.randomUUID();
-            // 写冻结信号先于任何业务库写入：其他标签页收到 storage 事件后
-            // 暂停写入并显示恢复遮罩；本标签页由 waitForIndexedDbWriteBarrier
-            // 等待在途写事务收尾。恢复中途失败时保留该标记（其他标签页
-            // 维持写冻结），由中断恢复流程接管或完整重试后清除。
+            // 冻结信号先于业务写入：其他标签页收到事件即暂停并遮罩；本页由
+            // 写屏障等在途事务收尾。恢复失败保留标记，由中断恢复流程接管。
             localStorage.setItem(RESTORE_ACTIVE_KEY, restoreEpoch);
             localStorage.setItem(RESTORE_EPOCH_KEY, restoreEpoch);
             await waitForIndexedDbWriteBarrier();
@@ -3690,9 +3651,7 @@ function createAutoSaveScheduler(options = {}) {
     const accessGateReady = startAccessGate();
 
     if (!RESTORE_PAGE) {
-        // 后台快照准备触发器：业务写入后防抖 8 秒；回到前台尽快补一次；
-        // 页面加载预热 3 秒——首次使用（无本地索引）时提前完整扫描，
-        // 让"首次上传"不再从零等待。
+        // 后台准备触发：写入防抖 8s、回前台 1s、加载预热 3s（首用提前全量扫描）。
         window.addEventListener('rphub:dirty', () => scheduleBackgroundPrepare());
         document.addEventListener('visibilitychange', () => {
             if (isAutoSavePageActive()) scheduleBackgroundPrepare(1000);

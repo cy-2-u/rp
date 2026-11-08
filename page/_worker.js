@@ -51,10 +51,8 @@ const SYNC_REQUEST_MAX_BYTES = 1024 * 1024;
 const COMMIT_ATTEMPTS = 3;
 const PACK_CACHE_TTL_SECONDS = 31536000;
 const SWEEP_GRACE_MS = 60 * 60 * 1000;
-// 根清单按 etag 索引缓存（内容寻址语义下同一 etag 必然同一内容）；
-// 写路径一律 fresh 读取。首版单用户，缓存只为省重复 GET。
-const manifestStateCache = new Map();
-const MANIFEST_STATE_CACHE_MAX = 8;
+// 根清单读路径走 1.5 秒 TTL 缓存（写路径一律 fresh）；不做二级 LRU——
+// 客户端 validateRemoteManifest 反正会全量重算校验和，重复验签是浪费。
 const manifestByBucket = new WeakMap();
 const MANIFEST_STATE_TTL_MS = 1500;
 
@@ -358,7 +356,7 @@ function resolveYnaiConfig(config) {
 // 优先级：外部脚本（config.json / 环境变量）→ 部署兜底脚本（ASSETS）→ R2 last-good。
 // 作者前端改版后只更新外部脚本这一个文件；兜底脚本保证首次部署开箱即用；
 // last-good 保证外部源故障时站点仍可用。全部失败时主页只注入 dirty-tracker。
-let adapterCacheByKey = new Map();
+let adapterCache = null; // { key, value, expiresAt }——单槽足够，运行期源几乎不变
 let adapterLastGoodPersisted = null;
 
 function lightValidateScript(source) {
@@ -394,7 +392,7 @@ async function loadAdapterScript(env) {
     }
     // 缓存按解析后的源键控：外部 URL 变化后 30 秒内也不会拿到旧脚本。
     const cacheKey = externalUrl ? `ext:${externalUrl}` : 'bundled';
-    const cached = adapterCacheByKey.get(cacheKey);
+    const cached = adapterCache?.key === cacheKey ? adapterCache : null;
     if (cached) {
         if (cached.value) {
             if (cached.expiresAt > Date.now()) return cached.value;
@@ -424,8 +422,7 @@ async function loadAdapterScript(env) {
                 sha256: await sha256Text(text),
                 bytes: textEncoder.encode(text).byteLength
             };
-            if (adapterCacheByKey.size >= 4) adapterCacheByKey.clear();
-            adapterCacheByKey.set(cacheKey, { value, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS });
+            adapterCache = { key: cacheKey, value, expiresAt: Date.now() + ADAPTER_CACHE_TTL_MS };
             // 外部脚本与兜底脚本成功时都刷新 last-good：last-good 的语义是
             // "最近一次验证通过的脚本"，不区分来源。
             if (bucket && text !== adapterLastGoodPersisted) {
@@ -441,7 +438,7 @@ async function loadAdapterScript(env) {
             lastError = err;
         }
     }
-    adapterCacheByKey.set(cacheKey, { value: null, expiresAt: Date.now() + ADAPTER_FAILURE_TTL_MS });
+    adapterCache = { key: cacheKey, value: null, expiresAt: Date.now() + ADAPTER_FAILURE_TTL_MS };
     throw lastError || new Error('适配脚本加载失败。');
 }
 
@@ -484,12 +481,11 @@ async function fetchAuthorUpstream(path, init, search) {
 }
 
 // 主页注入顺序固定：dirty-tracker → 适配脚本（内联正文，不发第二次请求）→
-// magic-extension → bootstrap。适配脚本加载失败时只注入 dirty-tracker，
-// 作者 app.js 始终保持原文；后续 app.js 请求不重新判断适配、不改写源码。
-function rewriteAuthorHtml(response, pathname, adapter = null) {
-    const isMain = pathname === '/' || pathname === '/index.html';
+// magic-extension → bootstrap。adapter=null（非主页或加载失败）只注 dirty-tracker；
+// 作者 app.js 始终保持原文。
+function rewriteAuthorHtml(response, adapter = null) {
     const injection = '<script src="/DB/dirty-tracker.js"></script>'
-        + (isMain && adapter
+        + (adapter
             ? '<script>' + adapter.source.replace(/<\/script/gi, '<\\/script') + '</script>'
                 + '<script src="/magic-extension.js"></script>'
                 + '<script src="/DB/bootstrap.js"></script>'
@@ -576,7 +572,7 @@ async function serveAuthor(request, env, ctx) {
     if (!response.ok || !isHtml) return proxied;
     const adapter = requestUrl.pathname === '/' || requestUrl.pathname === '/index.html'
         ? await tryLoadAdapterScript(env) : null;
-    return rewriteAuthorHtml(proxied, requestUrl.pathname, adapter);
+    return rewriteAuthorHtml(proxied, adapter);
 }
 
 async function serveStatic(request, env) {
@@ -606,19 +602,11 @@ function serveSyncRestorePage() {
 
 // ============================================================ 同步 v2 API
 
-// 协议要点（与 bootstrap.js 客户端、tests 三方一致）：
-//   manifest.json = {
-//     format: 'rp-sync-manifest-v2', version, updatedAt,
-//     compression: 'gzip', totalBytes, entryCount,
-//     checksum,                                       // 下方 canonical 源的 SHA-256
-//     packs: [{ bucket, checksum, length, entries }]   // 权威顺序，恢复按此顺序应用
-//   }
-//   checksum 只覆盖内容（不含 version/updatedAt）：同一份内容无论哪个客户端
-//   何时重建根，校验和恒定，"无变化上传"才能稳定判等。version/updatedAt 是
-//   元信息，由版本单调守卫与 CAS etag 保护。
-//   checksum 源 = JSON.stringify([MANIFEST_FORMAT, compression, totalBytes,
-//     entryCount, packs.map(p => [p.bucket, p.checksum, p.length, p.entries])])
-//   packs/<sha256>.bin 为 gzip 后字节，内容寻址，R2 按 sha256 参数校验写入。
+// 协议要点（worker / 客户端 / tests 三方一致）：manifest.json 内含完整分片列表
+// packs:[{bucket,checksum,length,entries}]，权威顺序即恢复顺序；checksum 只覆盖
+// 内容（不含 version/updatedAt——同一内容重建根校验和恒定，"无变化上传"靠它判等）；
+// canonical 源 = JSON.stringify([format, compression, totalBytes, entryCount, packs 元组])；
+// packs/<sha256>.bin 为 gzip 字节，R2 按 sha256 参数校验写入。
 
 function normalizePackEntry(item, index) {
     const bucket = String(item?.bucket || '');
@@ -727,7 +715,7 @@ function publicManifest(root) {
     };
 }
 
-// 读根清单并做完整校验。fresh=true 供写路径使用；读路径走 1.5 秒 TTL 缓存。
+// 读根清单并做结构校验（内容校验和由客户端 validateRemoteManifest 重算）。
 async function readManifestState(bucket, { fresh = false } = {}) {
     if (!fresh) {
         const cached = manifestByBucket.get(bucket);
@@ -751,18 +739,7 @@ async function loadManifestState(bucket) {
     } catch (_) {
         throw new SyncRequestError('服务器同步根清单损坏。', 409);
     }
-    const etag = object.etag || null;
-    const cached = etag ? manifestStateCache.get(etag) : null;
-    if (cached) return { manifest: cached, etag };
-    const normalized = normalizeManifest(value);
-    await verifyManifestChecksum(normalized);
-    if (etag) {
-        if (manifestStateCache.size >= MANIFEST_STATE_CACHE_MAX) {
-            manifestStateCache.delete(manifestStateCache.keys().next().value);
-        }
-        manifestStateCache.set(etag, normalized.root);
-    }
-    return { manifest: normalized.root, etag };
+    return { manifest: normalizeManifest(value).root, etag: object.etag || null };
 }
 
 function invalidateManifestState(bucket) {
@@ -1026,45 +1003,24 @@ async function authStatusPayload(request, env, checkAuthorized) {
     return { ok: true, authRequired, authenticated };
 }
 
+// 同步 JSON 请求体：复用有界文本读取（声明/流中超限统一 413），解析失败 400。
 async function readSyncJsonBody(request) {
-    const contentLength = request.headers.get('content-length');
-    const declaredLength = contentLength === null ? null : Number(contentLength);
-    if (contentLength !== null && (!/^\d+$/.test(contentLength) || !Number.isSafeInteger(declaredLength))) {
-        throw new SyncRequestError('上传请求长度无效。', 400);
-    }
-    if (declaredLength !== null && declaredLength > SYNC_REQUEST_MAX_BYTES) {
-        throw new SyncRequestError('上传请求超过大小上限。', 413);
-    }
-    const reader = request.body?.getReader();
-    const decoder = new TextDecoder('utf-8', { fatal: true });
-    let text = '';
-    let received = 0;
+    let text;
     try {
-        while (reader) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            received += value.byteLength;
-            if (received > SYNC_REQUEST_MAX_BYTES) throw new SyncRequestError('上传请求超过大小上限。', 413);
-            text += decoder.decode(value, { stream: true });
-        }
-        text += decoder.decode();
-        if (declaredLength !== null && received !== declaredLength) {
-            throw new SyncRequestError('上传请求长度与正文不一致。', 409);
-        }
-        const body = JSON.parse(text);
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-            throw new SyncRequestError('Invalid JSON body.', 400);
-        }
-        return body;
+        text = await readBoundedText(request, SYNC_REQUEST_MAX_BYTES);
     } catch (err) {
-        if (err instanceof SyntaxError || err instanceof TypeError) {
-            throw new SyncRequestError('Invalid JSON body.', 400);
-        }
-        throw err;
-    } finally {
-        // 中途失败时放弃剩余正文；正常读完再 cancel 是无害的空操作。
-        try { await reader?.cancel(); } catch (_) { }
+        throw new SyncRequestError(err.message, 413);
     }
+    let body;
+    try {
+        body = JSON.parse(text);
+    } catch (_) {
+        throw new SyncRequestError('Invalid JSON body.', 400);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new SyncRequestError('Invalid JSON body.', 400);
+    }
+    return body;
 }
 
 async function handleSyncApi(request, env, ctx) {
@@ -1272,34 +1228,9 @@ function imageCacheHeaders(etag, extra = {}) {
     };
 }
 
+// ynai 响应 JSON：同一有界读取（超限错误由调用方映射状态码）。
 async function readBoundedJson(response, maxBytes, signal) {
-    const reader = response.body?.getReader();
-    const cancel = () => { if (reader) void reader.cancel().catch(() => {}); };
-    signal?.addEventListener('abort', cancel, { once: true });
-    let text = '';
-    let total = 0;
-    const decoder = new TextDecoder('utf-8', { fatal: true });
-    try {
-        if (Number(response.headers.get('content-length')) > maxBytes) {
-            throw Object.assign(new Error('JSON 响应超过大小上限。'), { status: 413 });
-        }
-        while (reader) {
-            if (signal?.aborted) throw new Error('Image fetch timed out.');
-            const { done, value } = await reader.read();
-            if (signal?.aborted) throw new Error('Image fetch timed out.');
-            if (done) break;
-            total += value.byteLength;
-            if (total > maxBytes) throw Object.assign(new Error('JSON 响应超过大小上限。'), { status: 413 });
-            text += decoder.decode(value, { stream: true });
-        }
-        return JSON.parse(text + decoder.decode());
-    } catch (err) {
-        cancel();
-        throw err;
-    } finally {
-        signal?.removeEventListener('abort', cancel);
-        reader?.releaseLock();
-    }
+    return JSON.parse(await readBoundedText(response, maxBytes, signal));
 }
 
 function decodeImageBase64(encoded) {
@@ -1352,7 +1283,8 @@ async function fetchYnaiGeneratedImage(params, token, ynai) {
             return { bytes: decodeImageBase64(payload?.data?.[0]?.b64_json), contentType: 'image/png' };
         } catch (err) {
             if (signal.aborted) throw err;
-            return error(err.status === 413 ? err.message : '生图服务图片数据无效。', err.status === 413 ? 413 : 502);
+            const oversize = /size limit/i.test(err.message);
+            return error(oversize ? '生图服务响应过大。' : '生图服务图片数据无效。', oversize ? 413 : 502);
         }
     });
 }

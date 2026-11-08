@@ -1,9 +1,6 @@
-// RP Hub 魔改版 - IndexedDB/localStorage 事务级变更日志
-//
-// 职责：把作者业务的每次 IndexedDB 写入（put/add/delete/范围删除/clear/
-// cursor.update）与 localStorage 写入记录为同步候选；恢复期间暂停写入。
-// 与 bootstrap.js 是同一份协议的两份静态副本（无构建注入），头部常量
-// 任何一侧改名必须双侧同步；tests/audit-regressions.mjs 静态断言逐字比较。
+// RP Hub 魔改版 - IndexedDB/localStorage 事务级变更日志：业务写入记为同步
+// 候选，恢复期间冻结。与 bootstrap.js 是同一协议的两份静态副本（无构建注入），
+// 头部常量改名必须双侧同步（tests/audit-regressions.mjs 逐字断言）。
 (function () {
     if (window.__RPH_SYNC_DIRTY_TRACKING__) return;
     window.__RPH_SYNC_DIRTY_TRACKING__ = true;
