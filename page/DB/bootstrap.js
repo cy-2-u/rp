@@ -335,6 +335,15 @@ function createAutoSaveScheduler(options = {}) {
     padding: 20px;
 }
 
+.rp-sync-modal--notice .rp-sync-modal__panel {
+    width: min(86vw, 320px);
+    text-align: center;
+}
+
+.rp-sync-modal--notice .rp-sync-modal__actions {
+    justify-content: center;
+}
+
 .rp-sync-modal--restore .rp-sync-modal__title-main,
 .rp-sync-modal--restore .rp-sync-modal__status {
     text-align: center;
@@ -717,7 +726,7 @@ function createAutoSaveScheduler(options = {}) {
         }
         state.operationPending = true;
         autoSaveScheduler?.pause();
-        setActionButtonsDisabled(true);
+        setActionButtonsDisabled(true, automatic);
         try {
             if (automatic && (!isAutoSaveEnabled() || !isAutoSavePageActive())) {
                 return { skipped: true, reason: 'inactive' };
@@ -2188,8 +2197,9 @@ function createAutoSaveScheduler(options = {}) {
         modalRoot?.classList.add('is-error');
     }
 
-    function setActionButtonsDisabled(disabled) {
-        if (pullButton) pullButton.disabled = disabled;
+    // disabled 时可保住拉取按钮：自动上传期间拉取仍可点（点了给"请稍后"提示）。
+    function setActionButtonsDisabled(disabled, keepPullEnabled = false) {
+        if (pullButton) pullButton.disabled = disabled && !keepPullEnabled;
         if (pushButton) pushButton.disabled = disabled;
         if (rebuildButton) rebuildButton.disabled = disabled;
     }
@@ -2705,9 +2715,12 @@ function createAutoSaveScheduler(options = {}) {
         return accessGateDone;
     }
 
+    // 自动上传进行中允许进面板看进度、关面板也不影响运行；同步方向重置只在不忙时做。
     function openSyncPanel() {
-        state.statusText = '请选择同步方向。';
-        state.progress = 0;
+        if (!state.syncing) {
+            state.statusText = '请选择同步方向。';
+            state.progress = 0;
+        }
         openModal();
     }
 
@@ -2741,9 +2754,35 @@ function createAutoSaveScheduler(options = {}) {
         }
     }
 
+    // 同风格提示弹窗（自动上传占用等场景）。
+    let noticeModalRoot = null;
+    function showSyncNotice(text) {
+        if (!noticeModalRoot) {
+            noticeModalRoot = document.createElement('div');
+            noticeModalRoot.className = 'rp-sync-modal rp-sync-modal--notice';
+            noticeModalRoot.innerHTML = `
+                <div class="rp-sync-modal__backdrop"></div>
+                <div class="rp-sync-modal__panel">
+                    <h3 class="rp-sync-modal__title"><span class="rp-sync-modal__title-main">请稍后</span></h3>
+                    <p class="rp-sync-modal__intro"></p>
+                    <div class="rp-sync-modal__actions">
+                        <button type="button" class="rp-sync-modal__button is-primary" data-action="notice-ok">知道了</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(noticeModalRoot);
+            const close = () => noticeModalRoot.classList.remove('is-open');
+            noticeModalRoot.querySelector('[data-action="notice-ok"]').addEventListener('click', close);
+            noticeModalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', close);
+        }
+        noticeModalRoot.querySelector('.rp-sync-modal__intro').textContent = text;
+        noticeModalRoot.classList.add('is-open');
+    }
+
+    // 自动上传进行中照常开面板：进去能看实时进度，关掉也不影响后台运行。
     async function handleSyncButtonClick() {
         await accessGateDone;
-        if (state.syncing || checkingPassword) return;
+        if (checkingPassword) return;
         openSyncPanel();
     }
 
@@ -2829,10 +2868,12 @@ function createAutoSaveScheduler(options = {}) {
         initializeAutoSave();
 
         modalRoot.querySelector('.rp-sync-modal__close').addEventListener('click', closeModal);
-        modalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', () => {
-            if (!state.syncing) closeModal();
-        });
+        modalRoot.querySelector('.rp-sync-modal__backdrop').addEventListener('click', closeModal);
         pullButton.addEventListener('click', () => {
+            if (autoSaveRunning) {
+                showSyncNotice('正在自动上传，请稍后。');
+                return;
+            }
             if (confirm('从云端恢复将替换此浏览器的本地数据。继续吗？')) {
                 location.replace('/sync-restore');
             }
@@ -2859,11 +2900,13 @@ function createAutoSaveScheduler(options = {}) {
         ensureModal();
         modalRoot.classList.add('is-open');
         updateProgress(state.progress, state.statusText || '请选择同步方向。');
-        setActionButtonsDisabled(state.syncing);
+        setActionButtonsDisabled(state.syncing, autoSaveRunning);
     }
 
     function closeModal() {
-        if (state.syncing || !modalRoot) return;
+        if (!modalRoot) return;
+        // 手动同步进行中不许关（防误关丢反馈）；自动上传随时可关，后台照跑。
+        if ((state.syncing || state.operationPending) && !autoSaveRunning) return;
         modalRoot.classList.remove('is-open');
     }
 
@@ -2975,7 +3018,7 @@ function createAutoSaveScheduler(options = {}) {
 
         try {
             if (!automatic) openModal();
-            setActionButtonsDisabled(true);
+            setActionButtonsDisabled(true, automatic);
             updateProgress(8, automatic ? '正在自动保存…' : '准备中…');
             await flushAppState();
             await waitForIndexedDbWriteBarrier();
