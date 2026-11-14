@@ -201,6 +201,7 @@
         let attempted = false;
         try {
             const queue = [];
+            const pending = [];
             if (payload.characterNames?.length) queue.push({ characterNames: payload.characterNames });
             else {
                 const keys = [...new Set(payload.keys || [])];
@@ -210,7 +211,17 @@
                 const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(queue[index]) })).json();
                 attempted = true;
                 if (result.failedCount) throw new Error('部分图片删除失败，请重试。');
+                if (result.pendingCleanup?.length) pending.push(...result.pendingCleanup);
                 if (result.continuation) queue.push(result.continuation);
+            }
+            // 墓碑已写、旧链接已失效；物理残留静默重删一轮，仍失败留给下次删除兜底。
+            if (pending.length) {
+                try {
+                    for (let offset = 0; offset < pending.length; offset += 20) {
+                        const retry = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keys: pending.slice(offset, offset + 20) }) })).json();
+                        if (retry.pendingCleanup?.length) break;
+                    }
+                } catch { /* 静默 */ }
             }
             setNotice('删除完成。');
             removeLocal(payload);
