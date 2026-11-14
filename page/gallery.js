@@ -24,11 +24,16 @@
         if (message) $('authMsg').textContent = message;
     }
     function setNotice(text, isError) { notice.textContent = text || ''; notice.style.color = isError ? '#dc2626' : ''; }
-    // 数据：一次全量，characters 分组（Worker 返回形状与 v2 一致）。
+    // 数据：一次全量，characters 分组（Worker 返回形状与 v2 一致）；渲染
+    // 每角色限量一页（手机 6 / 电脑 8），组尾"显示更多"按页展开。
     let data = null;
     let loading = false, deleteBusy = false, deleteMode = false;
     const selected = new Set();
+    let characterRenderLimits = Object.create(null);
     let viewerList = [], viewerIndex = -1;
+    const albumPageSize = () => window.matchMedia && window.matchMedia('(max-width:720px)').matches ? 6 : 8;
+    const getCharacterRenderLimit = name => characterRenderLimits[name] || albumPageSize();
+    const increaseCharacterRenderLimit = (name, total) => { characterRenderLimits[name] = Math.min(total, getCharacterRenderLimit(name) + albumPageSize()); };
     function syncToolbar() {
         selectionCount.textContent = deleteMode ? '已选 ' + selected.size + ' 张' : '';
         selectionCount.classList.toggle('hidden', !deleteMode);
@@ -48,11 +53,15 @@
         if (!total) { library.innerHTML = '<div class="empty">' + (data ? '没有图片' : '') + '</div>'; syncToolbar(); return; }
         const html = [];
         for (const group of groups) {
-            const tiles = group.images.map(image => {
+            const limit = getCharacterRenderLimit(group.name);
+            const shown = group.images.slice(0, limit);
+            const remaining = Math.max(0, group.images.length - shown.length);
+            const tiles = shown.map(image => {
                 const selectedClass = selected.has(image.key) ? ' selected' : '';
                 return '<button class="photo' + selectedClass + '" data-key="' + esc(image.key) + '"><img loading="lazy" decoding="async" src="' + esc(thumbUrl(image.key)) + '" onerror="thumbFailed(this)" alt=""><span class="photo-check"></span><span class="photo-info">' + esc(image.sizeHuman) + '</span></button>';
             }).join('');
-            html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">' + esc(group.name) + '</div><div class="album-meta">' + group.images.length + ' 张 · ' + esc(group.sizeHuman) + '</div></div></div><div class="gallery">' + tiles + '</div><div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="' + esc(group.name) + '">清空本组</button></div></div></section>');
+            const more = remaining > 0 ? '<button class="album-more" data-character="' + esc(group.name) + '" data-total="' + group.images.length + '">显示更多 ' + Math.min(albumPageSize(), remaining) + '</button>' : '';
+            html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">' + esc(group.name) + '</div><div class="album-meta">' + shown.length + ' / ' + group.images.length + ' 张 · ' + esc(group.sizeHuman) + '</div></div></div><div class="gallery">' + tiles + '</div><div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="' + esc(group.name) + '">清空本组</button></div>' + more + '</div></section>');
         }
         library.innerHTML = html.join('');
         syncToolbar();
@@ -98,6 +107,7 @@
             for (const imageKey of [...selected]) if (!keys.has(imageKey)) selected.delete(imageKey);
             stats.textContent = data.totalCount + ' 张图片 / ' + data.totalHuman;
             setNotice('');
+            characterRenderLimits = Object.create(null);
             render();
         } catch (e) { if (e.status !== 401) { stats.textContent = '读取失败'; setNotice(e.message, true); } }
         finally { loading = false; syncToolbar(); }
@@ -171,6 +181,8 @@
     cancelDeleteButton.addEventListener('click', () => setDeleteMode(false));
     deleteSelectedButton.addEventListener('click', () => deletePayload({ keys: [...selected] }, '确定删除选中的 ' + selected.size + ' 张图片吗？删除后旧链接不会重新生图。'));
     library.addEventListener('click', event => {
+        const moreButton = event.target.closest('.album-more');
+        if (moreButton) { increaseCharacterRenderLimit(moreButton.dataset.character, Number(moreButton.dataset.total)); render(); return; }
         const clearButton = event.target.closest('.album-clear');
         if (clearButton) { deletePayload({ characterNames: [clearButton.dataset.character] }, '删除角色「' + clearButton.dataset.character + '」的全部图片？删除后旧链接不会重新生图。'); return; }
         const tile = event.target.closest('.photo');
