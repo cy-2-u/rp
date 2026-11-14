@@ -13,6 +13,12 @@ const encoder = new TextEncoder();
 const stateByEnv = new WeakMap();
 const failure = (message, status = 400, extra = {}) => Object.assign(new Error(message), { status, ...extra });
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+function formatBytes(bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = Math.max(0, Number(bytes) || 0), index = 0;
+    while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+    return value.toFixed(index === 0 ? 0 : 1) + ' ' + units[index];
+}
 const hash = async text => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', typeof text === 'string' ? encoder.encode(text) : text)), b => b.toString(16).padStart(2, '0')).join('');
 const authorized = (request, env) => !env.RP_SYNC_PASSWORD || request.headers.get('x-rp-sync-password') === env.RP_SYNC_PASSWORD;
 const background = (ctx, promise) => ctx.waitUntil(Promise.resolve(promise).catch(() => {}));
@@ -251,19 +257,44 @@ async function thumb(request, bucket, key) {
 async function images(request, env, ctx, url) {
     const bucket = env.RP_SYNC_R2;
     if (url.pathname === '/image/api/auth-status') return json({ ok: true, authRequired: Boolean(env.RP_SYNC_PASSWORD), authenticated: authorized(request, env) });
+    // 图片读取（GET/HEAD）公开直连：拿到链接即拿到图，<img> 原生并发与缓存
+    // 生效（v2 同语义）；只有管理端点（library/delete/thumb 上传）要求密码。
+    if (url.pathname === '/image/api/image') {
+        if (!['GET', 'HEAD'].includes(request.method)) throw failure('Method not allowed.', 405);
+        return imageRead(request, bucket, url.searchParams.get('key'));
+    }
+    if (url.pathname === '/image/api/thumb') {
+        if (request.method === 'GET' || request.method === 'HEAD') return imageRead(request, bucket, url.searchParams.get('key'), true);
+        if (!authorized(request, env)) throw failure('Sync password required.', 401);
+        return thumb(request, bucket, url.searchParams.get('key'));
+    }
     if (url.pathname.startsWith('/image/api/')) {
         if (!authorized(request, env)) throw failure('Sync password required.', 401);
-        if (url.pathname === '/image/api/image') return imageRead(request, bucket, url.searchParams.get('key'));
-        if (url.pathname === '/image/api/thumb') return thumb(request, bucket, url.searchParams.get('key'));
         if (url.pathname === '/image/api/library') {
-            const prefix = url.searchParams.get('character') ? IMAGE + safeName(url.searchParams.get('character')) + '/' : IMAGE;
-            const page = await list(bucket, prefix, url.searchParams.get('cursor'), 200);
-            const names = (await pool(page.objects, 6, async p => {
-                const parts = imageParts(p.key);
-                if (await bucket.head(parts.tomb)) return null;
-                return { key: p.key, size: p.size, uploaded: new Date(p.uploaded).toISOString(), characterName: parts.name };
-            })).filter(Boolean);
-            return json({ ok: true, images: names, cursor: page.truncated ? page.cursor : null });
+            // 全量分组清单（v2 形状）：一次渲染整页，无分页错峰。
+            // 墓碑只 list 一次建集合，内存过滤替代逐对象 head。
+            const deleted = new Set();
+            let tombCursor;
+            do {
+                const page = await list(bucket, TOMBS, tombCursor, 1000);
+                for (const object of page.objects) deleted.add(object.key.slice(TOMBS.length, -'.json'.length));
+                tombCursor = page.truncated ? page.cursor : null;
+            } while (tombCursor);
+            const groups = new Map();
+            let cursor, totalBytes = 0, totalCount = 0;
+            do {
+                const page = await list(bucket, IMAGE, cursor, 1000);
+                for (const object of page.objects) {
+                    const parts = imageParts(object.key);
+                    if (deleted.has(parts.name + '/' + parts.checksum)) continue;
+                    if (!groups.has(parts.name)) groups.set(parts.name, []);
+                    groups.get(parts.name).push({ key: object.key, size: object.size, sizeHuman: formatBytes(object.size) });
+                    totalBytes += object.size; totalCount++;
+                }
+                cursor = page.truncated ? page.cursor : null;
+            } while (cursor);
+            const characters = [...groups.entries()].map(([name, images]) => ({ name, count: images.length, sizeHuman: formatBytes(images.reduce((sum, image) => sum + image.size, 0)), images }));
+            return json({ ok: true, totalCount, totalHuman: formatBytes(totalBytes), characters });
         }
         if (url.pathname === '/image/api/delete') {
             if (request.method !== 'POST') throw failure('Method not allowed.', 405);

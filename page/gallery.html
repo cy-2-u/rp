@@ -131,7 +131,7 @@ select.search{appearance:auto;padding:0 10px}
         <div class="title-copy"><h1>角色图片管理</h1>
         <div id="stats" class="subline">正在读取...</div></div>
       </div>
-      <select id="filter" class="search" aria-label="角色筛选"><option value="">全部角色</option></select>
+      <input id="filter" class="search" type="search" placeholder="搜索角色卡">
       <div class="controls">
         <button id="deleteMode" class="btn">选择</button>
         <span id="selectionCount" class="selection-info hidden"></span>
@@ -144,7 +144,6 @@ select.search{appearance:auto;padding:0 10px}
   <main>
     <div id="notice" class="notice"></div>
     <div id="library"></div>
-    <button id="more" hidden>加载更多</button>
   </main>
 </section>
 <section id="viewer" class="viewer hidden">

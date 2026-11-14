@@ -1,5 +1,5 @@
-// 图库前端：v2 视觉交互（album 分组/选择模式/全屏查看器）+ v3 引擎
-//（鉴权 fetch 读取、密码不进 URL、缩略图按需回填、游标分页、游标清空角色）。
+// 图库前端：v2 加载与显示管线（全量分组一次渲染、缩略图/原图 <img> 直连
+// 原生并发与缓存、onerror 回填），管理操作（删除/清空/密码）仍走鉴权 fetch。
 (function () {
     'use strict';
     const key = 'rp_hub_sync_password_v1';
@@ -7,15 +7,11 @@
     const authBox = $('auth'), appBox = $('app'), library = $('library');
     const stats = $('stats'), notice = $('notice'), filter = $('filter');
     const deleteModeButton = $('deleteMode'), cancelDeleteButton = $('cancelDelete'), deleteSelectedButton = $('deleteSelected');
-    const selectionCount = $('selectionCount'), moreButton = $('more');
+    const selectionCount = $('selectionCount');
     const viewer = $('viewer'), viewerImage = $('viewerImage'), viewerTitle = $('viewerTitle'), viewerCount = $('viewerCount');
     const esc = s => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    const formatBytes = bytes => {
-        const units = ['B', 'KB', 'MB', 'GB'];
-        let value = Math.max(0, Number(bytes) || 0), i = 0;
-        while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
-        return (i ? value.toFixed(1) : value) + ' ' + units[i];
-    };
+    const thumbUrl = imageKey => '/image/api/thumb?key=' + encodeURIComponent(imageKey);
+    const originalUrl = imageKey => '/image/api/image?key=' + encodeURIComponent(imageKey);
     async function request(path, options = {}) {
         const response = await fetch('/image/api/' + path, { ...options, headers: { 'x-rp-sync-password': localStorage.getItem(key) || '', ...options.headers } });
         if (response.status === 401) { showAuth('请输入同步密码。'); throw Object.assign(new Error('请输入同步密码。'), { status: 401 }); }
@@ -27,29 +23,12 @@
         authBox.classList.remove('hidden');
         if (message) $('authMsg').textContent = message;
     }
-    // 数据：photos 全量累积（游标分页），按角色分组渲染。
-    const photos = new Map();
-    const urls = new Set();
-    const selected = new Set();
-    let cursor = null, loading = false, deleteMode = false, deleteBusy = false;
-    let revision = 0, viewerUrl = null, viewerList = [], viewerIndex = -1;
-    function release(url) { if (url) { URL.revokeObjectURL(url); urls.delete(url); } }
     function setNotice(text, isError) { notice.textContent = text || ''; notice.style.color = isError ? '#dc2626' : ''; }
-    function visibleCharacters() {
-        const name = filter.value;
-        const groups = new Map();
-        for (const photo of photos.values()) {
-            if (name && photo.characterName !== name) continue;
-            if (!groups.has(photo.characterName)) groups.set(photo.characterName, []);
-            groups.get(photo.characterName).push(photo);
-        }
-        return [...groups.entries()].map(([characterName, list]) => ({ characterName, list: list.sort((a, b) => a.key < b.key ? -1 : 1) })).sort((a, b) => a.characterName < b.characterName ? -1 : 1);
-    }
-    function viewerSequence() {
-        const list = [];
-        for (const group of visibleCharacters()) for (const photo of group.list) list.push(photo);
-        return list;
-    }
+    // 数据：一次全量，characters 分组（Worker 返回形状与 v2 一致）。
+    let data = null;
+    let loading = false, deleteBusy = false, deleteMode = false;
+    const selected = new Set();
+    let viewerList = [], viewerIndex = -1;
     function syncToolbar() {
         selectionCount.textContent = deleteMode ? '已选 ' + selected.size + ' 张' : '';
         selectionCount.classList.toggle('hidden', !deleteMode);
@@ -57,81 +36,67 @@
         cancelDeleteButton.classList.toggle('hidden', !deleteMode);
         deleteSelectedButton.classList.toggle('hidden', !deleteMode);
         deleteSelectedButton.disabled = !selected.size || deleteBusy;
-        moreButton.hidden = !cursor;
-        moreButton.disabled = loading;
         $('refresh').disabled = loading;
     }
+    function visibleGroups() {
+        const q = filter.value.trim().toLowerCase();
+        return (data?.characters || []).filter(group => !q || group.name.toLowerCase().includes(q));
+    }
     function render() {
-        const groups = visibleCharacters();
-        if (!groups.length) { library.innerHTML = '<div class="empty">' + (photos.size ? '该角色暂无图片' : '没有图片') + '</div>'; syncToolbar(); return; }
+        const groups = visibleGroups();
+        const total = groups.reduce((sum, group) => sum + group.images.length, 0);
+        if (!total) { library.innerHTML = '<div class="empty">' + (data ? '没有图片' : '') + '</div>'; syncToolbar(); return; }
         const html = [];
         for (const group of groups) {
-            const tiles = group.list.map(photo => {
-                const selectedClass = selected.has(photo.key) ? ' selected' : '';
-                return '<button class="photo' + selectedClass + '" data-key="' + esc(photo.key) + '"><img loading="lazy" decoding="async" alt=""><span class="photo-check"></span><span class="photo-info">' + esc(formatBytes(photo.size)) + '</span></button>';
+            const tiles = group.images.map(image => {
+                const selectedClass = selected.has(image.key) ? ' selected' : '';
+                return '<button class="photo' + selectedClass + '" data-key="' + esc(image.key) + '"><img loading="lazy" decoding="async" src="' + esc(thumbUrl(image.key)) + '" onerror="thumbFailed(this)" alt=""><span class="photo-check"></span><span class="photo-info">' + esc(image.sizeHuman) + '</span></button>';
             }).join('');
-            html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">' + esc(group.characterName) + '</div><div class="album-meta">' + group.list.length + ' 张</div></div></div><div class="gallery">' + tiles + '</div><div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="' + esc(group.characterName) + '">清空本组</button></div></div></section>');
+            html.push('<section class="album"><div class="album-head"><div class="album-head-main"><div class="album-title">' + esc(group.name) + '</div><div class="album-meta">' + group.images.length + ' 张 · ' + esc(group.sizeHuman) + '</div></div></div><div class="gallery">' + tiles + '</div><div class="album-actions"><div class="album-primary-actions"><button class="album-clear" data-character="' + esc(group.name) + '">清空本组</button></div></div></section>');
         }
         library.innerHTML = html.join('');
-        scheduleThumbs();
         syncToolbar();
     }
-    // 缩略图按需回填：读缓存缩略图，缺失时拉原图缩放并回传（并发 2）。
-    const queue = [];
-    let readers = 0;
-    async function thumbnail(imageKey) {
-        try { return await (await request('thumb?key=' + encodeURIComponent(imageKey))).blob(); }
-        catch (e) { if (e.status !== 404) throw e; }
-        const original = await (await request('image?key=' + encodeURIComponent(imageKey))).blob();
-        const bitmap = await createImageBitmap(original);
-        let blob;
-        try {
-            const scale = Math.min(1, 320 / Math.max(bitmap.width, bitmap.height));
-            const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-            canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-            blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', .78));
-        } finally { bitmap.close(); }
-        if (!blob || blob.type !== 'image/webp') throw new Error('浏览器无法生成 WebP 缩略图。');
-        await request('thumb?key=' + encodeURIComponent(imageKey), { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: blob });
-        return blob;
-    }
-    function drain() {
-        while (readers < 2 && queue.length) {
-            const img = queue.shift();
+    // 缩略图回填：直连 404 时拉原图缩放为 WebP 上传（并发 2），成功后原地重载。
+    const backfillQueue = [];
+    let backfillBusy = 0;
+    window.thumbFailed = img => {
+        if (!img.dataset.key || img.dataset.backfill) return;
+        img.dataset.backfill = '1';
+        backfillQueue.push(img);
+        drainBackfill();
+    };
+    function drainBackfill() {
+        while (backfillBusy < 2 && backfillQueue.length) {
+            const img = backfillQueue.shift();
             if (!img.isConnected) continue;
-            readers++;
-            thumbnail(img.dataset.key).then(blob => {
-                if (!img.isConnected) return;
-                const url = URL.createObjectURL(blob); urls.add(url); img.src = url;
-            }).catch(() => { if (img.isConnected) img.alt = '缩略图加载失败，点击查看原图'; }).finally(() => { readers--; drain(); });
+            backfillBusy++;
+            (async () => {
+                const original = await (await request('image?key=' + encodeURIComponent(img.dataset.key))).blob();
+                const bitmap = await createImageBitmap(original);
+                let blob;
+                try {
+                    const scale = Math.min(1, 320 / Math.max(bitmap.width, bitmap.height));
+                    const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+                    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+                    blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', .78));
+                } finally { bitmap.close(); }
+                if (!blob || blob.type !== 'image/webp') throw new Error('浏览器无法生成 WebP 缩略图。');
+                await request('thumb?key=' + encodeURIComponent(img.dataset.key), { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: blob });
+                if (img.isConnected) { img.dataset.backfill = '2'; img.src = thumbUrl(img.dataset.key) + '&t=' + Date.now(); }
+            })().catch(() => { /* 回填失败保持占位，下次进入页面重试 */ }).finally(() => { backfillBusy--; drainBackfill(); });
         }
     }
-    const observer = new IntersectionObserver(entries => {
-        for (const item of entries) if (item.isIntersecting) { observer.unobserve(item.target); queue.push(item.target); }
-        drain();
-    }, { rootMargin: '300px' });
-    function scheduleThumbs() {
-        for (const img of library.querySelectorAll('.photo img:not([src])')) observer.observe(img);
-    }
-    async function load(reset = false) {
+    async function load() {
         if (loading) return;
         loading = true; syncToolbar();
-        if (reset) {
-            for (const url of [...urls]) if (url !== viewerUrl) release(url);
-            observer.disconnect(); queue.length = 0;
-            photos.clear(); selected.clear(); cursor = null;
-            filter.replaceChildren(new Option('全部角色', ''));
-        }
         try {
-            stats.textContent = '正在读取…';
-            const result = await (await request('library' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : ''))).json();
-            for (const image of result.images) {
-                if (!photos.has(image.key)) photos.set(image.key, image);
-                if (![...filter.options].some(option => option.value === image.characterName)) filter.append(new Option(image.characterName, image.characterName));
-            }
-            cursor = result.cursor;
-            const totalBytes = [...photos.values()].reduce((sum, p) => sum + (p.size || 0), 0);
-            stats.textContent = photos.size + ' 张图片 / ' + formatBytes(totalBytes);
+            stats.textContent = '正在读取...';
+            data = await (await request('library', { method: 'GET' })).json();
+            const keys = new Set();
+            for (const group of data.characters) for (const image of group.images) keys.add(image.key);
+            for (const imageKey of [...selected]) if (!keys.has(imageKey)) selected.delete(imageKey);
+            stats.textContent = data.totalCount + ' 张图片 / ' + data.totalHuman;
             setNotice('');
             render();
         } catch (e) { if (e.status !== 401) { stats.textContent = '读取失败'; setNotice(e.message, true); } }
@@ -144,24 +109,17 @@
         document.body.classList.toggle('delete-mode', deleteMode);
         syncToolbar();
     }
-    async function preview(imageKey) {
-        const sequence = viewerSequence();
-        const index = sequence.findIndex(photo => photo.key === imageKey);
+    function preview(imageKey) {
+        const sequence = [];
+        for (const group of visibleGroups()) for (const image of group.images) sequence.push(image);
+        const index = sequence.findIndex(image => image.key === imageKey);
         if (index < 0) return;
         viewerList = sequence;
         viewerIndex = index;
-        const expected = ++revision;
-        setNotice('正在加载原图…');
-        try {
-            const blob = await (await request('image?key=' + encodeURIComponent(imageKey))).blob();
-            if (expected !== revision) return;
-            release(viewerUrl); viewerUrl = URL.createObjectURL(blob); urls.add(viewerUrl);
-            viewerImage.src = viewerUrl;
-            viewerTitle.textContent = sequence[index].characterName;
-            viewerCount.textContent = (index + 1) + ' / ' + sequence.length;
-            viewer.classList.remove('hidden');
-            setNotice('');
-        } catch (e) { if (e.status !== 401) setNotice(e.message, true); }
+        viewerImage.src = originalUrl(imageKey);
+        viewerTitle.textContent = data.characters.find(group => group.images.some(image => image.key === imageKey))?.name || '';
+        viewerCount.textContent = (index + 1) + ' / ' + sequence.length;
+        viewer.classList.remove('hidden');
     }
     function stepViewer(delta) {
         if (!viewerList.length) return;
@@ -169,25 +127,27 @@
         preview(viewerList[viewerIndex].key);
     }
     function closeViewer() {
-        revision++;
         viewer.classList.add('hidden');
         viewerImage.removeAttribute('src');
-        release(viewerUrl); viewerUrl = null; viewerList = []; viewerIndex = -1;
+        viewerList = []; viewerIndex = -1;
     }
-    async function clearCharacter(name) {
-        if (!name || deleteBusy || !confirm('删除角色「' + name + '」的全部图片？删除后旧链接不会重新生图。')) return;
+    async function deletePayload(payload, message) {
+        if (deleteBusy || !confirm(message)) return;
         deleteBusy = true; syncToolbar();
         try {
-            let pageCursor = null;
-            do {
-                const body = { characterNames: [name], ...(pageCursor ? { cursor: pageCursor } : {}) };
-                const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).json();
-                for (const imageKey of result.acceptedKeys) { photos.delete(imageKey); selected.delete(imageKey); }
+            const queue = [];
+            if (payload.characterNames?.length) queue.push({ characterNames: payload.characterNames });
+            else {
+                const keys = [...new Set(payload.keys || [])];
+                for (let offset = 0; offset < keys.length; offset += 20) queue.push({ keys: keys.slice(offset, offset + 20) });
+            }
+            for (let index = 0; index < queue.length; index++) {
+                const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(queue[index]) })).json();
                 if (result.failedCount) throw new Error('部分图片删除失败，请重试。');
-                pageCursor = result.continuation?.cursor || null;
-            } while (pageCursor);
-            setNotice('已清空角色「' + name + '」。');
-            render();
+                if (result.continuation) queue.push(result.continuation);
+            }
+            setNotice('删除完成。');
+            await load();
         } catch (e) { setNotice(e.message, true); }
         finally { deleteBusy = false; syncToolbar(); }
     }
@@ -200,7 +160,7 @@
             $('authMsg').textContent = '';
             authBox.classList.add('hidden');
             appBox.classList.remove('hidden');
-            await load(true);
+            await load();
         } catch (e) {
             if (old === null) localStorage.removeItem(key); else localStorage.setItem(key, old);
             $('authMsg').textContent = e.message;
@@ -209,24 +169,10 @@
     $('password').addEventListener('keydown', event => { if (event.key === 'Enter') $('login').click(); });
     deleteModeButton.addEventListener('click', () => setDeleteMode(true));
     cancelDeleteButton.addEventListener('click', () => setDeleteMode(false));
-    deleteSelectedButton.addEventListener('click', async () => {
-        if (deleteBusy || !selected.size || !confirm('确定删除选中的 ' + selected.size + ' 张图片吗？删除后旧链接不会重新生图。')) return;
-        deleteBusy = true; syncToolbar();
-        try {
-            const keys = [...selected];
-            for (let offset = 0; offset < keys.length; offset += 20) {
-                const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keys: keys.slice(offset, offset + 20) }) })).json();
-                for (const imageKey of result.acceptedKeys) { photos.delete(imageKey); selected.delete(imageKey); }
-                if (result.failedCount) throw new Error('部分图片删除失败，请重试。');
-            }
-            setNotice('已删除所选图片。');
-            render();
-        } catch (e) { setNotice(e.message, true); }
-        finally { deleteBusy = false; syncToolbar(); }
-    });
+    deleteSelectedButton.addEventListener('click', () => deletePayload({ keys: [...selected] }, '确定删除选中的 ' + selected.size + ' 张图片吗？删除后旧链接不会重新生图。'));
     library.addEventListener('click', event => {
         const clearButton = event.target.closest('.album-clear');
-        if (clearButton) { clearCharacter(clearButton.dataset.character); return; }
+        if (clearButton) { deletePayload({ characterNames: [clearButton.dataset.character] }, '删除角色「' + clearButton.dataset.character + '」的全部图片？删除后旧链接不会重新生图。'); return; }
         const tile = event.target.closest('.photo');
         if (!tile) return;
         const imageKey = tile.dataset.key;
@@ -237,9 +183,8 @@
         } else preview(imageKey);
     });
     $('back').addEventListener('click', () => { location.href = '/'; });
-    $('refresh').addEventListener('click', () => load(true));
-    moreButton.addEventListener('click', () => load());
-    filter.addEventListener('change', render);
+    $('refresh').addEventListener('click', () => load());
+    filter.addEventListener('input', () => render());
     $('closeViewer').addEventListener('click', closeViewer);
     $('prevImage').addEventListener('click', () => stepViewer(-1));
     $('nextImage').addEventListener('click', () => stepViewer(1));
@@ -249,12 +194,11 @@
         if (event.key === 'ArrowLeft') stepViewer(-1);
         if (event.key === 'ArrowRight') stepViewer(1);
     });
-    window.addEventListener('pagehide', () => { observer.disconnect(); for (const url of urls) URL.revokeObjectURL(url); });
     // 入口：先探测密码态，决定显示锁卡还是直接进图库。
     (async () => {
         try {
             const result = await (await request('auth-status')).json();
-            if (result.authenticated) { appBox.classList.remove('hidden'); await load(true); }
+            if (result.authenticated) { appBox.classList.remove('hidden'); await load(); }
             else showAuth();
         } catch { showAuth('网络不可用，请刷新重试。'); }
     })();
