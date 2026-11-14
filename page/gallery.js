@@ -66,36 +66,67 @@
         library.innerHTML = html.join('');
         syncToolbar();
     }
-    // 缩略图回填：直连 404 时拉原图缩放为 WebP 上传（并发 2），成功后原地重载。
-    const backfillQueue = [];
-    let backfillBusy = 0;
+    // 缩略图回填（v2 管线）：缩略图 404 时瓦片先直连原图保证立即可见，
+    // 原图加载完成（load 委托）后从已解码的 <img> 画 480px WebP 上传，
+    // 成功后瓦片切回缩略图；失败按 800ms 间隔重试至多 3 次。
+    let thumbBackfillRunning = 0;
+    const thumbBackfillQueue = [];
+    const thumbBackfillQueued = new Set(), thumbBackfillDone = new Set(), thumbBackfillAttempts = new Map();
     window.thumbFailed = img => {
-        if (!img.dataset.key || img.dataset.backfill) return;
-        img.dataset.backfill = '1';
-        backfillQueue.push(img);
-        drainBackfill();
+        const tile = img.closest('.photo');
+        const key = tile && tile.dataset.key;
+        if (!key) return;
+        img.onerror = null;
+        img.dataset.needsThumb = '1';
+        img.src = originalUrl(key);
     };
-    function drainBackfill() {
-        while (backfillBusy < 2 && backfillQueue.length) {
-            const img = backfillQueue.shift();
-            if (!img.isConnected) continue;
-            backfillBusy++;
-            (async () => {
-                const original = await (await request('image?key=' + encodeURIComponent(img.dataset.key))).blob();
-                const bitmap = await createImageBitmap(original);
-                let blob;
-                try {
-                    const scale = Math.min(1, 320 / Math.max(bitmap.width, bitmap.height));
-                    const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-                    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-                    blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', .78));
-                } finally { bitmap.close(); }
-                if (!blob || blob.type !== 'image/webp') throw new Error('浏览器无法生成 WebP 缩略图。');
-                await request('thumb?key=' + encodeURIComponent(img.dataset.key), { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: blob });
-                if (img.isConnected) { img.dataset.backfill = '2'; img.src = thumbUrl(img.dataset.key) + '&t=' + Date.now(); }
-            })().catch(() => { /* 回填失败保持占位，下次进入页面重试 */ }).finally(() => { backfillBusy--; drainBackfill(); });
+    function thumbBlobFromImage(img) {
+        return new Promise((resolve, reject) => {
+            const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
+            if (!w || !h) return reject(new Error('图片未加载完成'));
+            const scale = Math.min(1, 480 / Math.max(w, h));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(w * scale));
+            canvas.height = Math.max(1, Math.round(h * scale));
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('缩略图生成失败')), 'image/webp', 0.8);
+        });
+    }
+    async function uploadAdminThumb(key, img) {
+        if (!img.complete || !img.naturalWidth) return;
+        const blob = await thumbBlobFromImage(img);
+        const response = await request('thumb?key=' + encodeURIComponent(key), { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: blob });
+        if (!response.ok) throw new Error('缩略图上传失败');
+        img.removeAttribute('data-needs-thumb');
+        img.src = thumbUrl(key);
+    }
+    function queueThumbBackfill(img) {
+        if (!img || !img.isConnected || !img.matches('img[data-needs-thumb="1"]') || !img.complete || !img.naturalWidth) return;
+        const tile = img.closest('.photo');
+        const key = tile && tile.dataset.key;
+        if (!key || thumbBackfillDone.has(key) || thumbBackfillQueued.has(key)) return;
+        thumbBackfillQueued.add(key);
+        thumbBackfillQueue.push({ key, img });
+        scheduleThumbBackfill();
+    }
+    function scheduleThumbBackfill() {
+        while (thumbBackfillRunning < 3 && thumbBackfillQueue.length) {
+            const item = thumbBackfillQueue.shift();
+            if (!item || !item.img.isConnected) { if (item) thumbBackfillQueued.delete(item.key); continue; }
+            thumbBackfillRunning++;
+            Promise.resolve(uploadAdminThumb(item.key, item.img)).then(() => {
+                thumbBackfillDone.add(item.key);
+                thumbBackfillAttempts.delete(item.key);
+            }).catch(() => {
+                const attempts = (thumbBackfillAttempts.get(item.key) || 0) + 1;
+                thumbBackfillAttempts.set(item.key, attempts);
+                if (attempts < 3) setTimeout(() => { thumbBackfillQueued.delete(item.key); queueThumbBackfill(item.img); }, 800);
+            }).finally(() => { thumbBackfillRunning--; thumbBackfillQueued.delete(item.key); scheduleThumbBackfill(); });
         }
     }
+    library.addEventListener('load', event => {
+        if (event.target && event.target.matches && event.target.matches('img[data-needs-thumb="1"]')) queueThumbBackfill(event.target);
+    }, true);
     async function load() {
         if (loading) return;
         loading = true; syncToolbar();
