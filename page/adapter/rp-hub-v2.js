@@ -136,9 +136,17 @@
         }
         return { ok: false, reason: '作者数据仍在变化，请稍后重试。' };
     }
-    let started = false, scheduled = false, observer, modelToken = '', modelLoading = false, modelRetryAt = 0, modelList = [];
+    let started = false, modelToken = '', modelLoading = false, modelRetryAt = 0, modelList = [];
     const FIXED = 'rp_hub_magic_fixed_image', MODEL = 'rp_hub_magic_ynai_model';
-    function button(text, fn, className = '') { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.className = className; b.onclick = fn; return b; }
+    // 设置行/聊天浮层的锚点值与 v2 版锚点表一致（作者行样式类原样沿用）。
+    const UI = {
+        navContent: '.app-navigation-content', navSection: '.app-navigation-section', navHeading: '常用',
+        settingsRowClass: 'settings-toggle-row group',
+        settingsTextClass: 'text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors',
+        toggleWrapClass: 'relative inline-flex flex-none items-center', toggleClass: 'settings-toggle',
+        chatRow: '.input-island', chatArea: '.input-area-mobile'
+    };
+    const textOf = node => String(node?.textContent || '').replace(/\s+/g, ' ').trim();
     async function updateModels(select, control) {
         const token = external.imageKey(), ynai = token.toUpperCase().startsWith('YNAI-');
         select.hidden = !ynai; control.hidden = ynai;
@@ -164,38 +172,180 @@
             localStorage.setItem(MODEL, select.value);
         }
     }
+    function installStyle() {
+        if (document.getElementById('magic-extension-style')) return;
+        const style = document.createElement('style');
+        style.id = 'magic-extension-style';
+        style.textContent = [
+            '.magic-extension-button{display:inline-flex;align-items:center;justify-content:center;gap:4px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.92);color:#475569;border-radius:9px;padding:5px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;transition:.15s}',
+            '.magic-extension-button:hover{color:#2563eb;background:#eff6ff}',
+            '.magic-extension-button svg{width:14px;height:14px;flex:none}',
+            '.magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
+            '.app-navigation-user .magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
+            '.magic-image-nav{margin-top:4px}',
+            '.magic-image-nav svg{flex:none}',
+            '.magic-image-nav span{white-space:nowrap;overflow:hidden}',
+            '.app-navigation-item.magic-image-nav{display:flex;align-items:center;gap:.65rem;width:100%;text-align:left}',
+            '.app-navigation-item.magic-image-nav .magic-image-nav-icon{display:inline-flex;align-items:center;justify-content:center;flex:none;width:1.5rem;height:1.5rem}',
+            '.magic-fixed-image-toggle{display:flex;align-items:center;justify-content:space-between;gap:12px}',
+            '.magic-fixed-image-toggle input{accent-color:#4f46e5}',
+            '.magic-scroll-button{position:absolute;left:50%;top:-2.75rem;z-index:30;display:none;width:2.25rem;height:2.25rem;padding:0;pointer-events:auto;align-items:center;justify-content:center;border:1px solid #e5e7eb;border-radius:999px;transform:translateX(-50%);background:rgba(255,255,255,.95);color:#6b7280;box-shadow:0 10px 15px -3px rgba(15,23,42,.12),0 4px 6px -4px rgba(15,23,42,.12);backdrop-filter:blur(12px);cursor:pointer;transition:all .15s}',
+            '.magic-scroll-button:hover{color:#4f46e5;border-color:#c7d2fe}',
+            '.magic-scroll-button:active{transform:translateX(-50%) scale(.95)}',
+            '.magic-scroll-button svg{width:1rem;height:1rem}',
+            '.magic-scroll-button.is-visible{display:flex}',
+            '.magic-scroll-sentinel{width:1px;height:1px;pointer-events:none}',
+            '.magic-image-save-warning{position:absolute;bottom:8px;left:8px;right:8px;padding:5px 8px;border-radius:6px;background:#fff7ed;color:#9a3412;font-size:12px}',
+            '.generated-image-card.is-generating ' + ANCHORS.reroll + '{opacity:.45;pointer-events:none}'
+        ].join('');
+        document.head.append(style);
+    }
+    function installSidebarActions() {
+        const userCard = document.querySelector(ANCHORS.user);
+        if (!userCard || userCard.querySelector('.magic-extension-actions')) return;
+        const actions = document.createElement('div');
+        actions.className = 'magic-extension-actions';
+        const syncButton = document.createElement('button');
+        syncButton.type = 'button';
+        syncButton.className = 'magic-extension-button';
+        syncButton.title = '同步';
+        syncButton.setAttribute('aria-label', '同步');
+        syncButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-4L3 10"></path><path d="M3 4v6h6"></path><path d="M4 13a8.1 8.1 0 0 0 14.9 4L21 14"></path><path d="M21 20v-6h-6"></path></svg><span>同步</span>';
+        syncButton.addEventListener('click', () => window.RPH_R2_OPEN_SYNC?.());
+        actions.append(syncButton);
+        userCard.append(actions);
+    }
+    function installImageNav() {
+        const content = document.querySelector(UI.navContent);
+        if (!content) return;
+        const section = [...content.querySelectorAll(UI.navSection)].find(item => textOf(item.querySelector('h1,h2,h3,[role="heading"]') || item).includes(UI.navHeading));
+        const grid = section?.querySelector(ANCHORS.nav);
+        if (!grid || grid.querySelector('.magic-image-nav')) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'app-navigation-item magic-image-nav';
+        button.title = '图片管理';
+        button.setAttribute('aria-label', '图片管理');
+        button.innerHTML = '<span class="app-navigation-icon magic-image-nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5zm3 10 3-3 2 2 2-2 3 3M8 8h.01"></path></svg></span><span>图片管理</span>';
+        button.addEventListener('click', () => { location.href = '/image'; });
+        const settingsButton = [...grid.querySelectorAll('.app-navigation-item')].find(item => textOf(item).includes('设置'));
+        grid.insertBefore(button, settingsButton || null);
+    }
+    function installFixedImageSetting() {
+        const labels = [...document.querySelectorAll('label')].filter(l => l.textContent.includes(ANCHORS.settings));
+        const label = labels[labels.length - 1] || null;
+        const grid = label?.closest('.grid');
+        if (!grid) return null;
+        if (grid.querySelector('.magic-fixed-image-toggle .magic-fixed-image-input')) return grid;
+        const row = document.createElement('label');
+        row.className = 'magic-fixed-image-toggle ' + UI.settingsRowClass;
+        row.innerHTML = '<span class="' + UI.settingsTextClass + '">固定生图</span><span class="' + UI.toggleWrapClass + '"><input type="checkbox" class="magic-fixed-image-input settings-toggle-input sr-only"><span class="' + UI.toggleClass + '"></span></span>';
+        const input = row.querySelector('input');
+        input.checked = localStorage.getItem(FIXED) !== '0';
+        input.addEventListener('change', () => localStorage.setItem(FIXED, input.checked ? '1' : '0'));
+        grid.insertBefore(row, label);
+        return grid;
+    }
+    let scrollContainer, scrollButtonNode, scrollSentinelNode, scrollObserver;
+    function resetScrollNodes(button) {
+        scrollObserver?.disconnect();
+        scrollObserver = null;
+        scrollContainer = null;
+        scrollButtonNode = null;
+        scrollSentinelNode = null;
+        if (button) button.classList.remove('is-visible');
+    }
+    function installScrollButton() {
+        const input = document.querySelector(ANCHORS.input);
+        const inputRow = input?.closest(UI.chatRow);
+        const inputArea = input?.closest(UI.chatArea) || inputRow?.parentElement;
+        if (!inputRow || !inputArea) { resetScrollNodes(); return; }
+        let button = inputArea.querySelector('.magic-scroll-button') || inputRow.querySelector('.magic-scroll-button');
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'magic-scroll-button';
+            button.title = '滚动到底部';
+            button.setAttribute('aria-label', '滚动到底部');
+            button.innerHTML = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>';
+            button.addEventListener('click', () => scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'smooth' }));
+        }
+        if (button.parentElement !== inputArea) inputArea.prepend(button);
+        const chatView = inputRow.closest('.chat-view-root');
+        const container = chatView ? chatView.querySelector(ANCHORS.chat) : null;
+        if (!container) { resetScrollNodes(button); return; }
+        let sentinel = container.querySelector(':scope > .magic-scroll-sentinel');
+        if (!sentinel) {
+            sentinel = document.createElement('div');
+            sentinel.className = 'magic-scroll-sentinel';
+            sentinel.setAttribute('aria-hidden', 'true');
+            container.append(sentinel);
+        }
+        if (scrollContainer === container && scrollButtonNode === button && scrollSentinelNode === sentinel) return;
+        resetScrollNodes();
+        scrollContainer = container;
+        scrollButtonNode = button;
+        scrollSentinelNode = sentinel;
+        scrollObserver = new IntersectionObserver(entries => {
+            const entry = entries[entries.length - 1];
+            scrollButtonNode?.classList.toggle('is-visible', !entry?.isIntersecting);
+        }, { root: scrollContainer, rootMargin: '0px 0px 120px 0px', threshold: 0 });
+        scrollObserver.observe(sentinel);
+    }
+    // 观察目标与 v2 一致：#app 开 subtree 覆盖条件渲染视图；固定生图网格、
+    // 聊天输入行只看直接子节点变化，避免全页 subtree 开销。
+    let reconcileScheduled = false;
+    const uiObserver = new MutationObserver(() => {
+        if (reconcileScheduled) return;
+        reconcileScheduled = true;
+        requestAnimationFrame(() => { reconcileScheduled = false; reconcile(); });
+    });
+    function observeUiTargets(fixedGrid) {
+        uiObserver.disconnect();
+        // body 必须在列：作者的导航抽屉经 Vue teleport 挂在 #app 之外。
+        const targets = new Set([document.body, document.querySelector(ANCHORS.root) || null, fixedGrid || null, document.querySelector(ANCHORS.input)?.closest(UI.chatRow) || null].filter(Boolean));
+        for (const target of targets) {
+            let subtree = false;
+            try { subtree = target.matches?.(ANCHORS.root) || false; } catch { subtree = false; }
+            uiObserver.observe(target, { childList: true, subtree });
+        }
+    }
     function reconcile() {
-        observer?.disconnect();
-        try {
-            const user = document.querySelector(ANCHORS.user);
-            if (user && !user.querySelector('[data-rp-sync]')) { const b = button('同步', () => window.RPH_R2_OPEN_SYNC?.()); b.dataset.rpSync = ''; user.append(b); }
-            const nav = document.querySelector(ANCHORS.nav);
-            if (nav && !nav.querySelector('[data-rp-gallery]')) { const b = button('图片管理', () => { location.href = '/image'; }, 'app-navigation-item'); b.dataset.rpGallery = ''; nav.append(b); }
-            const labels = [...document.querySelectorAll('label')];
-            const anchor = labels.filter(l => l.textContent.includes(ANCHORS.settings)).at(-1);
-            const grid = anchor?.closest('.grid');
-            if (grid && !grid.querySelector('[data-rp-fixed]')) {
-                const label = document.createElement('label'); label.dataset.rpFixed = ''; label.className = 'settings-toggle-row'; label.textContent = '固定生图';
-                const input = document.createElement('input'); input.type = 'checkbox'; input.checked = localStorage.getItem(FIXED) !== '0'; input.onchange = () => localStorage.setItem(FIXED, input.checked ? '1' : '0'); label.append(input); grid.append(label);
-            }
-            const modelLabel = labels.find(l => l.textContent.trim() === ANCHORS.model);
-            if (modelLabel) {
+        uiObserver.disconnect();
+        // 每步独立兜底：条件渲染视图未挂载时单步拿不到锚点，任何一步异常
+        // 都不允许炸断后续安装与观察者挂载。
+        let fixedGrid = null;
+        const steps = [
+            () => installStyle(),
+            () => installSidebarActions(),
+            () => installImageNav(),
+            () => { fixedGrid = installFixedImageSetting(); },
+            () => {
+                const labels = [...document.querySelectorAll('label')];
+                const modelLabel = labels.find(l => l.textContent.trim() === ANCHORS.model);
+                if (!modelLabel) return;
                 const box = modelLabel.parentElement, control = [...box.children].find(el => el !== modelLabel && !el.matches('[data-rp-model]') && el.querySelector('button.settings-control'));
-                if (control) {
-                    let select = box.querySelector('[data-rp-model]');
-                    if (!select) { select = document.createElement('select'); select.dataset.rpModel = ''; select.className = 'settings-control'; select.onchange = () => localStorage.setItem(MODEL, select.value); box.append(select); }
-                    updateModels(select, control).catch(() => {});
-                }
-            }
-            const input = document.querySelector(ANCHORS.input), area = input?.closest('.input-area-mobile');
-            if (area && !area.querySelector('[data-rp-scroll]')) { const b = button('↓', () => { const chat = document.querySelector(ANCHORS.chat); chat?.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' }); }); b.dataset.rpScroll = ''; b.title = '滚动到底部'; area.prepend(b); }
-        } finally { observer?.observe(document.querySelector(ANCHORS.root) || document.body, { childList: true, subtree: true }); }
+                if (!control) return;
+                let select = box.querySelector('[data-rp-model]');
+                if (!select) { select = document.createElement('select'); select.dataset.rpModel = ''; select.className = 'settings-control'; select.onchange = () => localStorage.setItem(MODEL, select.value); box.append(select); }
+                updateModels(select, control).catch(() => {});
+            },
+            () => installScrollButton()
+        ];
+        for (const step of steps) { try { step(); } catch { /* 单步失败不阻塞其余安装 */ } }
+        observeUiTargets(fixedGrid);
     }
     function installUi() {
         if (started) return; started = true;
         const start = () => {
-            observer = new MutationObserver(() => { if (scheduled) return; scheduled = true; requestAnimationFrame(() => { scheduled = false; reconcile(); }); });
             reconcile();
+            // 作者导航抽屉开合是短窗口条件渲染（开→外部点击即关），触发器
+            // 点击后立即+延迟各补装一轮，窗口内完成按钮注入。
+            document.addEventListener('click', event => {
+                if (!event.target.closest?.('.app-nav-trigger')) return;
+                requestAnimationFrame(reconcile);
+                window.setTimeout(reconcile, 250);
+            }, true);
         };
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true }); else start();
     }

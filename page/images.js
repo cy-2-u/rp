@@ -38,7 +38,7 @@
             card.hidden = Boolean(job.suppressed);
             task.render(card, task, job);
             let warning = card.querySelector('[data-rp-image-save-error]');
-            if (job.storageError && !warning) { warning = document.createElement('small'); warning.dataset.rpImageSaveError = ''; card.append(warning); }
+            if (job.storageError && !warning) { warning = document.createElement('small'); warning.dataset.rpImageSaveError = ''; warning.className = 'magic-image-save-warning'; card.append(warning); }
             if (warning) { if (job.storageError) warning.textContent = '固定记录未保存，请勿刷新'; else warning.remove(); }
         }
         return job;
