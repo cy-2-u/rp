@@ -10,6 +10,7 @@
     const selectionCount = $('selectionCount');
     const viewer = $('viewer'), viewerImage = $('viewerImage'), viewerTitle = $('viewerTitle'), viewerCount = $('viewerCount');
     const esc = s => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const formatBytes = value => { let n = Number(value) || 0; if (n < 1024) return n + ' B'; const units = ['KB', 'MB', 'GB']; let index = -1; do { n /= 1024; index++; } while (n >= 1024 && index < units.length - 1); return n.toFixed(1) + ' ' + units[index]; };
     const thumbUrl = imageKey => '/image/api/thumb?key=' + encodeURIComponent(imageKey);
     const originalUrl = imageKey => '/image/api/image?key=' + encodeURIComponent(imageKey);
     async function request(path, options = {}) {
@@ -130,6 +131,7 @@
     async function load() {
         if (loading) return;
         loading = true; syncToolbar();
+        const scrollPosition = window.scrollY;
         try {
             stats.textContent = '正在读取...';
             data = await (await request('library', { method: 'GET' })).json();
@@ -140,6 +142,8 @@
             setNotice('');
             characterRenderLimits = Object.create(null);
             render();
+            // 重绘后恢复滚动位置（v2 管线）：长列表刷新/兜底重载不跳顶。
+            requestAnimationFrame(() => window.scrollTo({ top: scrollPosition, behavior: 'instant' }));
         } catch (e) { if (e.status !== 401) { stats.textContent = '读取失败'; setNotice(e.message, true); } }
         finally { loading = false; syncToolbar(); }
     }
@@ -172,9 +176,29 @@
         viewerImage.removeAttribute('src');
         viewerList = []; viewerIndex = -1;
     }
+    // 乐观更新（v2 removeDeletedImages 管线）：删除全部成功后直接改本地
+    // 分组重渲染，省一次 library 全量重拉；后续 load() 兜底仍会校正。
+    function removeLocal(payload) {
+        if (!data) { load(); return; }
+        const keys = new Set(payload.keys || []);
+        const names = new Set(payload.characterNames || []);
+        data.characters = (data.characters || []).map(group => {
+            const images = names.has(group.name) ? [] : group.images.filter(image => !keys.has(image.key));
+            if (!images.length) return null;
+            const size = images.reduce((sum, image) => sum + (Number(image.size) || 0), 0);
+            return { ...group, images, count: images.length, size, sizeHuman: formatBytes(size) };
+        }).filter(Boolean);
+        data.totalCount = data.characters.reduce((sum, group) => sum + group.images.length, 0);
+        data.totalHuman = formatBytes(data.characters.reduce((sum, group) => sum + (Number(group.size) || 0), 0));
+        characterRenderLimits = Object.create(null);
+        setDeleteMode(false);
+        stats.textContent = data.totalCount + ' 张图片 / ' + data.totalHuman;
+        render();
+    }
     async function deletePayload(payload, message) {
         if (deleteBusy || !confirm(message)) return;
         deleteBusy = true; syncToolbar();
+        let attempted = false;
         try {
             const queue = [];
             if (payload.characterNames?.length) queue.push({ characterNames: payload.characterNames });
@@ -184,12 +208,17 @@
             }
             for (let index = 0; index < queue.length; index++) {
                 const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(queue[index]) })).json();
+                attempted = true;
                 if (result.failedCount) throw new Error('部分图片删除失败，请重试。');
                 if (result.continuation) queue.push(result.continuation);
             }
             setNotice('删除完成。');
-            await load();
-        } catch (e) { setNotice(e.message, true); }
+            removeLocal(payload);
+        } catch (e) {
+            // 云端已部分删除时重拉真值校正；notice 在 load 之后设置避免被清掉。
+            if (attempted) await load();
+            setNotice(e.message, true);
+        }
         finally { deleteBusy = false; syncToolbar(); }
     }
     $('login').addEventListener('click', async () => {

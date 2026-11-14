@@ -65,5 +65,8 @@ await P.txDone(tx); assert.equal(extra.result, undefined); assert.equal(preset.r
 assert.equal(w.localStorage.getItem('rp_hub_settings'), '{"stream":true}');
 assert.equal(w.localStorage.getItem('rp_hub_extra'), null);
 assert.equal(w.localStorage.getItem(w.RPCore.KEYS.active), null);
+const afterRestore = calls;
+await w.RPSync.operate('push', true);
+assert.equal(calls, afterRestore, 'restore pre-writes committed so the first auto upload is request-free');
 db.close(); w.close(); await ctx.drain();
 console.log(JSON.stringify({ test: 'roundtrip', result: 'upload, zero-request unchanged auto upload, 1100-message restore, local cleanup and preset exclusion passed', requests: calls, r2: bucket.calls }));

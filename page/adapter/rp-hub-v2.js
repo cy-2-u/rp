@@ -160,8 +160,12 @@
                 if (!r.ok || !payload.data?.length) throw new Error('模型列表无效');
                 if (external.imageKey() !== expected) return;
                 modelList = payload.data.filter(m => m.id);
-            } catch { modelRetryAt = Date.now() + 60000; }
-            finally { modelLoading = false; }
+                try { localStorage.setItem('rp_hub_magic_ynai_models', JSON.stringify(modelList)); } catch { /* 持久化失败不致命 */ }
+            } catch {
+                modelRetryAt = Date.now() + 60000;
+                // 拉取失败回退上次成功拉取的列表，避免断网时丢失模型选项。
+                if (!modelList.length) { try { modelList = JSON.parse(localStorage.getItem('rp_hub_magic_ynai_models') || '[]'); } catch { modelList = []; } }
+            } finally { modelLoading = false; }
         }
         const models = modelList.length ? modelList : [{ id: 'nai-diffusion-4-5-full' }];
         const signature = models.map(m => m.id).join('\n');
@@ -372,7 +376,7 @@
         imageKey: () => String(get('settings')?.imageGenKey || ''),
         register(name, handler) { hooks.set(name, handler); return () => { if (hooks.get(name) === handler) hooks.delete(name); }; },
         capabilities() { const missing = ANCHORS.save.filter(key => !markers.has(key)); if (!mounted) missing.push('mounted'); if (!storage) missing.push('storage'); return { flush: !missing.length, images: Boolean(state && hooks.has('image-request')), missing }; },
-        status() { return { version: 2, anchors: ANCHORS.version, mounted, storage: Boolean(storage), startupError: startupError?.message || '', saveWatchers: Object.fromEntries(ANCHORS.save.map(key => [key, markers.has(key)])) }; }
+        status() { return { version: 2, anchors: ANCHORS.version, mounted, storage: Boolean(storage), startupError: startupError?.message || '', saveWatchers: Object.fromEntries(ANCHORS.save.map(key => [key, markers.has(key)])), hooks: [...hooks.keys()] }; }
     };
     window.RPHubExternal = external;
 })();

@@ -196,14 +196,19 @@
             let reclaimed = 0;
             if (remote?.checksum !== localRoot.checksum) {
                 const known = new Set((remote?.packs || []).map(p => p.checksum));
-                const send = async packs => C.pool(packs, 6, async p => {
-                    const bytes = await readCache(db, 'packs', p.checksum);
-                    if (!bytes || bytes.length !== p.length || await C.hash(bytes) !== p.checksum) throw C.fail('本地分片缓存损坏，请重建索引。');
-                    const query = new URLSearchParams({ checksum: p.checksum, length: String(p.length), entries: String(p.entries) });
-                    await request('/api/rp-sync/pack?' + query, { method: 'PUT', headers: { 'content-type': 'application/gzip' }, body: bytes });
-                });
+                const pending = snapshot.packs.filter(p => !known.has(p.checksum));
+                const send = async packs => {
+                    let done = 0;
+                    await C.pool(packs, 6, async p => {
+                        const bytes = await readCache(db, 'packs', p.checksum);
+                        if (!bytes || bytes.length !== p.length || await C.hash(bytes) !== p.checksum) throw C.fail('本地分片缓存损坏，请重建索引。');
+                        const query = new URLSearchParams({ checksum: p.checksum, length: String(p.length), entries: String(p.entries) });
+                        await request('/api/rp-sync/pack?' + query, { method: 'PUT', headers: { 'content-type': 'application/gzip' }, body: bytes });
+                        progress(40 + Math.round(++done / Math.max(1, packs.length) * 40), '正在上传分片…');
+                    });
+                };
                 progress(40, '正在上传分片…');
-                await send(snapshot.packs.filter(p => !known.has(p.checksum)));
+                await send(pending);
                 let result;
                 const root = await rootFor(snapshot, remote?.version || 0);
                 for (let round = 0; round < 3; round++) {
@@ -376,7 +381,11 @@
             progress(75, '正在应用云端数据…');
             await parse(root.packs, get, new Restore(false), root.entryCount);
             await P.acknowledge(mark);
-            const tx = db.transaction(['sources', 'state'], 'readwrite'); tx.objectStore('sources').clear(); tx.objectStore('state').clear(); await P.txDone(tx);
+            // 恢复后本地与云端一致：预写 committed 记忆，首轮自动保存零请求。
+            const tx = db.transaction(['sources', 'state'], 'readwrite');
+            tx.objectStore('sources').clear();
+            tx.objectStore('state').put({ layout: 2, epoch: localStorage.getItem(K.epoch), epochs: {}, watermark: { databases: {}, intents: [] }, packs: [], totalBytes: 0, entryCount: 0, verifiedAt: Date.now(), committed: root.checksum, sweptAt: 0 }, 'snapshot');
+            await P.txDone(tx);
             localStorage.removeItem(K.active);
             return '恢复完成';
         } finally { db.close(); }
@@ -395,9 +404,11 @@
             try {
                 if (preparing) await preparing;
                 const result = await exclusive(async () => kind === 'pull' ? download() : kind === 'rebuild' ? (await buildSnapshot(true), '本地索引已重建') : upload(automatic));
+                if (automatic) lastAutoSaveError = '';
                 progress(100, result); lastResult(true);
                 if (kind === 'pull') location.replace('/');
             } catch (e) {
+                if (automatic) lastAutoSaveError = e.message;
                 progress(ui.progress, e.message); lastResult(false);
                 if (modalRoot) modalRoot.classList.add('is-error');
                 // 缓存损坏类错误亮出"重建本地索引"作为恢复入口。
@@ -417,6 +428,7 @@
 
     const enabled = () => localStorage.getItem('rp_hub_sync_auto_save_enabled_v1') === '1';
     const minutes = () => Math.max(1, Math.min(1440, Number(localStorage.getItem('rp_hub_sync_auto_save_minutes_v1')) || 5));
+    let lastAutoSaveError = '';
 
     function schedulePrepare(delay = 8000) {
         clearTimeout(prepareTimer);
@@ -945,7 +957,7 @@
         if (!autoSaveToggle) return;
         autoSaveToggle.checked = enabled();
         if (autoSaveMinutesInput.value === '' || document.activeElement !== autoSaveMinutesInput) autoSaveMinutesInput.value = minutes();
-        autoSaveStatus.textContent = running && ui.automatic ? '正在自动上传…' : enabled() ? (remaining <= 0 ? '即将自动保存' : '约 ' + Math.max(1, Math.ceil(remaining / 60000)) + ' 分钟后自动保存') : '自动保存已关闭';
+        autoSaveStatus.textContent = running && ui.automatic ? '正在自动上传…' : enabled() ? ((remaining <= 0 ? '即将自动保存' : '约 ' + Math.max(1, Math.ceil(remaining / 60000)) + ' 分钟后自动保存') + (lastAutoSaveError ? '；上次失败：' + lastAutoSaveError : '')) : '自动保存已关闭';
     }
     function ensureModal() {
         if (modalRoot) return;
@@ -1032,7 +1044,7 @@
             catch { /* 状态探测失败不阻塞恢复入口 */ }
             if (confirm('从云端恢复会替换本地数据' + local + '，继续吗？')) location.replace('/sync-restore');
         });
-        rebuildButton.addEventListener('click', () => { if (!running) operate('rebuild').catch(() => {}); });
+        rebuildButton.addEventListener('click', () => { if (!running && confirm('重建会完整读取本地数据重建索引，不会上传或覆盖云端。继续吗？')) operate('rebuild').catch(() => {}); });
         renderLastSync();
         syncAutoSaveUi();
     }
