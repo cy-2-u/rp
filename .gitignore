@@ -1,5 +1,4 @@
-*.log
-*.tmp
-.zcode/
-page.zip
 node_modules/
+.zcode/
+# 作者前端快照：版权属作者，不入公开仓库（本地生成方式见 ARCHITECTURE 第 6 节）
+tests/fixtures/author/

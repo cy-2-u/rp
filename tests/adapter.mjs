@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM('<!doctype html><html><head></head><body><div id="app"></div></body></html>', { url: 'https://test.local/', runScripts: 'outside-only' });
+const w = dom.window;
+w.eval(await readFile(new URL('../page/adapter/rp-hub-v2.js', import.meta.url), 'utf8'));
+w.eval(await readFile(require.resolve('vue/dist/vue.global.prod.js'), 'utf8'));
+await Promise.resolve();
+const saved = [];
+w.RPHubStorage = { setStoredValue: async (key, value) => saved.push([key, value]) };
+w.eval(`
+const signal = Vue.ref(0);
+Vue.createApp({ setup() {
+    const settings = Vue.ref({ stream: true, temperature: 0.8 });
+    const currentCharacter = Vue.ref({ uuid: 'test', name: 'test' });
+    const currentStoryBranch = Vue.ref({ id: 'main' });
+    const chatHistory = Vue.ref([{ content: 'hello' }]);
+    Vue.watch(signal, () => { const _memorySettingsSaveTimer = setTimeout(() => RPHubStorage.setStoredValue('memory', signal.value), 60000); });
+    Vue.watch(signal, () => { const debouncedCharacterSave = setTimeout(() => RPHubStorage.setStoredValue('character', signal.value), 60000); });
+    Vue.watch(signal, () => { const debouncedSave = setTimeout(() => RPHubStorage.setStoredValue('settings', signal.value), 60000); });
+    Vue.watch(signal, () => { const scheduleChatHistorySave = setTimeout(() => RPHubStorage.setStoredValue('chat', signal.value), 60000); });
+    Vue.onMounted(async () => {});
+    return { settings, currentCharacter, currentStoryBranch, chatHistory };
+}, template: '<div>ready</div>' }).mount('#app');
+signal.value = 1;
+`);
+await w.Vue.nextTick(); await Promise.resolve();
+assert.equal(w.RPHubExternal.status().mounted, true);
+assert.ok(Object.values(w.RPHubExternal.status().saveWatchers).every(Boolean));
+const result = await w.RPHubExternal.flush();
+assert.equal(result.ok, true, result.reason);
+assert.equal(saved.length, 4);
+assert.ok(saved.every(([, value]) => value === 1));
+w.close();
+console.log('adapter: real Vue UMD initialization, watcher hooks and timer drain passed');

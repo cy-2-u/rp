@@ -1,5 +1,5 @@
 {
   "version": 1,
   "include": ["/*"],
-  "exclude": ["/DB/*", "/magic-extension.js"]
+  "exclude": ["/core.js", "/client.js", "/sync.js", "/images.js", "/gallery.js", "/gallery.html", "/config.json", "/adapter/*"]
 }

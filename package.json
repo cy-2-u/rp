@@ -1,16 +1,26 @@
 {
-  "name": "rp-hub-magic-v2",
+  "name": "rp-hub-magic",
   "private": true,
   "type": "module",
-  "description": "RP Hub 魔改版 v2 根工作区：ESLint 死代码门禁（npm run lint），测试在 tests/",
+  "description": "RP Hub 魔改版：Cloudflare Pages Worker + 注入脚本，云同步/图片托管/适配层。",
   "scripts": {
     "lint": "eslint .",
-    "test": "npm --prefix tests test"
-  },
-  "engines": {
-    "node": ">=22.13"
+    "worker": "node tests/worker.mjs",
+    "client": "node tests/client.mjs",
+    "adapter": "node tests/adapter.mjs",
+    "sync": "node tests/sync.mjs",
+    "images": "node tests/images.mjs",
+    "roundtrip": "node tests/roundtrip.mjs",
+    "parity": "node tests/parity.mjs",
+    "author": "node tests/author.mjs",
+    "scale": "node --max-old-space-size=8192 tests/scale.mjs",
+    "serve": "node tests/serve.mjs",
+    "test": "node tests/parity.mjs && node tests/worker.mjs && node tests/client.mjs && node tests/adapter.mjs && node tests/sync.mjs && node tests/images.mjs && node tests/roundtrip.mjs && node tests/author.mjs"
   },
   "devDependencies": {
-    "eslint": "^10.11.0"
+    "eslint": "^9.39.2",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "^26.1.0",
+    "vue": "^3.5.24"
   }
 }

@@ -1,13 +1,14 @@
 # 架构文档（ARCHITECTURE）
 
-面向维护者：适配脚本链与契约、同步 v2 协议、测试体系与维护约定。
+面向维护者：适配脚本链与契约、同步协议、测试体系与维护约定。
 
 ## 1. 设计前提
 
-- **个人单用户**：同步是整体替换语义，不为并发设计任何机制。
-- **国内高延迟**：一切协议决策向"更少请求、更少字节"倾斜。
-- **Cloudflare 免费版**：分片正文永远由 Worker 把 `request.body` 流式直通 R2，不进 isolate 内存聚合。
+- **个人单用户**：同步是整体替换语义，不为并发设计任何机制；多标签页靠一把 Web Locks 互斥锁串行化全部同步操作。
+- **国内高延迟**：一切协议决策向"更少请求、更少字节"倾斜——分片 gzip 内容寻址、无变化零请求、增量只动受影响的桶。
+- **Cloudflare 免费版**：分片正文永远由 Worker 把 `request.body` 流式直通 R2（FixedLengthStream + 条件写），不进 isolate 内存聚合。
 - **作者前端会变**：应对手段是更新一个外部可执行脚本（第 2 节），不是自动探测魔法。
+- **正文直通、计算给浏览器**：差分/分片/gzip 全部在客户端完成，Worker 只做校验与转发。
 
 ## 2. 适配脚本链（核心）
 
@@ -15,19 +16,17 @@
 
 ```
 1. 外部适配脚本   ← page/config.json 的 adapter.externalUrl（env RPHUB_ADAPTER_URL 可覆盖）
-2. 部署兜底脚本   ← page/adapter/rp-hub-v2.js（开箱即用；仓库另保留旧版契约 v1 脚本
-                    page/adapter/rp-hub.js 供旧版部署重部署，两者互不兼容）
+2. 部署兜底脚本   ← page/adapter/rp-hub-v2.js（开箱即用）
 3. R2 last-good   ← rp-adapter/last-good-script-v2.js（最近一次验证通过的副本）
-→ 全部失败：主页只注入 dirty-tracker，同步/图片显式报错
+→ 全部失败：主页只注入协议内核与变更追踪，同步/图片显式报错
 ```
 
-- 外部脚本必定优先：Worker 拉取（10s 超时、512KiB 上限、成功缓存 30s/失败 5s），经 ASSETS 内联注入主页，浏览器不发第二次请求。**作者改版后的维护动作只有一个**：写新脚本 → 传到外部源，刷新即生效。
-- 轻校验：非空、大小上限、含契约标记 `RPHubExternal`。不做字段级 schema 校验——可执行代码的任何字段级校验都是新的一票否决点。
-- Worker 侧自有配置（外部 URL、ynai 端点）在 `page/config.json`（30s 缓存，R2 `last-good-config-v2.json` 兜底）。
+- 外部脚本必定优先：Worker 拉取（10s 超时、512KiB 上限、成功缓存 30s/失败 5s、按源 URL 键控），经 ASSETS 内联注入主页。**作者改版后的维护动作只有一个**：写新脚本 → 传到外部源，刷新即生效。
+- 轻校验：非空、大小上限、含契约标记 `RPHubExternal`。可执行代码不做字段级 schema 校验——任何字段级校验都是新的一票否决点。
+- **注入只在主页**（`/` 与 `/character`、`/novel` 等工坊页不注入）：作者把角色工坊拆成了独立页，那边没有聊天数据可同步。
+- 旧版契约 v1 脚本 `page/adapter/rp-hub.js` **只存于 GitHub 仓库历史**（旧版部署的外部脚本源），本地正本与部署清单均不含它。【勿删远端文件】推送仓库时若本地无此文件会连带删除，旧版部署用户将断供。
 
 ### 2.2 稳定契约：window.RPHubExternal v2
-
-系统侧只依赖契约，不依赖作者内部实现：
 
 | 成员 | 语义 |
 |---|---|
@@ -40,9 +39,16 @@
 | `capabilities()` / `status()` | 逐能力健康度 + missing 列表 / 诊断摘要 |
 | `installUi()` | 同步按钮、图片管理入口、固定生图开关、YNAI 下拉、滚动按钮 |
 
-写新脚本的规范：锚点全集中在头部 `ANCHORS`（候选数组逐个尝试）；UI 安装每步独立 try/catch（reconcile）；**flush 无法确认作者保存完成必须拒绝**（数据安全底线）；上下文探测失败返回 null（图片退化、同步不受影响）；保存定时器经作用域化 `setTimeout` 捕获，flush 重放到"零写入、零待定事务、revision 稳定"。
+### 2.3 与作者真实代码的对接事实（2026-11 实测）
 
-注入顺序：dirty-tracker → 适配脚本（内联）→ magic-extension → bootstrap。降级矩阵：外部失败回兜底 → 回 last-good → 三层全败只注 dirty-tracker；契约版本不符则增强不启用；单锚点失效只缺该项。
+- 作者存储层：`window.RPHubStorage = Object.freeze({...})`，方法为内联箭头函数直连 dbSet/dbGet；适配层经 `defineProperty` 拦截赋值并包装（冻结原对象不可写，包装出的是新对象）。app.js 在 data-services.js 之后装载，解构到的已是包装版。
+- 写入追踪包装：`setStoredValue / deleteStoredValue / setScopedStoredValue / deleteScopedStoredValue`（作者还有裸 `deleteStoredValue`，必须一并包装，否则删除类写入不进 flush 等待）。
+- **角色删除钩子**：作者删除角色时对 `CHARACTER_SCOPED_STORAGE_NAMES = ['chat','classic_memories','branches']` 的每个作用域名调用 `deleteScopedStoredValue(name, id)`，id 含裸角色 uuid 与分支 scopeId。适配层在 `name === 'branches'` 时触发 `character-deleted(id)`；分支 scopeId 传入属无害空操作（不匹配任何记录键）。
+- 保存 watcher 标记：`_memorySettingsSaveTimer / debouncedCharacterSave / debouncedSave / scheduleChatHistorySave`，均存于 app.js；适配层经包装 `Vue.watch` 按函数文本捕获。
+- 写新脚本的规范：锚点全集中在头部 `ANCHORS`；UI 安装经 MutationObserver + reconcile，每步独立容错；**flush 无法确认作者保存完成必须拒绝**；上下文探测失败返回 null（图片退化、同步不受影响）。
+- 作者自己的 cloud-backup（键控式云端备份）与本项目并存不冲突。
+
+注入顺序：core.js → client.js（事务日志/写屏障）→ 适配脚本（内联）→ images.js → sync.js（后两者 defer）。
 
 ## 3. 同步协议 v2（`rp-sync/v2/`）
 
@@ -56,93 +62,100 @@ rp-sync/v2/packs/<sha256>.bin   gzip 后内容寻址分片（customMetadata.entr
 ```json
 { "format": "rp-sync-manifest-v2", "version": 3, "updatedAt": 1730000000000,
   "compression": "gzip", "totalBytes": 980, "entryCount": 24, "checksum": "<hex64>",
-  "packs": [{ "bucket": "store:RPHubDB/store:data|s012", "checksum": "<hex64>", "length": 101, "entries": 3 }] }
+  "packs": [{ "bucket": "source:<sha256>", "checksum": "<hex64>", "length": 101, "entries": 3 }] }
 ```
 
-**canonical 校验和源（三方一致，顺序敏感）**：
+**canonical 校验和源（Worker 与 core.js 逐字双写，parity 测试断言）**：
 
 ```js
-JSON.stringify(['rp-sync-manifest-v2', root.compression, root.totalBytes, root.entryCount,
-  root.packs.map(p => [p.bucket, p.checksum, p.length, p.entries])])
+JSON.stringify([FORMAT, m.compression, m.totalBytes, m.entryCount,
+  m.packs.map(p => [p.bucket, p.checksum, p.length, p.entries])])
 ```
 
-- checksum **只覆盖内容**（不含 version/updatedAt）：同一内容重建根校验和恒定，"无变化上传"靠它 1 个 status 判等；version 单调递增 + CAS etag 防过期覆盖。
-- 上限：快照 1GiB、4096 分片、单片 gzip 6MiB（原始 4MiB 客户端保证）、512 条。`entries` 允许 0：单条超分片缓冲先落纯字节填充片，记录跨片拼接，恢复按行重组。
+- checksum 只覆盖内容（不含 version/updatedAt）：无变化上传靠它 1 个 status 判等；version 单调递增 + CAS etag 防过期覆盖。
+- 上限：快照 1GiB、4096 分片、单片 gzip 6MiB（原始 4MiB）、512 条。`entries` 允许 0：单条记录超分片缓冲时先落纯字节填充片，记录跨片拼接，恢复按行重组。
 
-### 3.2 端点
+### 3.2 源分片布局（客户端，与旧实现的差别）
+
+快照不是"全库按桶切块"，而是**按源组织**：
+
+```
+localStorage            → 全部应用键值一组
+header:<db>             → 数据库头（版本/store 定义）
+bucket:<db>/<store>/<0..63> → 每个对象存储固定 64 桶（FNV-1a(canonical(key)) % 64）
+footer:<db>/<store>     → storeEnd 标记
+end:<db>                → databaseEnd 标记
+```
+
+- 每个源独立 4MiB 缓冲分片；**未变化分片凭原始内容摘要跳过压缩**（rawHashes 与上次对比），改一条记录只重压所在桶。
+- 小记录库不再爆分片数：5000 条小记录 67 片（逐记录布局会 5000+ 片撞 4096 上限）；300MiB 库 129 片。
+- 恢复端按 header → bucket → footer → end 顺序逐行校验（键序、内联键一致、无重复、跨桶不串），两遍语义：validateOnly 全量校验 → 写冻结标记（其他标签页被 client.js 拦截写入+遮罩）→ 写屏障 → 第二遍应用 → 清派生索引。
+- 变更日志水位（journal 自增主键）随快照同一事务持久化：后台准备只扫水位之后的新事件，成本恒定；上传成功 acknowledge 合并水位。索引失效（layout/epoch/库集变化）自动全量重建自愈。
+
+### 3.3 端点
 
 | 端点 | 方法 | 语义 |
 |---|---|---|
 | `/api/rp-sync` | POST | JSON 动作：`auth-status` / `status` / `commit` / `sweep` |
-| `/api/rp-sync/pack` | PUT | 上传一片（sha256 校验、条件创建、流式直通 R2、幂等 204） |
-| `/api/rp-sync/pack?c=<sha>` | GET | 下载一片（边缘 Cache API，immutable） |
+| `/api/rp-sync/pack` | PUT | 上传一片（sha256 条件写、FixedLengthStream 定长直通、幂等 204） |
+| `/api/rp-sync/pack?c=` | GET | 下载一片（边缘 Cache API，immutable，需密码头） |
 
-认证：`RP_SYNC_PASSWORD` 设置后所有同步端点要求 `x-rp-sync-password` 头。
+认证：`RP_SYNC_PASSWORD` 设置后所有同步端点与图库管理端点要求 `x-rp-sync-password` 头。图库页面里图片经 fetch+blob 读取，密码不进 URL。
 
-### 3.3 上传流程（客户端）
+### 3.4 上传流程（客户端）
 
-1. `flushAppState`（作者保存链路 → 图片记录 → 日志收尾）+ 写屏障等在途事务。
-2. **无变化快速通道**（仅自动保存）：journal 全确认 + committed 记忆未过 1 小时验证间隔 ⇒ 跳过网络直接返回；手动上传永远走完整流程。
-3. `status` 与本地快照准备**并行**。
-4. **无变化判定**：本地根校验和 === 云端 ⇒ 只 acknowledge 水位，0 分片。
-5. `PUT pack` ×N（并发 6；云端已有校验和跳过；本地缓存存 gzip 字节直接复用）。
-6. `commit`：版本单调校验 → list 校验全部包存在（缺包 409 带回 missing，客户端按桶重建补传，最多 3 轮）→ etag CAS 切根（3 轮收敛）→ 对比新旧根顺带删除孤儿，响应带 `reclaimed`（未确认删除数）。
-7. `reclaimed > 0` 才补发 `sweep`（正常零残留省一趟 RTT）；`acknowledge` 水位 + 记录上次提交校验和。
+1. `RPHubExternal.flush()`（作者保存链路）→ `RPH_MAGIC_FLUSH_IMAGES`（图片记录落盘）→ 写屏障。
+2. buildSnapshot 增量准备；status 与准备并行不了的部分省略——准备完成后本地算根校验和。
+3. **无变化快速通道**（仅自动保存）：journal 已全部确认 + 未过 1 小时验证间隔 ⇒ 零网络直接 acknowledge。
+4. status 判等 ⇒ "已是最新"；否则并发 6 路 PUT 缺失分片 → commit（版本单调 + 缺包 409 带回 missing 补传，最多 3 轮）。
+5. commit 响应带 `reclaimed`：>0 或距上次清扫满 1 天 ⇒ sweep 兜底（清中断上传的孤儿，1 小时宽限）。
+6. 本地分片缓存按新根修剪；acknowledge 水位。
 
-**后台预先准备**：写入防抖 8s / 加载预热 3s / 回前台 1s 触发；journal 水位增量消费（持续聊天时准备成本恒定）；差分 → 按桶组装 4MiB 分片 → gzip → 本地分片缓存，全程零网络。单飞互斥，上传前等在飞准备收尾再补一次增量。索引缺失/过期后台自动静默重建；上传路径"确认后重建"仅兜底。完整扫描用低占空比（6ms/8ms），上传全速。增量粒度是"桶"（256 个稳定桶，300MB 库约 1.2MiB/桶）。
+### 3.5 多标签页与崩溃安全
 
-### 3.4 恢复流程（客户端）
-
-1. `status` → 客户端按同一 canonical 源重算校验和验证根清单。
-2. `GET pack` ×N（6 路滑动窗口）：字节先验 SHA-256 与长度 → 解压写 staging；gzip 字节同时进本地缓存（命中只验长度）。
-3. **两遍语义**：validateOnly 全量校验结构/顺序/桶归属/重复键 → 写恢复标记（其他标签页冻结+遮罩）→ 写屏障 → 第二遍应用：恢复 localStorage/IndexedDB、按包内行字节精确复制重建缓存索引、确认水位、清标记、刷新。
-4. 失败保留已校验分片缓存，只清派生索引，重试不重新下载。
-
-### 3.5 孤儿分片
-
-"无用" = 不被当前根引用。提交即回收（Worker 对比新旧根批量删差集）+ sweep 兜底（list 全部、1 小时宽限期、删未引用过期对象）+ 本地 `pruneCachedPacks`。删除失败只留垃圾不留风险（下轮 sweep 重判）；单用户 + 全量根清单让引用判断变成一次内存差集——旧协议的 GC 状态机/Bloom/上传会话全部不需要。
+- `navigator.locks.request('rp-sync-v2')` 串行化 prepare/upload/restore——快照从生成到确认期间不被并发修改。
+- 恢复冻结：`rp_sync_restore_active` + epoch 双标记，client.js 在事务与 Storage 层直接抛错拦截写入，并显示遮罩。
+- 触库写屏障：恢复前对每个库发起一次 readwrite 事务，确保在飞事务全部落盘再取水位。
+- 后台准备低占空比（工作 6ms → 让出 8ms），上传路径全速；页面隐藏自动暂停。
 
 ## 4. 图片模块
 
-- R2 键：`rp-images/characters/<角色名>/<签名sha256>`（缩略图 `thumbs/`、墓碑 `_deleted/`）。签名 provider 恒 `sta1n`——ynai/sta1n 共享内容寻址缓存，历史键稳定。
+- R2 键：`rp-images/characters/<角色名>/<签名sha256>`（缩略图 `thumbs/`、墓碑 `_deleted/`）。签名 provider 恒 `sta1n`——ynai/sta1n 共享内容寻址缓存，历史键稳定；参数表与默认值在 Worker 与 images.js 双写，parity 测试断言。
 - 生图只接受 POST（GET/HEAD 只读或 404，爬虫不扣费）；24MiB/16MiB/2MiB 有界读取；墓碑优先（删除后旧链接返回占位 SVG）。
-- 两阶段删除：先墓碑后台清理；每请求 ≤20 目标，清空角色游标续传。**墓碑不参与分片回收**（删墓碑会让旧链接重新生图）。
-- `/image` = 静态资产 `gallery.html`；缩略图读写归图库端点（图库自带按需回填），**聊天卡片恒显原图**【产品决策，勿回退，详见 adapter ANCHORS 后区块注释】。
+- 两阶段删除：先墓碑后台清理；每请求 ≤20 目标，清空角色游标续传。墓碑不参与分片回收。
+- **聊天卡片恒显原图**（懒加载 IntersectionObserver）；图库页自带按需缩略图回填（320px WebP，并发 2），与聊天互不影响。
 - ynai 端点只认 `page/config.json`，缺失时显式 503。
 
 ## 5. 测试
 
 ```text
-cd tests && npm ci
-npm test              # unit（audit/protocol/images/legacy/magic）+ runtime（client-sim/realistic-sim/adapter-contract）
-npm run scale         # 规模模拟（SCALE_MB 默认 300）
-npm run realistic     # 真实形态模拟（SIM_CHARS/SIM_CHATS/SIM_MSGS 可调）
-npm run sync-perf     # 后台准备基准 + journal 增量消费正确性
-npm run code-audit    # 死代码静态审计
+npm test          # parity + worker(25) + client + adapter + sync + images + roundtrip + author(46)
+npm run scale     # 300MiB 规模（RP_MIB 可调）
+npm run serve     # 本地验收服务器；RP_FIXTURE=1 时作者源站=真实作者线上版 fixture
+npm run lint      # ESLint 死代码门禁
 ```
 
 | 文件 | 覆盖 |
 |---|---|
-| `audit-regressions.mjs` | 双写协议/UI 常量逐字一致、三方 canonical 一致、无旧协议残留、Worker 结构约束、page/ 文件集完整 |
-| `protocol-smoke.mjs` | 脚本链注入/优先/回退/last-good、同步协议全形状、密码门禁 |
-| `image-regressions.mjs` | 生图键稳定/缓存/ETag/GET 不生图/墓碑/上限/ynai 路由/模型列表/图库页 |
-| `legacy-upgrade.mjs` | v1 遗留状态升级 + 中断续传元数据合法 |
-| `magic-behavior.mjs` | 真实适配脚本+Vue+magic：生图全链路、复用不重生成、原图展示、flush |
-| `realistic-sim.mjs` | 真实形态数据端到端（首次/无变化/增量/图片库/恢复字节级/缓存命中） |
-| `client-sim.mjs` | jsdom+fake-indexeddb 真实三方端到端 + entries=0 填充片 + 规模模式 |
-| `adapter-contract.mjs` | 契约 v2、能力报告、flush 稳定判定、忙碌拒绝、注册钩子 |
-| `background-prepare-bench.mjs` | 后台准备耗时不随累积增长 |
-| `journal-incremental-verify.mjs` | 水位推进、上传捕获未准备写入、恢复字节级对比 |
-| `day-sim.mjs` | "用户的一天"全行为随机交错（虚拟时钟 24h≈2min），产出请求账单/快速通道命中/孤儿拓扑 |
-| `dead-code-audit.mjs` | 零引用顶层函数候选 + 单调用点自审清单 |
+| `tests/parity.mjs` | Worker↔core.js 协议双写（布局/校验和源/限额）、图片参数表、密码键、资产清单、契约版本 |
+| `tests/worker.mjs` | 鉴权、缺包 409、条件写、长度不符、提交幂等、缓存鉴权、墓碑、删除故障、HEAD 透传、注入完整性 |
+| `tests/client.mjs` | 事务日志原子性、中止不留脏、水位确认、恢复冻结 |
+| `tests/adapter.mjs` | 真实 Vue UMD 初始化、4 个保存标记捕获、防抖定时器排空、flush |
+| `tests/sync.mjs` | 全量建索引、重复准备稳定、单桶增量、分片缓存校验、长会话追加 |
+| `tests/images.mjs` | 禁止生图语义、固定记录、已有图保留、角色删除清理 |
+| `tests/roundtrip.mjs` | 上传→无变化零请求→恢复字节级→本地清理→预设保留 |
+| `tests/author.mjs` | **真实作者线上版锚点审计**：适配层 ANCHORS 单源提取，逐项在 fixture 中核对 |
+| `tests/scale.mjs` | 300MiB：分片数、耗时、无变化零压缩、增量 |
+| `tests/serve.mjs` | 真实浏览器验收服务器（内存 R2）；`RP_FIXTURE=1` 切换真实作者 fixture |
 
-测试基建：`lib/r2.mjs`（内存 R2 桶）、`lib/worker.mjs`（Worker 装载器 + HTMLRewriter 桩）。全部外网在测试内拦截。
+测试基建：`tests/platform.mjs`（内存 R2 桶——含定长流与条件写拒绝语义、Cache、FixedLengthStream、HTMLRewriter 桩）。
 
 ## 6. 维护约定
 
-- Worker 单文件、无构建、无 import/顶层 await。
-- `page/` 是唯一发布正本；手动部署上传该目录；部署器（`deployer/worker.js`，线上独立 Worker 需手动同步）实时从仓库 `main` 的 `page/` 拉文件。**部署器 ASSETS 清单必须与 page/ 文件集一致**；改动后跑 `node deployer/test-blake3.mjs && node deployer/test-flow.mjs`（37+101 项断言）。
-- 改同步协议必须同时改 `page/_worker.js`、`page/DB/bootstrap.js`、`tests/`；dirty-tracker 与 bootstrap 的协议常量是人肉双写副本（audit-regressions 逐字断言）。
-- 改适配层：锚点变化只改 `ANCHORS`；契约变化必须升 `version` 并同步系统侧。
+- Worker 单文件、无构建、无 import/顶层 await；代理超时 = 8s 响应头 + 30s 正文空闲（bodyIdleGuard），慢线路长正文不断流。
+- `page/` 是唯一发布正本（11 文件，其中 `adapter/rp-hub.js` 为旧版契约存档、不参与部署）；手动部署上传其余 10 个。
+- 改同步协议必须同时改 `page/_worker.js` 与 `page/core.js`，跑 `npm test`（parity 会拦双写漂移）。
+- 改适配层：锚点变化只改 `ANCHORS` 并跑 `npm test`（author 审计逐项核对 fixture）；契约变化必须升 `version` 并同步系统侧。
+- 作者改版维护流程：`curl` 拉新版 → 覆盖 `tests/fixtures/author/` → `npm test` → 按失活项改 ANCHORS → 新脚本传外部源。fixture 是作者代码的本地快照，因版权不入公开仓库（.gitignore 已排除），换机器需重新拉取。
 - 不推送 GitHub（除非明确要求）；不删除线上 R2 数据。
-- 免费版上限优先于美观：禁止全量分片/完整根清单聚合进单次 Worker 内存（根清单除外，≤1MiB 有界读取）。
+- 免费版上限优先于美观：禁止把全量分片聚合进单次 Worker 内存（根清单除外，≤1MiB 有界读取）。

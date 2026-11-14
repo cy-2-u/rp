@@ -1,5 +1,11 @@
-/DB/*
+/*.js
   Cache-Control: no-cache
 
-/magic-extension.js
+/adapter/*
+  Cache-Control: no-cache
+
+/gallery.html
+  Cache-Control: no-cache
+
+/config.json
   Cache-Control: no-cache

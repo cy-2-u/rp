@@ -1,7 +1,5 @@
 {
-  "adapter": {
-    "externalUrl": ""
-  },
+  "adapter": { "externalUrl": "" },
   "image": {
     "ynai": {
       "base": "https://nai.rinko.ai",
