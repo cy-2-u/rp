@@ -28,7 +28,6 @@ h1{font-size:22px;margin:0;font-weight:850;letter-spacing:0;white-space:nowrap}
 main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
 .auth{position:relative;min-height:100svh;display:flex;align-items:center;justify-content:center;padding:32px 16px}
 .auth-card{width:min(420px,100%);background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 48px rgba(15,23,42,.08)}
-.auth-kicker{font-size:11px;font-weight:850;letter-spacing:.16em;color:var(--blue);text-transform:uppercase;margin-bottom:10px}
 .auth h2{margin:0 0 8px;font-size:22px;line-height:1.2}
 .auth p,.empty{color:var(--muted);font-size:13px}
 .auth input{width:100%;height:44px;border:1px solid var(--line);border-radius:8px;padding:0 12px;margin:16px 0 12px;outline:none;font-size:14px}
@@ -42,8 +41,8 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
 .album-meta{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .album-actions{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:10px}
 .album-primary-actions{display:flex;align-items:center;gap:8px}
-.album-clear{height:32px;border:1px solid #fecaca;border-radius:8px;background:#fff;color:#b91c1c;font-weight:850;padding:0 12px;cursor:pointer;white-space:nowrap}
-.album-clear:hover{background:#fef2f2;border-color:#fca5a5}
+.album-clear{height:32px;border:1px solid #e5e9f0;border-radius:8px;background:#fff;color:#9aa3b2;font-weight:800;padding:0 12px;cursor:pointer;white-space:nowrap}
+.album-clear:hover{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
 .album-more{height:34px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#2563eb;font-weight:850;padding:0 12px;cursor:pointer;white-space:nowrap}
 .album-more:hover{background:#eff6ff;border-color:#bfdbfe}
 .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(142px,1fr));gap:10px}
@@ -55,31 +54,19 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
 .delete-mode .photo-check{display:flex}
 .photo.selected .photo-check{background:var(--blue);border-color:var(--blue)}
 .photo.selected .photo-check:after{content:"\2713"}
-.photo.blurred img{filter:blur(12px)}
-.photo.blurred:after{content:"";position:absolute;inset:0;background:rgba(255,255,255,.22);pointer-events:none}
+.photo img{background:linear-gradient(100deg,#eef1f6 40%,#f7f9fc 50%,#eef1f6 60%);background-size:200% 100%;animation:photo-shimmer 1.4s ease infinite}
+@keyframes photo-shimmer{from{background-position:120% 0}to{background-position:-80% 0}}
 .photo-info,.photo-check{z-index:1}
-.album-head-actions{display:flex;align-items:center;gap:6px;flex:none}
-.album-toggle{height:30px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#374151;font-weight:800;padding:0 10px;cursor:pointer;white-space:nowrap}
-.album-toggle:hover{background:#f1f5f9;border-color:#c7d2e0}
-.context-menu{position:fixed;z-index:40;min-width:132px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 12px 32px rgba(15,23,42,.16);padding:6px;display:flex;flex-direction:column;gap:2px}
-.context-menu button{height:34px;border:0;border-radius:6px;background:transparent;color:#111827;font-weight:700;text-align:left;padding:0 10px;cursor:pointer;white-space:nowrap}
-.context-menu button:hover{background:#eff6ff}
-.viewer-stage img.blurred{filter:blur(12px)}
 .notice{min-height:20px;color:#4b5563;font-size:13px;margin-bottom:10px}
 .hidden{display:none!important}
-.viewer{position:fixed;inset:0;z-index:30;background:rgba(246,248,251,.96);backdrop-filter:blur(10px);display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;gap:12px;padding:14px;overflow:hidden}
+.viewer{position:fixed;inset:0;z-index:30;background:rgba(15,23,42,.93);backdrop-filter:blur(8px);display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr) auto;gap:12px;padding:14px;overflow:hidden}
 .viewer-top{display:flex;align-items:center;gap:10px;width:100%}
-.viewer-title{font-weight:850;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.viewer-count{color:var(--muted);font-size:12px;margin-left:auto;white-space:nowrap}
+.viewer-title{font-weight:850;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f8fafc}
+.viewer-count{color:rgba(248,250,252,.75);font-size:12px;margin-left:auto;white-space:nowrap}
 .viewer-stage{min-width:0;width:100%;min-height:0;display:flex;align-items:center;justify-content:center}
-.viewer-stage img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 24px 70px rgba(15,23,42,.14)}
-.viewer-nav{position:fixed;top:50%;transform:translateY(-50%);width:42px;height:54px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.9);font-size:24px;color:#1f2937}
+.viewer-stage img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 24px 70px rgba(0,0,0,.45)}
+.viewer-nav{position:fixed;top:50%;transform:translateY(-50%);width:42px;height:54px;border:1px solid rgba(255,255,255,.22);border-radius:8px;background:rgba(15,23,42,.55);font-size:24px;color:#f8fafc}
 .viewer-nav.prev{left:14px}.viewer-nav.next{right:14px}
-.filmstrip{display:flex;gap:8px;overflow-x:auto;padding:4px 14px 2px;justify-content:flex-start;min-width:0;width:100%}
-.film{flex:0 0 58px;width:58px;height:58px;border:2px solid transparent;border-radius:8px;padding:0;overflow:hidden;background:#e5e7eb}
-.film.active{border-color:var(--blue)}
-.film img{width:100%;height:100%;object-fit:cover;display:block}
-.film-placeholder{display:block;width:100%;height:100%;background:linear-gradient(135deg,#e5ebf3,#f8fafc)}
 @media(max-width:720px){
   body:before{height:34vh;background-size:30px 30px}
   .bar{grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:12px}
@@ -101,21 +88,16 @@ main{position:relative;max-width:1180px;margin:auto;padding:18px 16px 48px}
   .photo-info{display:none}
   .viewer{padding:10px;gap:10px}
   .viewer-nav{width:36px;height:48px}
-  .film{flex-basis:52px;width:52px;height:52px}
 }
 /* —— v3 引擎接入的补充规则（其余为 v2 视觉原样） —— */
-#more{display:block;margin:18px auto 0;height:38px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#2563eb;font-weight:800;padding:0 16px;cursor:pointer}
-#more:hover{background:#eff6ff;border-color:#bfdbfe}
-#more:disabled{opacity:.45;cursor:not-allowed}
-select.search{appearance:auto;padding:0 10px}
-.viewer button:hover{border-color:#9bb7f4;color:var(--blue-dark)}
-.viewer-top .btn{flex:none}</style>
+.viewer button:hover{border-color:rgba(255,255,255,.5);color:#fff}
+.viewer-top .btn{flex:none;background:transparent;border-color:rgba(255,255,255,.28);color:#e2e8f0}
+.viewer-nav:hover{background:rgba(15,23,42,.75)}</style>
 <script defer src="/gallery.js"></script>
 </head>
 <body>
 <section id="auth" class="auth hidden">
   <div class="auth-card">
-    <div class="auth-kicker">Image Library</div>
     <h2>角色图片管理</h2>
     <p>输入云同步密码后进入。</p>
     <input id="password" type="password" placeholder="同步密码" autocomplete="current-password">

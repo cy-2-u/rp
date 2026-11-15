@@ -35,14 +35,8 @@ body{
 /* ---------- 桌面壁纸 ---------- */
 .wall{
   position:fixed; inset:0; z-index:-1;
-  background:
-    radial-gradient(90rem 60rem at 85% 115%, rgba(255,159,64,.55), transparent 60%),
-    radial-gradient(80rem 55rem at -10% 110%, rgba(255,88,110,.42), transparent 55%),
-    radial-gradient(120rem 80rem at 55% -20%, #2f5fd0, transparent 65%),
-    linear-gradient(165deg, #171a33 0%, #2c2454 48%, #6d3f68 100%);
-  animation:drift 80s ease-in-out infinite alternate;
+  background:linear-gradient(180deg, #1d1f27 0%, #272a36 60%, #2b2e3b 100%);
 }
-@keyframes drift{from{filter:hue-rotate(0deg) saturate(1)}to{filter:hue-rotate(16deg) saturate(1.1)}}
 @media (prefers-reduced-motion: reduce){ .wall{animation:none} }
 
 /* ---------- 悬浮时钟 ---------- */
@@ -268,7 +262,7 @@ input:focus{border-color:var(--blue); box-shadow:0 0 0 3.5px rgba(0,122,255,.25)
       </label>
       <button id="deploy" class="btn-primary" type="button">部署</button>
       <button id="update" class="btn-primary btn-update" type="button">更新</button>
-      <p class="note">令牌通过 zhao 的 Worker 转发部署；「更新」把已有魔改版项目刷成 GitHub 最新版。</p>
+      <p class="note">令牌仅在本次部署请求中使用，不存储不回显；「更新」把已有魔改版项目刷成 GitHub 最新版。</p>
       <div id="err" class="err" hidden></div>
       <div id="projects" hidden>
         <div class="proj-head">
