@@ -148,7 +148,7 @@ const RAW_BASE = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_REPO}/$
 const FRONTEND_URL = 'https://cy-2-u.github.io/rp/';
 const REQUEST_MAX_BYTES = 4096;
 const CF_REQUEST_TIMEOUT_MS = 15 * 1000;
-const DEPLOY_POLL_DEADLINE_MS = 15 * 1000;
+const DEPLOY_POLL_DEADLINE_MS = 30 * 1000;
 const DEPLOY_POLL_INTERVAL_MS = 1500;
 
 function json(data, status, origin) {
