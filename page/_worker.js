@@ -303,11 +303,13 @@ async function images(request, env, ctx, url) {
             let continuation = null;
             if (body.characterNames?.length) {
                 if (body.characterNames.length !== 1) throw failure('每次清空一个角色。');
-                const page = await list(bucket, IMAGE + safeName(body.characterNames[0]) + '/', body.cursor, 20);
+                // 免费版每请求 50 个子请求上限（R2 操作计入）：每对象 head+墓碑+删除 3 个，
+                // 一批最多 15 张才稳在限内。
+                const page = await list(bucket, IMAGE + safeName(body.characterNames[0]) + '/', body.cursor, 15);
                 objects = page.objects;
                 if (page.truncated) continuation = { characterNames: body.characterNames, cursor: page.cursor };
             } else {
-                if (!Array.isArray(body.keys) || body.keys.length > 20) throw failure('每批最多删除 20 张图片。');
+                if (!Array.isArray(body.keys) || body.keys.length > 15) throw failure('每批最多删除 15 张图片。');
                 objects = (await pool([...new Set(body.keys)], 6, async key => { imageParts(key); return bucket.head(key); })).filter(Boolean);
             }
             const acceptedKeys = [], remainingKeys = [], pendingCleanup = [];

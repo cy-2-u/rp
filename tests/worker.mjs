@@ -57,6 +57,8 @@ const thumbPath = '/image/api/thumb?key=' + imageKey;
 check((await call(thumbPath, { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: new Uint8Array([4, 5]) }, false)).status === 401, 'thumbnail upload requires password');
 check((await call(thumbPath, { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: new Uint8Array([4, 5]) })).status === 200, 'authenticated thumbnail upload');
 check((await call(thumbPath, {}, false)).status === 200, 'thumbnail reads without password');
+// 免费版每请求 50 个子请求上限（R2 操作计入）：一批 15 张 × 3 操作 + list 才稳在限内。
+check((await call('/image/api/delete', { method: 'POST', body: JSON.stringify({ keys: Array.from({ length: 16 }, () => imageKey) }) })).status === 400, 'delete batch above 15 is rejected to stay under the free-plan subrequest cap');
 const deleteKeys = [imageKey, 'rp-images/thumbs/test/' + 'a'.repeat(64) + '.webp'];
 bucket.faults.set('delete:' + deleteKeys.join(','), new Error('injected physical delete failure'));
 const removed = await (await call('/image/api/delete', { method: 'POST', body: JSON.stringify({ keys: [imageKey] }) })).json();

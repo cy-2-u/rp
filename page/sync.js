@@ -45,21 +45,16 @@
         const response = await request('/api/rp-sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, conflicts);
         return response.conflict ? { ok: false, ...response.conflict } : response.json();
     };
-    async function record(dbName, storeName, key) {
-        const db = await P.open(dbName);
-        try { const tx = db.transaction(storeName, 'readonly'), r = tx.objectStore(storeName).get(key); return await P.txDone(tx, () => r.result); }
-        finally { db.close(); }
-    }
     function bucketFor(key) {
         let hash = 2166136261;
         for (const ch of C.canonical(key)) { hash ^= ch.charCodeAt(0); hash = Math.imul(hash, 16777619); }
         return (hash >>> 0) % 64;
     }
-    async function* bucketRows(dbName, store, keys) {
-        for (const key of keys) {
-            const value = await record(dbName, store, key);
-            if (value !== undefined) yield* rowsFor(dbName, store, key, value);
-        }
+    // 单事务批量读整个桶：事务内并发 get，避免每键重开连接（真机数量级开销）。
+    async function* bucketRows(app, dbName, store, keys) {
+        const tx = app.transaction(store, 'readonly'), requests = keys.map(key => tx.objectStore(store).get(key));
+        const values = await P.txDone(tx, () => requests.map(r => r.result));
+        for (let i = 0; i < keys.length; i++) if (values[i] !== undefined) yield* rowsFor(dbName, store, keys[i], values[i]);
     }
     function* rowsFor(db, store, key, value) {
         if (Array.isArray(value)) {
@@ -68,10 +63,12 @@
             yield { type: 'recordArrayEnd', database: db, store, key, length: value.length };
         } else yield { type: 'record', database: db, store, key, value };
     }
+    // 打包缓冲模块级复用：prepare 串行持锁，10+ 源共享同一 4MB 缓冲省掉分配抖动。
+    let packBuffer = null;
     async function encodeSource(id, rows, storePack, previous) {
         const packs = [], rawHashes = [];
         const bucket = 'source:' + await C.hash(id);
-        const buffer = new Uint8Array(C.LIMIT.raw);
+        const buffer = packBuffer || (packBuffer = new Uint8Array(C.LIMIT.raw));
         let used = 0, entries = 0;
         const flush = async () => {
             if (!used) return;
@@ -143,11 +140,17 @@
                         if (full || item) {
                             const keyTx = app.transaction(def.name, 'readonly'), keyRequest = keyTx.objectStore(def.name).getAllKeys();
                             const keys = await P.txDone(keyTx, () => keyRequest.result.filter(key => !C.excluded(dbName, def.name, key)));
-                            const affected = full || item.clear ? new Set(Array.from({ length: 64 }, (_, i) => i)) : new Set([...item.keys.values()].map(bucketFor));
-                            for (const bucket of affected) {
-                                const id = 'bucket:' + dbName + '/' + def.name + '/' + bucket;
-                                const selected = keys.filter(key => bucketFor(key) === bucket);
-                                if (selected.length) await replace(id, bucketRows(dbName, def.name, selected), order + ':1:' + String(bucket).padStart(2, '0'));
+                            // 一次遍历按桶分组：避免每桶全量重扫 + 每键重复 canonical 序列化。
+                            const byBucket = new Map();
+                            for (const key of keys) { const b = bucketFor(key), list = byBucket.get(b); list ? list.push(key) : byBucket.set(b, [key]); }
+                            // 清空记账不带键：非全量 clear 时旧桶源也要纳入，空桶才会被删除而非残留。
+                            const bucketPrefix = 'bucket:' + dbName + '/' + def.name + '/';
+                            const affected = full || item.clear
+                                ? new Map([...byBucket, ...full ? [] : [...sources.keys()].filter(id => id.startsWith(bucketPrefix)).map(id => [Number(id.slice(bucketPrefix.length)), []])])
+                                : new Map([...new Set([...item.keys.values()].map(bucketFor))].map(b => [b, byBucket.get(b) || []]));
+                            for (const [bucket, selected] of affected) {
+                                const id = bucketPrefix + bucket;
+                                if (selected.length) await replace(id, bucketRows(app, dbName, def.name, selected), order + ':1:' + String(bucket).padStart(2, '0'));
                                 else { sources.delete(id); changes.set(id, null); }
                             }
                         }
@@ -339,8 +342,8 @@
                     size += piece.length; fragments.push(piece);
                     if (size > C.LIMIT.object) throw C.fail('单条恢复数据过大。');
                     if (end < 0) break;
-                    const bytes = new Uint8Array(size); let pos = 0;
-                    for (const part of fragments) { bytes.set(part, pos); pos += part.length; }
+                    // 单片段行直接复用零拷贝视图，跨包行才拼接。
+                    const bytes = fragments.length === 1 ? fragments[0] : (() => { const b = new Uint8Array(size); let pos = 0; for (const part of fragments) { b.set(part, pos); pos += part.length; } return b; })();
                     const row = JSON.parse(decoder.decode(bytes));
                     await consumer.consume(row);
                     fragments = []; size = 0; count++; offset = end + 1;

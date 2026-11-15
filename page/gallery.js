@@ -154,9 +154,8 @@
         document.body.classList.toggle('delete-mode', deleteMode);
         syncToolbar();
     }
-    function preview(imageKey) {
-        const sequence = [];
-        for (const group of visibleGroups()) for (const image of group.images) sequence.push(image);
+    function preview(imageKey, sequence) {
+        if (!sequence) { sequence = []; for (const group of visibleGroups()) for (const image of group.images) sequence.push(image); }
         const index = sequence.findIndex(image => image.key === imageKey);
         if (index < 0) return;
         viewerList = sequence;
@@ -169,7 +168,7 @@
     function stepViewer(delta) {
         if (!viewerList.length) return;
         viewerIndex = (viewerIndex + delta + viewerList.length) % viewerList.length;
-        preview(viewerList[viewerIndex].key);
+        preview(viewerList[viewerIndex].key, viewerList);
     }
     function closeViewer() {
         viewer.classList.add('hidden');
@@ -205,7 +204,7 @@
             if (payload.characterNames?.length) queue.push({ characterNames: payload.characterNames });
             else {
                 const keys = [...new Set(payload.keys || [])];
-                for (let offset = 0; offset < keys.length; offset += 20) queue.push({ keys: keys.slice(offset, offset + 20) });
+                for (let offset = 0; offset < keys.length; offset += 15) queue.push({ keys: keys.slice(offset, offset + 15) });
             }
             for (let index = 0; index < queue.length; index++) {
                 const result = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(queue[index]) })).json();
@@ -217,8 +216,8 @@
             // 墓碑已写、旧链接已失效；物理残留静默重删一轮，仍失败留给下次删除兜底。
             if (pending.length) {
                 try {
-                    for (let offset = 0; offset < pending.length; offset += 20) {
-                        const retry = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keys: pending.slice(offset, offset + 20) }) })).json();
+                    for (let offset = 0; offset < pending.length; offset += 15) {
+                        const retry = await (await request('delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keys: pending.slice(offset, offset + 15) }) })).json();
                         if (retry.pendingCleanup?.length) break;
                     }
                 } catch { /* 静默 */ }
