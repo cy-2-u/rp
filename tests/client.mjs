@@ -20,6 +20,19 @@ let dirty = await P.dirty();
 assert.equal(dirty.stores.get('RPHubDB/store').keys.get('"chat"'), 'chat');
 await P.acknowledge({ databases: dirty.databases });
 assert.equal((await P.dirty()).stores.size, 0);
+// 一锤定音：epoch 记录保住 autoIncrement 不重置。journal 数字记录全清后 store 仍非空（剩
+// '__epoch__'），键生成器必须继续递增——若重置回卷，水位增量扫描永远捕不到新写入 = 增量静默失效。
+{
+    const watermark = dirty.databases.RPHubDB;
+    tx = db.transaction('store', 'readwrite');
+    tx.objectStore('store').put({ content: 'after-ack' }, 'k-next');
+    await P.txDone(tx);
+    await P.flush();
+    const delta = await P.dirty({ RPHubDB: watermark });
+    assert.ok(delta.stores.get('RPHubDB/store'), 'acknowledge 后增量扫描仍捕到新写入');
+    assert.ok(delta.databases.RPHubDB > watermark, '键生成器未重置：新水位必须大于旧水位');
+    await P.acknowledge(delta);
+}
 tx = db.transaction('store', 'readwrite');
 tx.objectStore('store').put('discarded', 'aborted');
 const aborted = P.txDone(tx).catch(() => {});
@@ -43,4 +56,4 @@ assert.equal(w.localStorage.getItem('rp_hub_sync_auto_save_enabled_v1'), '1', 'c
 assert.equal(w.localStorage.getItem('rp_hub_test'), null, 'clear removes app keys');
 await P.acknowledge(await P.dirty());
 db.close(); dom.window.close();
-console.log('client: 12 journal, abort, acknowledgment, freeze and clear-scope checks passed');
+console.log('client: 15 journal, abort, acknowledgment, freeze, clear-scope and key-generator monotonicity checks passed');

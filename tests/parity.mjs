@@ -75,4 +75,13 @@ for (const file of deployerFiles) assert.ok(pageFiles.has(file), '部署器清�
 const undeployed = [...pageFiles].filter(name => !deployerFiles.has(name));
 assert.deepEqual(undeployed, [], 'page/ 无未进部署器清单的文件');
 
-console.log('parity: 云端布局/校验和源/限额/图片参数/密码键/资产清单/契约版本/部署器清单 双写全部一致');
+// 8. formatBytes 双写（Worker library 端 sizeHuman ↔ 图库本地乐观更新 sizeHuman）：整数域样本逐点一致，
+// 两端显示口径漂移会让乐观更新后的体积文案与刷新后不一致。
+{
+    const workerBytes = eval('(' + one(worker, /(function formatBytes\(bytes\) \{[\s\S]*?\n\})/, 'worker formatBytes') + ')');
+    const galleryBytes = eval('(' + one(gallery, /^\s*const formatBytes = (value => \{.*\});$/m, 'gallery formatBytes') + ')');
+    for (const sample of [0, 1, 512, 1023, 1024, 1536, 1048575, 1048576, 1073741824, 10 * 1024 ** 3]) {
+        assert.equal(workerBytes(sample), galleryBytes(sample), 'formatBytes 双写一致 @' + sample + ' 字节');
+    }
+}
+console.log('parity: 云端布局/校验和源/限额/图片参数/密码键/资产清单/契约版本/部署器清单/formatBytes 双写全部一致');
