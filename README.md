@@ -75,9 +75,11 @@
 
 ```text
 npm install
-npm test          # 全部回归（协议/端到端/锚点审计）
+npm test          # 全部回归（协议/端到端/图库/锚点审计/部署器）
 npm run scale     # 300MiB 规模模拟
-RP_FIXTURE=1 npm run serve   # 本地验收服务器（作者源站=真实线上版 fixture），浏览器打开 http://127.0.0.1:18791/
+npm run serve     # 本地验收服务器（作者源站=内置仿真），浏览器打开 http://127.0.0.1:18791/
+# 真实线上版 fixture 作为作者源站：bash 用 RP_FIXTURE=1 npm run serve；
+# PowerShell 用 $env:RP_FIXTURE=1; npm run serve
 npm run lint      # 死代码门禁
 ```
 

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "description": "RP Hub 魔改版：Cloudflare Pages Worker + 注入脚本，云同步/图片托管/适配层。",
+  "engines": { "node": ">=22.13" },
   "scripts": {
     "lint": "eslint .",
     "worker": "node tests/worker.mjs",
@@ -11,11 +12,13 @@
     "sync": "node tests/sync.mjs",
     "images": "node tests/images.mjs",
     "roundtrip": "node tests/roundtrip.mjs",
+    "gallery": "node tests/gallery.mjs",
     "parity": "node tests/parity.mjs",
     "author": "node tests/author.mjs",
+    "deployer": "node deployer/test-blake3.mjs && node deployer/test-flow.mjs",
     "scale": "node --max-old-space-size=8192 tests/scale.mjs",
     "serve": "node tests/serve.mjs",
-    "test": "node tests/parity.mjs && node tests/worker.mjs && node tests/client.mjs && node tests/adapter.mjs && node tests/sync.mjs && node tests/images.mjs && node tests/roundtrip.mjs && node tests/author.mjs"
+    "test": "node tests/parity.mjs && node tests/worker.mjs && node tests/client.mjs && node tests/adapter.mjs && node tests/sync.mjs && node tests/images.mjs && node tests/gallery.mjs && node tests/roundtrip.mjs && node tests/author.mjs && node deployer/test-blake3.mjs && node deployer/test-flow.mjs"
   },
   "devDependencies": {
     "eslint": "^9.39.2",

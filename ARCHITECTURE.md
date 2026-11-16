@@ -145,8 +145,10 @@ npm run lint      # ESLint 死代码门禁
 | `tests/images.mjs` | 禁止生图语义、固定记录、已有图保留、角色删除清理 |
 | `tests/roundtrip.mjs` | 上传→无变化零请求→恢复字节级→本地清理→预设保留 |
 | `tests/author.mjs` | **真实作者线上版锚点审计**：适配层 ANCHORS 单源提取，逐项在 fixture 中核对 |
+| `tests/gallery.mjs` | 真实 gallery.html+js 端到端：认证门、分组限量渲染、搜索、查看器翻页、乐观删除、15/批分块 |
 | `tests/scale.mjs` | 300MiB：分片数、耗时、无变化零压缩、增量 |
 | `tests/serve.mjs` | 真实浏览器验收服务器（内存 R2）；`RP_FIXTURE=1` 切换真实作者 fixture |
+| `deployer/test-*.mjs` | blake3 官方向量 + 部署全流程（multipart 形状、isMod 校验、重试、更新拒绝非魔改版）；已并入 `npm test` 链 |
 
 测试基建：`tests/platform.mjs`（内存 R2 桶——含定长流与条件写拒绝语义、Cache、FixedLengthStream、HTMLRewriter 桩）。
 
@@ -154,7 +156,7 @@ npm run lint      # ESLint 死代码门禁
 
 - Worker 单文件、无构建、无 import/顶层 await；代理超时 = 8s 响应头 + 30s 正文空闲（bodyIdleGuard），慢线路长正文不断流。
 - `page/` 是唯一发布正本（11 文件，其中 `adapter/rp-hub.js` 为旧版契约存档、不参与部署）；手动部署上传其余 10 个。
-- 改同步协议必须同时改 `page/_worker.js` 与 `page/core.js`，跑 `npm test`（parity 会拦双写漂移）。
+- 改同步协议必须同时改 `page/_worker.js` 与 `page/core.js`，跑 `npm test`（parity 会拦双写漂移）；往 `page/` 增删部署文件必须同步 `deployer/worker.js` 的 ASSETS 清单（parity 第 7 节双向锁死）。
 - 改适配层：锚点变化只改 `ANCHORS` 并跑 `npm test`（author 审计逐项核对 fixture）；契约变化必须升 `version` 并同步系统侧。
 - 作者改版维护流程：`curl` 拉新版 → 覆盖 `tests/fixtures/author/` → `npm test` → 按失活项改 ANCHORS → 新脚本传外部源。fixture 是作者代码的本地快照，因版权不入公开仓库（.gitignore 已排除），换机器需重新拉取。
 - 不推送 GitHub（除非明确要求）；不删除线上 R2 数据。

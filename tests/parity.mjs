@@ -63,4 +63,16 @@ for (const route of routes.exclude) {
 for (const name of staticList) assert.ok(routes.exclude.some(route => name.startsWith(route.endsWith('/*') ? route.slice(0, -1) : route)), '_routes 排除 ' + name);
 assert.ok(worker.includes('data-rp-sync-restore'), '恢复页携带客户端识别标记');
 
-console.log('parity: 云端布局/校验和源/限额/图片参数/密码键/资产清单/契约版本 双写全部一致');
+// 7. 部署器清单 ↔ page/ 实际文件：加文件忘更新 ASSETS 就是静默残废部署，此处双向锁死
+//（rp-hub.js 是 v1 存档，参与 Worker 直供但不进部署器清单）。
+const deployer = await readFile(new URL('../deployer/worker.js', import.meta.url), 'utf8');
+const deployerFiles = new Set([one(deployer, /const WORKER_FILE = '([^']+)'/, 'deployer worker file'), ...[...deployer.matchAll(/path: '([^']+)'/g)].map(m => m[1])]);
+const { readdir } = await import('node:fs/promises');
+const pageFiles = new Set((await readdir(new URL('../page/', import.meta.url), { recursive: true }))
+    .map(String).map(name => name.replace(/\\/g, '/'))
+    .filter(name => name !== 'adapter' && name !== 'adapter/rp-hub.js'));
+for (const file of deployerFiles) assert.ok(pageFiles.has(file), '部署器清单文件存在于 page/' + file);
+const undeployed = [...pageFiles].filter(name => !deployerFiles.has(name));
+assert.deepEqual(undeployed, [], 'page/ 无未进部署器清单的文件');
+
+console.log('parity: 云端布局/校验和源/限额/图片参数/密码键/资产清单/契约版本/部署器清单 双写全部一致');
