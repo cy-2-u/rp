@@ -58,7 +58,7 @@ const node = {
 
 export default [
     { ignores: ['node_modules/**', '**/*.json', '**/*.html'] },
-    { files: ['page/_worker.js'], languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: workerd }, rules: gate },
+    { files: ['page/_worker.js', 'deployer/worker.js'], languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: workerd }, rules: gate },
     { files: ['page/core.js', 'page/client.js', 'page/sync.js', 'page/images.js', 'page/gallery.js', 'page/adapter/**/*.js'], languageOptions: { ecmaVersion: 'latest', sourceType: 'script', globals: client }, rules: gate },
-    { files: ['eslint.config.mjs', 'tests/**/*.mjs'], languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: node }, rules: gate }
+    { files: ['eslint.config.mjs', 'tests/**/*.mjs', 'deployer/test-*.mjs'], languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: node }, rules: gate }
 ];
