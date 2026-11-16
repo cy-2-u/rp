@@ -185,7 +185,6 @@
             '.magic-extension-button:hover{color:#2563eb;background:#eff6ff}',
             '.magic-extension-button svg{width:14px;height:14px;flex:none}',
             '.magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
-            '.app-navigation-user .magic-extension-actions{display:flex;align-items:center;gap:4px;margin-left:auto}',
             '.magic-image-nav{margin-top:4px}',
             '.magic-image-nav svg{flex:none}',
             '.magic-image-nav span{white-space:nowrap;overflow:hidden}',

@@ -75,11 +75,6 @@
         } catch (error) { cancel(); throw error; }
         finally { signal?.removeEventListener('abort', cancel); reader.releaseLock(); }
     }
-    async function jsonBody(message, limit = 1024 ** 2, signal) {
-        const bytes = await bounded(message, limit, signal);
-        try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
-        catch { throw fail('JSON 正文无效。', 400); }
-    }
     async function pool(items, count, fn) {
         const results = new Array(items.length);
         let next = 0, error;
@@ -96,5 +91,5 @@
         const body = new Blob([bytes]).stream().pipeThrough(decode ? new DecompressionStream('gzip') : new CompressionStream('gzip'));
         return bounded({ body }, decode ? LIMIT.raw : LIMIT.pack);
     }
-    root.RPCore = Object.freeze({ FORMAT, LIMIT, STORES, KEYS, appKey, excluded, fail, hash, checksumSource, canonical, normalizeManifest, validateManifest, bounded, jsonBody, pool, compress, encoder });
+    root.RPCore = Object.freeze({ FORMAT, LIMIT, STORES, KEYS, appKey, excluded, fail, hash, checksumSource, canonical, normalizeManifest, validateManifest, bounded, pool, compress, encoder });
 })(globalThis);

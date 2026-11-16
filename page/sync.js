@@ -1106,7 +1106,7 @@
             passwordModalRoot.className = 'rp-sync-modal';
             passwordModalRoot.innerHTML = `
                 <div class="rp-sync-modal__backdrop"></div>
-                <form class="rp-sync-modal__panel rp-sync-password-panel">
+                <form class="rp-sync-modal__panel">
                     <div class="rp-sync-modal__header">
                         <div><div class="rp-sync-modal__eyebrow">云端访问</div><h3 class="rp-sync-modal__title">同步密码</h3></div>
                         <button type="button" class="rp-sync-modal__close" aria-label="关闭">×</button>
