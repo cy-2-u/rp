@@ -1068,6 +1068,16 @@
         syncAutoSaveUi();
         modalRoot.classList.add('is-open');
     }
+    // Esc 逐层关闭：提示框 → 密码框 → 主面板（恢复页的主面板不可关，误关会误导恢复状态）。
+    document.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        for (const root of [noticeModalRoot, passwordModalRoot, modalRoot]) {
+            if (!root?.classList.contains('is-open')) continue;
+            if (root === modalRoot && P.restorePage) return;
+            root.classList.remove('is-open');
+            return;
+        }
+    });
     function showSyncNotice(text) {
         ensureStyle('rp-sync-style', SYNC_STYLE_TEXT);
         if (!noticeModalRoot) {

@@ -34,5 +34,13 @@ w.localStorage.setItem(C.KEYS.active, 'restore');
 assert.throws(() => db.transaction('store', 'readwrite'), /暂停写入/);
 assert.throws(() => w.localStorage.setItem('rp_hub_test', 'b'), /暂停写入/);
 w.localStorage.removeItem(C.KEYS.active);
+// 应用级 clear 保留同步基础设施键：密码与自动保存设置不能被作者应用重置波及。
+w.localStorage.setItem(C.KEYS.password, 'keep-me');
+w.localStorage.setItem('rp_hub_sync_auto_save_enabled_v1', '1');
+w.localStorage.clear();
+assert.equal(w.localStorage.getItem(C.KEYS.password), 'keep-me', 'clear keeps the sync password');
+assert.equal(w.localStorage.getItem('rp_hub_sync_auto_save_enabled_v1'), '1', 'clear keeps autosave settings');
+assert.equal(w.localStorage.getItem('rp_hub_test'), null, 'clear removes app keys');
+await P.acknowledge(await P.dirty());
 db.close(); dom.window.close();
-console.log('client: 9 journal, abort, acknowledgment and freeze checks passed');
+console.log('client: 12 journal, abort, acknowledgment, freeze and clear-scope checks passed');

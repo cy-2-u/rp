@@ -54,6 +54,8 @@
             current.onerror = e => { error = current.error; done = true; emit('error', e); };
             current.onupgradeneeded = e => {
                 const db = current.result;
+                // epoch 记录用 UUID 字符串键：数字水位删除（upperBound）天然不会波及它，
+                // acknowledge 之后 dirty() 仍能读到 epoch。
                 if (!db.objectStoreNames.contains(K.journal)) { const log = db.createObjectStore(K.journal, { autoIncrement: true }); native.put.call(log, crypto.randomUUID(), '__epoch__'); }
                 emit('upgradeneeded', e);
             };
@@ -134,7 +136,8 @@
         writable();
         const keys = Object.keys(this);
         for (const key of keys) if (C.appKey(key)) intent(key);
-        for (const key of keys) if (!key.startsWith('rp_sync_')) native.remove.call(this, key);
+        // 应用级 clear 保留全部同步基础设施键（rp_sync_ 追踪态 + rp_hub_sync_ 密码与设置）。
+        for (const key of keys) if (!key.startsWith('rp_sync_') && !key.startsWith('rp_hub_sync_')) native.remove.call(this, key);
         notify();
     };
     async function names() {
@@ -142,7 +145,7 @@
         const all = await indexedDB.databases();
         return Object.keys(C.STORES).filter(name => all.some(db => db.name === name));
     }
-    async function dirty(after = {}, expectedEpochs = {}) {
+    async function dirty(after = {}) {
         const result = { databases: {}, epochs: {}, stores: new Map(), intents: [], local: new Set() };
         for (const key of Object.keys(localStorage)) if (key.startsWith(K.intent)) { result.intents.push(key); result.local.add(localStorage.getItem(key)); }
         for (const name of await names()) {
