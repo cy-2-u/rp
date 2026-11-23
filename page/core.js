@@ -3,7 +3,7 @@
     'use strict';
     const encoder = new TextEncoder();
     const FORMAT = 'rp-sync-manifest-v2';
-    const LIMIT = Object.freeze({ snapshot: 1024 ** 3, pack: 6 * 1024 ** 2, raw: 4 * 1024 ** 2, packs: 4096, entries: 512, object: 64 * 1024 ** 2 });
+    const LIMIT = Object.freeze({ snapshot: 2 * 1024 ** 3, pack: 6 * 1024 ** 2, raw: 4 * 1024 ** 2, packs: 4096, entries: 512, object: 64 * 1024 ** 2 });
     const STORES = Object.freeze({ RPHubDB: ['store'], AICharGen: ['characters'] });
     const KEYS = Object.freeze({ journal: '__rp_sync_journal_v2', intent: 'rp_sync_intent_v2:', epoch: 'rp_sync_tracking_epoch_v2', active: 'rp_sync_restore_active', restoreEpoch: 'rp_sync_restore_epoch', password: 'rp_hub_sync_password_v1' });
     const appKey = key => typeof key === 'string' && !key.startsWith('rp_hub_sync_') && (key.startsWith('rp_hub_') || key.startsWith('ai_chargen_'));

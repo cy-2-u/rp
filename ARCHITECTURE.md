@@ -73,7 +73,7 @@ JSON.stringify([FORMAT, m.compression, m.totalBytes, m.entryCount,
 ```
 
 - checksum 只覆盖内容（不含 version/updatedAt）：无变化上传靠它 1 个 status 判等；version 单调递增 + CAS etag 防过期覆盖。
-- 上限：快照 1GiB、4096 分片、单片 gzip 6MiB（原始 4MiB）、512 条。`entries` 允许 0：单条记录超分片缓冲时先落纯字节填充片，记录跨片拼接，恢复按行重组。
+- 上限：快照 2GiB、4096 分片、单片 gzip 6MiB（原始 4MiB）、512 条。`entries` 允许 0：单条记录超分片缓冲时先落纯字节填充片，记录跨片拼接，恢复按行重组。
 
 ### 3.2 源分片布局（客户端，与旧实现的差别）
 

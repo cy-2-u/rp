@@ -130,7 +130,7 @@ function normalizeManifest(m) {
         seen.add(p.checksum); total += p.length; entries += p.entries;
         return { bucket: p.bucket, checksum: p.checksum, length: p.length, entries: p.entries };
     });
-    if (total !== m.totalBytes || entries !== m.entryCount || total > 1024 ** 3 || entries > 10000000 || !/^[a-f0-9]{64}$/.test(m.checksum)) throw failure('同步清单合计无效。', 409);
+    if (total !== m.totalBytes || entries !== m.entryCount || total > 2 * 1024 ** 3 || entries > 10000000 || !/^[a-f0-9]{64}$/.test(m.checksum)) throw failure('同步清单合计无效。', 409);
     return { format: FORMAT, compression: 'gzip', version: m.version, updatedAt: m.updatedAt, totalBytes: total, entryCount: entries, packs, checksum: m.checksum };
 }
 async function current(bucket) {
