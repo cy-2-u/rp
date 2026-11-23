@@ -16,9 +16,10 @@ const env = { RP_SYNC_PASSWORD: 'test-password', RP_SYNC_R2: bucket, ASSETS: { a
     return path === '/adapter/rp-hub-v2.js' ? new Response(adapter) : new Response('', { status: 404 });
 } } };
 const outbound = [];
+const authorHtml = '<html><head><script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script><script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script><script src="https://cdn.tailwindcss.com"></script><script src="vue.js"></script><link href="https://fonts.googleapis.com/css2?family=Inter"></head><body>author</body></html>';
 globalThis.fetch = async (input, init) => {
     outbound.push({ url: String(input), init });
-    return new Response('<html><head><script src="vue.js"></script></head><body>author</body></html>', { headers: { 'content-type': 'text/html' } });
+    return new Response(authorHtml, { headers: { 'content-type': 'text/html' } });
 };
 const call = (path, init = {}, auth = true) => worker.fetch(new Request('https://test.local' + path, { ...init, headers: { ...(auth ? { 'x-rp-sync-password': 'test-password' } : {}), ...init.headers } }), env, ctx);
 const post = body => call('/api/rp-sync', { method: 'POST', body: JSON.stringify(body) });
@@ -74,6 +75,25 @@ const html = await home.text();
 check(html.indexOf('/client.js') < html.indexOf('vue.js'), 'tracker before author');
 check(html.includes("Object.defineProperty(window, 'Vue'"), 'late Vue installation');
 check(html.includes(adapter.replace(/<\/script/gi, '<\\/script')), 'HTML injection preserves adapter source exactly');
+// CDN 白名单代理：jsdelivr 间歇 RST 不再杀死 Vue 挂载（白屏根因）。改写为同源 /cdn/，
+// 回源走 Worker 出站（Cloudflare 骨干到 CDN 不经本地网络），边缘缓存吸收重复拉取。
+check(html.includes('<script src="/cdn/unpkg.com/vue@3/dist/vue.global.prod.js">'), 'vue src rewritten to same-origin /cdn/');
+check(html.includes('<script src="/cdn/cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js">'), 'purify src rewritten to same-origin /cdn/');
+check(html.includes('<script src="/cdn/cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js">'), 'sortable src rewritten to same-origin /cdn/');
+check(html.includes('<script src="/cdn/cdn.tailwindcss.com/">'), 'tailwind src rewritten to same-origin /cdn/');
+check(html.includes('https://fonts.googleapis.com'), 'non-script CDN links untouched');
+check(!outbound.some(({ url }) => url.startsWith('https://cdn.jsdelivr.net')), 'html render itself never fetches CDN');
+const cdnRes = await call('/cdn/cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js');
+await ctx.drain(); // 等边缘缓存 put 落盘，下一次请求才可能命中。
+check(cdnRes.status === 200, 'cdn passthrough fetches whitelisted host');
+check(outbound.at(-1).url === 'https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js', 'cdn route maps to whitelisted upstream');
+check(cdnRes.headers.get('cache-control') === 'public, max-age=86400', 'cdn floating version cached 24h');
+const cdnHit = await call('/cdn/cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js');
+check(cdnHit.headers.get('cache-control') === 'public, max-age=86400' && outbound.filter(({ url }) => url === 'https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js').length === 1, 'cdn edge cache absorbs repeat fetch');
+check((await call('/cdn/evil.github.com/x.js')).status === 404, 'cdn route rejects non-whitelisted hosts');
+check((await call('/cdn/cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js', { method: 'POST' })).status === 405, 'cdn route is GET/HEAD only');
+const tailwindRes = await call('/cdn/cdn.tailwindcss.com');
+check(tailwindRes.headers.get('cache-control') === 'public, max-age=300', 'tailwind dynamic JIT cached 5min');
 await call('/head-only.js', { method: 'HEAD' });
 check(outbound.at(-1).init.method === 'HEAD', 'proxy forwards HEAD without downloading the body');
 await ctx.drain();

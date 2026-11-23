@@ -76,18 +76,28 @@ export class Bucket {
     }
 }
 
-// 只模拟本项目使用的 head 注入；不是通用 HTML 解析器或流式性能模型。
+// 只模拟本项目使用的 head 注入与 script[src] 改写；不是通用 HTML 解析器或流式性能模型。
 export class HTMLRewriter {
     handlers = [];
     on(selector, handler) { this.handlers.push([selector, handler]); return this; }
     async transform(response) {
         let text = await response.text();
         for (const [selector, handler] of this.handlers) {
-            if (selector !== 'head') throw new Error('unsupported selector');
-            handler.element({
-                prepend(html) { text = text.replace(/(<head\b[^>]*>)/i, match => match + html); },
-                append(html) { text = text.replace(/<\/head\s*>/i, () => html + '</head>'); }
-            });
+            if (selector === 'head') {
+                handler.element({
+                    prepend(html) { text = text.replace(/(<head\b[^>]*>)/i, match => match + html); },
+                    append(html) { text = text.replace(/<\/head\s*>/i, () => html + '</head>'); }
+                });
+            } else if (selector === 'script[src]') {
+                text = text.replace(/<script\b[^>]*\bsrc=(["'])(.*?)\1[^>]*>/gi, (tag, quote, src) => {
+                    let value = src;
+                    handler.element({
+                        getAttribute: name => (name === 'src' ? value : null),
+                        setAttribute: (name, next) => { if (name === 'src') value = next; }
+                    });
+                    return value === src ? tag : tag.replace(src, value);
+                });
+            } else throw new Error('unsupported selector');
         }
         return new Response(text, response);
     }

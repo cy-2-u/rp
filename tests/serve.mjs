@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
 import worker from '../page/_worker.js';
+// 原生 fetch 引用必须在任何 mock 覆盖之前捕获；RP_FIXTURE 的 CDN 回源依赖它走真网络。
+const nativeFetch = globalThis.fetch;
 import { Bucket, Cache, FixedLengthStream, HTMLRewriter, context } from './platform.mjs';
 const require = createRequire(import.meta.url);
 const vue = await readFile(require.resolve('vue/dist/vue.global.prod.js'), 'utf8');
@@ -31,11 +33,10 @@ globalThis.fetch = async input => {
 // 其余 CDN 资产走真实网络。用于真实浏览器验收：锚点、保存链路、上传全链路。
 const fixtureMode = process.env.RP_FIXTURE === '1';
 if (fixtureMode) {
-    const networkFetch = globalThis.fetch;
     const types = { '.js': 'application/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8' };
     globalThis.fetch = async input => {
         const url = new URL(String(input));
-        if (url.origin !== 'https://sta1n156.github.io') return networkFetch(input);
+        if (url.origin !== 'https://sta1n156.github.io') return nativeFetch(input);
         const rel = decodeURIComponent(url.pathname).replace(/^\/RP-Hub\/?/, '');
         const name = rel === '' ? 'index.html' : ['character', 'novel'].includes(rel) ? rel + '.html' : rel;
         try {

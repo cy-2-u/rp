@@ -8,6 +8,10 @@ const FORMAT = 'rp-sync-manifest-v2';
 const IMAGE = 'rp-images/characters/';
 const TOMBS = 'rp-images/_deleted/';
 const THUMBS = 'rp-images/thumbs/';
+// 作者页硬编码境外 CDN；jsdelivr 被间歇 RST 时 DOMPurify 缺失直接杀死 Vue 挂载（白屏）。
+// 白名单主机代取 + 边缘长缓存（浮动版本 24h、tailwind JIT 5min）；按主机路由而非透传任意
+// 主机，避免成为开放代理。
+const CDN_HOSTS = { 'cdn.jsdelivr.net': 86400, 'unpkg.com': 86400, 'cdn.tailwindcss.com': 300 };
 const PARAMS = ['tag', 'model', 'artist', 'size', 'steps', 'scale', 'cfg', 'sampler', 'negative', 'nocache', 'noise_schedule'];
 const encoder = new TextEncoder();
 const stateByEnv = new WeakMap();
@@ -405,6 +409,27 @@ function bodyIdleGuard(body, timeoutMs) {
         cancel(reason) { clear(); return reader.cancel(reason); }
     });
 }
+async function cdn(request, env, ctx, url) {
+    if (!['GET', 'HEAD'].includes(request.method)) throw failure('Method not allowed.', 405);
+    const path = url.pathname.slice(5), host = path.split('/')[0], ttl = CDN_HOSTS[host];
+    if (!ttl) throw failure('Not found.', 404);
+    const cache = globalThis.caches?.default;
+    if (cache && request.method === 'GET') {
+        const cached = await cache.match(new Request(url));
+        if (cached) return cached;
+    }
+    const headers = new Headers(request.headers);
+    for (const key of ['host', 'cookie', 'authorization', 'referer']) headers.delete(key);
+    const upstream = await fetch('https://' + path + url.search, { method: request.method, headers, signal: AbortSignal.timeout(AUTHOR_HEADER_TIMEOUT), redirect: 'follow' });
+    if (!upstream.ok || request.method === 'HEAD') return new Response(request.method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: upstream.headers });
+    const bytes = await read(upstream, 8 * 1024 ** 2);
+    const h = new Headers(upstream.headers);
+    // 出站 fetch 已自动解压，压缩与长度头不再匹配解压后的正文，透传会让浏览器二次解压失败。
+    for (const key of ['set-cookie', 'content-encoding', 'content-length']) h.delete(key);
+    h.set('cache-control', 'public, max-age=' + ttl);
+    if (cache) background(ctx, cache.put(new Request(url), new Response(bytes, { headers: h })));
+    return new Response(bytes, { status: upstream.status, headers: h });
+}
 async function proxy(request, env, ctx, url) {
     if (!['GET', 'HEAD'].includes(request.method)) throw failure('Method not allowed.', 405);
     const path = url.pathname === '/' ? 'index.html' : ['character', 'novel'].includes(url.pathname.slice(1)) ? url.pathname.slice(1) + '/index.html' : url.pathname.slice(1);
@@ -439,7 +464,14 @@ async function proxy(request, env, ctx, url) {
     const injection = '<script src="/core.js"></script><script src="/client.js"></script>' + (selected ? '<script>' + selected.source.replace(/<\/script/gi, '<\\/script') + '</script><script defer src="/images.js"></script><script defer src="/sync.js"></script>' : '');
     for (const key of ['content-length', 'content-encoding', 'etag', 'last-modified']) h.delete(key);
     h.set('cache-control', 'no-store');
-    return new HTMLRewriter().on('head', { element(el) { el.prepend(injection, { html: true }); } }).transform(new Response(response.body, { status: response.status, headers: h }));
+    // 白名单 CDN 脚本改写为同源 /cdn/ 路径：本地网络到 jsdelivr 的间歇 RST 不再白屏。
+    return new HTMLRewriter()
+        .on('head', { element(el) { el.prepend(injection, { html: true }); } })
+        .on('script[src]', { element(el) {
+            const src = el.getAttribute('src');
+            if (src) try { const u = new URL(src, AUTHOR); if (CDN_HOSTS[u.host]) el.setAttribute('src', '/cdn/' + u.host + u.pathname + u.search); } catch {}
+        } })
+        .transform(new Response(response.body, { status: response.status, headers: h }));
 }
 export default {
     async fetch(request, env, ctx) {
@@ -452,6 +484,7 @@ export default {
             if (url.pathname === '/sync-restore') return new Response('<!doctype html><html lang="zh-CN" data-rp-sync-restore><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>恢复数据</title><script src="/core.js"></script><script src="/client.js"></script><script defer src="/sync.js"></script></head><body></body></html>', { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
             if (url.pathname === '/image' || url.pathname === '/image/') return await asset(env, '/gallery.html');
             if (['/core.js', '/client.js', '/sync.js', '/images.js', '/gallery.js', '/gallery.html', '/config.json', '/adapter/rp-hub-v2.js'].includes(url.pathname)) return await asset(env, url.pathname);
+            if (url.pathname.startsWith('/cdn/')) return await cdn(request, env, ctx, url);
             return await proxy(request, env, ctx, url);
         } catch (e) {
             const status = e.status || (/checksum|SHA-?256|length.*(?:match|expected)/i.test(e.message) ? 409 : 500);
