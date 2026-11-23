@@ -38,7 +38,10 @@ if (fixtureMode) {
         const url = new URL(String(input));
         if (url.origin !== 'https://sta1n156.github.io') return nativeFetch(input);
         const rel = decodeURIComponent(url.pathname).replace(/^\/RP-Hub\/?/, '');
-        const name = rel === '' ? 'index.html' : ['character', 'novel'].includes(rel) ? rel + '.html' : rel;
+        // 线上 /RP-Hub/character/index.html 有效（Pages 解析），fixture 只存了平面文件：
+        // 工坊页两种路径形态都归一到 character.html / novel.html。
+        const flat = rel.replace(/^(character|novel)\/index\.html$/, '$1');
+        const name = flat === '' ? 'index.html' : ['character', 'novel'].includes(flat) ? flat + '.html' : flat;
         try {
             const bytes = await readFile(new URL('fixtures/author/' + name, import.meta.url));
             return new Response(bytes, { headers: { 'content-type': types[name.slice(name.lastIndexOf('.'))] || 'application/octet-stream' } });

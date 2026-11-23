@@ -420,8 +420,10 @@ async function cdn(request, env, ctx, url) {
     }
     const headers = new Headers(request.headers);
     for (const key of ['host', 'cookie', 'authorization', 'referer']) headers.delete(key);
-    const upstream = await fetch('https://' + path + url.search, { method: request.method, headers, signal: AbortSignal.timeout(AUTHOR_HEADER_TIMEOUT), redirect: 'follow' });
+    let upstream = await fetch('https://' + path + url.search, { method: request.method, headers, signal: AbortSignal.timeout(AUTHOR_HEADER_TIMEOUT), redirect: 'follow' });
     if (!upstream.ok || request.method === 'HEAD') return new Response(request.method === 'HEAD' ? null : upstream.body, { status: upstream.status, headers: upstream.headers });
+    // 与 proxy 同款正文空闲守卫：上游吐完头就挂流时不能让资源无限 pending。
+    if (upstream.body) upstream = new Response(bodyIdleGuard(upstream.body, AUTHOR_BODY_IDLE_TIMEOUT), { status: upstream.status, headers: upstream.headers });
     const bytes = await read(upstream, 8 * 1024 ** 2);
     const h = new Headers(upstream.headers);
     // 出站 fetch 已自动解压，压缩与长度头不再匹配解压后的正文，透传会让浏览器二次解压失败。
@@ -459,17 +461,27 @@ async function proxy(request, env, ctx, url) {
     h.set('cache-control', 'no-cache');
     if (request.method === 'HEAD' || [204, 205, 304].includes(response.status)) return new Response(null, { status: response.status, headers: h });
     if (!response.ok || !h.get('content-type')?.includes('text/html')) return new Response(response.body, { status: response.status, headers: h });
-    if (!home) return new Response(response.body, { status: response.status, headers: h });
-    const selected = await adapterPromise;
-    const injection = '<script src="/core.js"></script><script src="/client.js"></script>' + (selected ? '<script>' + selected.source.replace(/<\/script/gi, '<\\/script') + '</script><script defer src="/images.js"></script><script defer src="/sync.js"></script>' : '');
+    // 注入只限主页；CDN 改写覆盖全部三个 HTML 入口——工坊页同样硬依赖境外 CDN，
+    // 不改写时 jsdelivr RST 在 /character、/novel 照样白屏。
+    const inject = home;
+    const rewrite = home || path === 'character/index.html' || path === 'novel/index.html';
+    if (!inject && !rewrite) return new Response(response.body, { status: response.status, headers: h });
+    const selected = inject ? await adapterPromise : null;
+    // favicon 内联：作者站没有 favicon，浏览器自动请求 /favicon.ico 只落 404 噪音。
+    const favicon = '<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%AD%3C/text%3E%3C/svg%3E">';
+    const injection = favicon + (inject ? '<script src="/core.js"></script><script src="/client.js"></script>' + (selected ? '<script>' + selected.source.replace(/<\/script/gi, '<\\/script') + '</script><script defer src="/images.js"></script><script defer src="/sync.js"></script>' : '') : '');
     for (const key of ['content-length', 'content-encoding', 'etag', 'last-modified']) h.delete(key);
     h.set('cache-control', 'no-store');
-    // 白名单 CDN 脚本改写为同源 /cdn/ 路径：本地网络到 jsdelivr 的间歇 RST 不再白屏。
+    // 白名单 CDN 资源改写为同源 /cdn/ 路径：本地网络到 jsdelivr 的间歇 RST 不再白屏。
     return new HTMLRewriter()
-        .on('head', { element(el) { el.prepend(injection, { html: true }); } })
+        .on('head', inject ? { element(el) { el.prepend(injection, { html: true }); } } : { element() {} })
         .on('script[src]', { element(el) {
             const src = el.getAttribute('src');
             if (src) try { const u = new URL(src, AUTHOR); if (CDN_HOSTS[u.host]) el.setAttribute('src', '/cdn/' + u.host + u.pathname + u.search); } catch {}
+        } })
+        .on('link[rel="stylesheet"]', { element(el) {
+            const href = el.getAttribute('href');
+            if (href) try { const u = new URL(href, AUTHOR); if (CDN_HOSTS[u.host]) el.setAttribute('href', '/cdn/' + u.host + u.pathname + u.search); } catch {}
         } })
         .transform(new Response(response.body, { status: response.status, headers: h }));
 }

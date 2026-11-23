@@ -5,6 +5,7 @@
 - **免服务器运维**：部署到 Cloudflare Pages 免费版即可，数据存在自己的 R2 桶里。
 - **数据自主**：聊天记录、角色卡、生成图片全部保存在自己的 Cloudflare 账号。
 - **不改动作者代码**：作者前端原样代理；适配作者变化的手段是更新**一个外部可执行脚本**（见下）。
+- **CDN 兜底**：作者页引用的境外 CDN（jsdelivr/unpkg/tailwindcss）由 Worker 白名单代取并改写为同源路径，部分网络到 jsdelivr 的间歇性连接重置不再导致白屏。
 
 维护者文档（适配脚本链、同步协议、测试与发布）见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 

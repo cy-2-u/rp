@@ -76,12 +76,20 @@ export class Bucket {
     }
 }
 
-// 只模拟本项目使用的 head 注入与 script[src] 改写；不是通用 HTML 解析器或流式性能模型。
+// 只模拟本项目使用的 head 注入与 script[src]/link[rel=stylesheet] 改写；不是通用 HTML 解析器或流式性能模型。
 export class HTMLRewriter {
     handlers = [];
     on(selector, handler) { this.handlers.push([selector, handler]); return this; }
     async transform(response) {
         let text = await response.text();
+        const attributeRewrite = (handler, attr, tag) => tag.replace(new RegExp('(\\b' + attr + '=)(["\'])(.*?)\\2'), (_, name, quote, value) => {
+            let next = value;
+            handler.element({
+                getAttribute: name => (name === attr ? next : null),
+                setAttribute: (name, v) => { if (name === attr) next = v; }
+            });
+            return next === value ? name + quote + value + quote : name + quote + next + quote;
+        });
         for (const [selector, handler] of this.handlers) {
             if (selector === 'head') {
                 handler.element({
@@ -89,14 +97,9 @@ export class HTMLRewriter {
                     append(html) { text = text.replace(/<\/head\s*>/i, () => html + '</head>'); }
                 });
             } else if (selector === 'script[src]') {
-                text = text.replace(/<script\b[^>]*\bsrc=(["'])(.*?)\1[^>]*>/gi, (tag, quote, src) => {
-                    let value = src;
-                    handler.element({
-                        getAttribute: name => (name === 'src' ? value : null),
-                        setAttribute: (name, next) => { if (name === 'src') value = next; }
-                    });
-                    return value === src ? tag : tag.replace(src, value);
-                });
+                text = text.replace(/<script\b[^>]*\bsrc=(["'])(.*?)\1[^>]*>/gi, tag => attributeRewrite(handler, 'src', tag));
+            } else if (selector === 'link[rel="stylesheet"]') {
+                text = text.replace(/<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi, tag => attributeRewrite(handler, 'href', tag));
             } else throw new Error('unsupported selector');
         }
         return new Response(text, response);

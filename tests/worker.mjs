@@ -16,10 +16,14 @@ const env = { RP_SYNC_PASSWORD: 'test-password', RP_SYNC_R2: bucket, ASSETS: { a
     return path === '/adapter/rp-hub-v2.js' ? new Response(adapter) : new Response('', { status: 404 });
 } } };
 const outbound = [];
-const authorHtml = '<html><head><script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script><script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script><script src="https://cdn.tailwindcss.com"></script><script src="vue.js"></script><link href="https://fonts.googleapis.com/css2?family=Inter"></head><body>author</body></html>';
+const cdnScripts = '<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script><script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script><script src="https://cdn.tailwindcss.com"></script>';
+const authorHtml = '<html><head>' + cdnScripts + '<script src="vue.js"></script><link href="https://fonts.googleapis.com/css2?family=Inter"></head><body>author</body></html>';
+const workshopHtml = '<html><head><script src="https://cdn.tailwindcss.com"></script><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css"><script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script><script src="https://cdn.jsdelivr.net/npm/localforage@1.10.0/dist/localforage.min.js"></script><script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script><script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script></head><body>workshop</body></html>';
 globalThis.fetch = async (input, init) => {
     outbound.push({ url: String(input), init });
-    return new Response(authorHtml, { headers: { 'content-type': 'text/html' } });
+    const path = new URL(String(input)).pathname.replace(/^\/RP-Hub\//, '');
+    const html = path === 'character/index.html' || path === 'novel/index.html' ? workshopHtml : authorHtml;
+    return new Response(html, { headers: { 'content-type': 'text/html' } });
 };
 const call = (path, init = {}, auth = true) => worker.fetch(new Request('https://test.local' + path, { ...init, headers: { ...(auth ? { 'x-rp-sync-password': 'test-password' } : {}), ...init.headers } }), env, ctx);
 const post = body => call('/api/rp-sync', { method: 'POST', body: JSON.stringify(body) });
@@ -72,9 +76,10 @@ check((await call('/image/api/library', {}, false)).status === 401, 'library lis
 check((await call(thumbPath, { method: 'PUT', headers: { 'content-type': 'image/webp' }, body: new Uint8Array([4, 5]) })).status === 404, 'deleted image rejects thumbnail backfill');
 const home = await call('/');
 const html = await home.text();
-check(html.indexOf('/client.js') < html.indexOf('vue.js'), 'tracker before author');
+check(html.indexOf('/client.js') < html.indexOf('src="/cdn/unpkg.com/vue@3'), 'tracker before author');
 check(html.includes("Object.defineProperty(window, 'Vue'"), 'late Vue installation');
 check(html.includes(adapter.replace(/<\/script/gi, '<\\/script')), 'HTML injection preserves adapter source exactly');
+check(html.includes('<link rel="icon" href="data:image/svg+xml'), 'favicon inlined on home');
 // CDN 白名单代理：jsdelivr 间歇 RST 不再杀死 Vue 挂载（白屏根因）。改写为同源 /cdn/，
 // 回源走 Worker 出站（Cloudflare 骨干到 CDN 不经本地网络），边缘缓存吸收重复拉取。
 check(html.includes('<script src="/cdn/unpkg.com/vue@3/dist/vue.global.prod.js">'), 'vue src rewritten to same-origin /cdn/');
@@ -83,6 +88,16 @@ check(html.includes('<script src="/cdn/cdn.jsdelivr.net/npm/sortablejs@latest/So
 check(html.includes('<script src="/cdn/cdn.tailwindcss.com/">'), 'tailwind src rewritten to same-origin /cdn/');
 check(html.includes('https://fonts.googleapis.com'), 'non-script CDN links untouched');
 check(!outbound.some(({ url }) => url.startsWith('https://cdn.jsdelivr.net')), 'html render itself never fetches CDN');
+// 工坊页：注入仍只限主页（那边没有聊天数据），但 CDN 改写必须覆盖——jsdelivr RST 在
+// /character、/novel 同样白屏。stylesheet link 也要改写（daisyui 同在 jsdelivr）。
+const workshop = await (await call('/character')).text();
+check(!workshop.includes('/client.js') && !workshop.includes('/core.js'), 'workshop page keeps author app untouched (no injection)');
+check(!workshop.includes('https://cdn.jsdelivr.net') && !workshop.includes('https://unpkg.com') && !workshop.includes('https://cdn.tailwindcss.com'), 'workshop page has zero absolute CDN refs');
+check(workshop.includes('<script src="/cdn/unpkg.com/vue@3/dist/vue.global.prod.js">'), 'workshop vue rewritten');
+check(workshop.includes('<link rel="stylesheet" href="/cdn/cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css">'), 'workshop stylesheet rewritten');
+check(workshop.includes('<script src="/cdn/cdn.jsdelivr.net/npm/localforage@1.10.0/dist/localforage.min.js">'), 'workshop localforage rewritten');
+check(workshop.includes('<script src="/cdn/cdn.jsdelivr.net/npm/marked/marked.min.js">'), 'workshop marked rewritten');
+check(!workshop.includes('rel="icon"'), 'favicon only on home');
 const cdnRes = await call('/cdn/cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js');
 await ctx.drain(); // 等边缘缓存 put 落盘，下一次请求才可能命中。
 check(cdnRes.status === 200, 'cdn passthrough fetches whitelisted host');

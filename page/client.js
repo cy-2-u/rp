@@ -197,6 +197,6 @@
     window.addEventListener('focus', checkRestore);
     document.addEventListener('DOMContentLoaded', checkRestore, { once: true });
     if (!localStorage.getItem(K.epoch)) native.set.call(localStorage, K.epoch, crypto.randomUUID());
-    globalThis.RPClient = Object.freeze({ C, native, restorePage, txDone, open, names, dirty, acknowledge, flush });
+    globalThis.RPClient = Object.freeze({ restorePage, txDone, open, names, dirty, acknowledge, flush });
     globalThis.RPH_SYNC_TRACKER = Object.freeze({ flush, acknowledge });
 })();

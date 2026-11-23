@@ -122,14 +122,14 @@ end:<db>                → databaseEnd 标记
 
 - R2 键：`rp-images/characters/<角色名>/<签名sha256>`（缩略图 `thumbs/`、墓碑 `_deleted/`）。签名 provider 恒 `sta1n`——ynai/sta1n 共享内容寻址缓存，历史键稳定；参数表与默认值在 Worker 与 images.js 双写，parity 测试断言。
 - 生图只接受 POST（GET/HEAD 只读或 404，爬虫不扣费）；24MiB/16MiB/2MiB 有界读取；墓碑优先（删除后旧链接返回占位 SVG）。
-- 两阶段删除：先墓碑后台清理；每请求 ≤20 目标，清空角色游标续传。墓碑不参与分片回收。
-- **聊天卡片恒显原图**（懒加载 IntersectionObserver）；图库页自带按需缩略图回填（320px WebP，并发 2），与聊天互不影响。
+- 两阶段删除：先墓碑后台清理；每批 ≤15 目标（免费版 50 子请求上限内），清空角色游标续传。墓碑不参与分片回收。
+- **聊天卡片恒显原图**（懒加载 IntersectionObserver）；图库页自带按需缩略图回填（480px WebP，并发 3），与聊天互不影响。
 - ynai 端点只认 `page/config.json`，缺失时显式 503。
 
 ## 5. 测试
 
 ```text
-npm test          # parity + worker(25) + client + adapter + sync + images + roundtrip + author(46)
+npm test          # parity + worker(48) + client + adapter + sync + images + roundtrip + author(46)
 npm run scale     # 300MiB 规模（RP_MIB 可调）
 npm run serve     # 本地验收服务器；RP_FIXTURE=1 时作者源站=真实作者线上版 fixture
 npm run lint      # ESLint 死代码门禁
@@ -138,7 +138,7 @@ npm run lint      # ESLint 死代码门禁
 | 文件 | 覆盖 |
 |---|---|
 | `tests/parity.mjs` | Worker↔core.js 协议双写（布局/校验和源/限额）、图片参数表、密码键、资产清单、契约版本 |
-| `tests/worker.mjs` | 鉴权、缺包 409、条件写、长度不符、提交幂等、缓存鉴权、墓碑、删除故障、HEAD 透传、注入完整性 |
+| `tests/worker.mjs` | 鉴权、缺包 409、条件写、长度不符、提交幂等、缓存鉴权、墓碑、删除故障、HEAD 透传、注入完整性、CDN 改写（主页+工坊页）与白名单 |
 | `tests/client.mjs` | 事务日志原子性、中止不留脏、水位确认、恢复冻结 |
 | `tests/adapter.mjs` | 真实 Vue UMD 初始化、4 个保存标记捕获、防抖定时器排空、flush |
 | `tests/sync.mjs` | 全量建索引、重复准备稳定、单桶增量、分片缓存校验、长会话追加 |
@@ -154,8 +154,10 @@ npm run lint      # ESLint 死代码门禁
 
 ## 6. 维护约定
 
-- Worker 单文件、无构建、无 import/顶层 await；代理超时 = 8s 响应头 + 30s 正文空闲（bodyIdleGuard），慢线路长正文不断流。
+- Worker 单文件、无构建、无 import/顶层 await；代理超时 = 8s 响应头 + 30s 正文空闲（bodyIdleGuard，proxy 与 /cdn/ 共用），慢线路长正文不断流。
 - `page/` 是唯一发布正本（11 文件，其中 `adapter/rp-hub.js` 为旧版契约存档、不参与部署）；手动部署上传其余 10 个。
+- Worker 里的静态资产分支（`/core.js` 等直供）生产环境不可达——`_routes.json` 已把这些路径排除给 Pages 静态服务 + `_headers`；该分支仅供本地测试（tests 仿真 ASSETS 无 _routes 概念）与 _routes 配错时的兜底。
+- CDN 兜底（`/cdn/<主机>/<路径>`）：白名单 `cdn.jsdelivr.net`/`unpkg.com`/`cdn.tailwindcss.com`（TTL 24h/24h/5min），三个 HTML 入口（/、/character、/novel）的 script src 与 stylesheet href 一律改写为同源路径——作者页硬编码境外 CDN，jsdelivr 在部分网络间歇 RST 会杀死 Vue 挂载（白屏）。注入（core/client/adapter/images/sync）仍只发生在主页。新增作者 CDN 依赖时在 `CDN_HOSTS` 表加一行即可。
 - 改同步协议必须同时改 `page/_worker.js` 与 `page/core.js`，跑 `npm test`（parity 会拦双写漂移）；往 `page/` 增删部署文件必须同步 `deployer/worker.js` 的 ASSETS 清单（parity 第 7 节双向锁死）。
 - 改适配层：锚点变化只改 `ANCHORS` 并跑 `npm test`（author 审计逐项核对 fixture）；契约变化必须升 `version` 并同步系统侧。
 - 作者改版维护流程：`curl` 拉新版 → 覆盖 `tests/fixtures/author/` → `npm test` → 按失活项改 ANCHORS → 新脚本传外部源。fixture 是作者代码的本地快照，因版权不入公开仓库（.gitignore 已排除），换机器需重新拉取。
